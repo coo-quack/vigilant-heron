@@ -13,9 +13,26 @@ log_format = "json"
 client_ip_header = "x-real-ip"
 
 [decision]
-# Absolute http:// URI of the decision backend. The proxy posts one JSON
-# request per inspected request and expects {"attack": f64, "ai_instruction": f64}.
+# Protocol spoken to the decision backend:
+#   "http"  the JSON protocol described in the README (default)
+#   "clef"  Cloudflare Clef on Workers AI, or a server that speaks its protocol
+backend = "http"
+
+# Absolute http:// or https:// URI of the decision backend. For "http" the proxy
+# posts one JSON request per inspected request and expects
+# {"attack": f64, "ai_instruction": f64}. For "clef", use the Workers AI endpoint:
+# https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash
 url = "http://stub-decider:9000/decide"
+
+# Clef only, required with backend = "clef" and rejected otherwise: the Clef model.
+# "clef-flash" has a 24,576-token context, "clef" has 64K.
+# model = "clef-flash"
+
+# Clef only, required with backend = "clef" and rejected otherwise: the NAME of
+# an environment variable that holds the bearer token. The token itself is never
+# written in this file. The process fails to start when the variable is unset or
+# blank. Logs and errors print the token as [REDACTED].
+# api_token_env = "CLOUDFLARE_AI_TOKEN"
 
 # Time allowed for the whole decision exchange. A timeout counts as a
 # backend failure and follows each site's fail-open or fail-closed rules.

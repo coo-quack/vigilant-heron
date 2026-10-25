@@ -54,9 +54,35 @@ docker run --rm -p 8080:8080 \
   -v "$PWD/config.toml:/etc/vigilant-heron/config.toml:ro" vigilant-heron
 ```
 
-## Decision backend protocol
+## Decision backends
 
-The router posts JSON to `decision.url`:
+`decision.backend` selects the protocol. The default, `"http"`, is the JSON
+protocol below. `"clef"` calls Cloudflare Clef on Workers AI, or any server that
+implements the same API.
+
+### Clef (Cloudflare Workers AI)
+
+```toml
+[decision]
+backend = "clef"
+model = "clef-flash"        # or "clef" (64K context)
+url = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash"
+api_token_env = "CLOUDFLARE_AI_TOKEN"
+```
+
+The token is read from the environment variable named by `api_token_env` when
+the configuration loads. It is never written in the config file and is printed
+as `[REDACTED]` in logs and errors. The router asks three questions about each
+sanitized event: whether it is an attack (`attack`), whether it addresses an AI
+(`ai_instruction`), and which category of attack it is (`category`, logged
+only). The question wording lives in [`src/clef.rs`](src/clef.rs).
+
+Clef sends the sanitized event to Cloudflare. Read [SECURITY.md](SECURITY.md)
+before enabling it.
+
+### HTTP protocol
+
+With `backend = "http"`, the router posts JSON to `decision.url`:
 
 ```json
 {"event": {
@@ -66,7 +92,8 @@ The router posts JSON to `decision.url`:
 }}
 ```
 
-and expects `{"attack": 0.02, "ai_instruction": 0.01}`, both in `0..=1`.
+and expects `{"attack": 0.02, "ai_instruction": 0.01}`, both in `0..=1`. A
+`"category"` string is optional and is logged when present.
 
 ## Security
 
