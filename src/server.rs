@@ -26,7 +26,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::config::{BackendConfig, Config, DecisionConfig, MAX_REQUEST_ID_BYTES, SiteConfig};
-use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, decision_client};
+use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
 use crate::error::{DecisionError, ServeError};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
@@ -57,30 +57,26 @@ impl AppState<Backend> {
     fn from_config(config: Config) -> Result<Self, ServeError> {
         let client = decision_client()?;
         let url = config.decision.url.clone();
-        let timeout = config.decision.timeout;
-        let slots = Arc::new(Semaphore::new(config.decision.max_concurrency));
+        let limits = Limits {
+            timeout: config.decision.timeout,
+            queue_timeout: config.decision.queue_timeout,
+            slots: Arc::new(Semaphore::new(config.decision.max_concurrency)),
+        };
         let backend = match &config.decision.backend {
-            BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(
-                client,
-                url,
-                timeout,
-                Arc::clone(&slots),
-            )),
+            BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, limits)),
             BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
                 client,
                 url,
                 model.as_str().to_owned(),
                 token.clone(),
-                timeout,
-                Arc::clone(&slots),
+                limits,
             )),
             BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
                 client,
                 url,
                 model.clone(),
                 token.clone(),
-                timeout,
-                Arc::clone(&slots),
+                limits,
             )),
         };
         // The request-id header identifies the request to the proxy's log only.

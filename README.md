@@ -41,7 +41,12 @@ their own site settings, both `"allow"` by default:
 
 - `on_rate_limit`: the 429 and "no slot in time" group
 - `on_decision_error`: timeouts, connection errors, other non-2xx statuses,
-  malformed or out-of-range answers
+  malformed or out-of-range answers. A timeout that happens after a slot was
+  obtained is in this group.
+
+Saturation is always in the rate-limit group: a request that gets no
+concurrency slot within `decision.queue_timeout_ms` is `backend_busy`, and that
+never falls under `on_decision_error`.
 
 `fail_closed_paths` wins over both: a failure on such a path is always blocked.
 A blocked failure uses the site's `action`. The decision log records the
@@ -55,7 +60,12 @@ outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
 |---|---|---|
 | `max_connections` | client connections open at the same time | 1024 |
 | `worker_threads` | runtime threads that run the proxy | one per CPU core |
-| `decision.max_concurrency` | decision-backend calls in flight at the same time; waiting counts against `timeout_ms` | 64 |
+| `decision.max_concurrency` | decision-backend calls in flight at the same time | 64 |
+| `decision.queue_timeout_ms` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
+
+Waiting for a slot is bounded by `queue_timeout_ms` only. A call that gets a
+slot then has the rest of `timeout_ms`. Saturation is therefore always a rate
+limit, and it follows `on_rate_limit`, never `on_decision_error`.
 
 The defaults are: `decision.backend = "jev"` (its URL, model and token variable
 are set by default too), `timeout_ms = 300`, `block_threshold = 0.87`,

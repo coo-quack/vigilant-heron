@@ -130,6 +130,14 @@ pub enum ConfigError {
         /// Value that was rejected.
         value: String,
     },
+    /// `decision.queue_timeout_ms` is larger than `decision.timeout_ms`.
+    #[error("decision.queue_timeout_ms ({queue}) must not exceed decision.timeout_ms ({timeout})")]
+    QueueTimeoutExceedsTimeout {
+        /// Configured queue timeout.
+        queue: u64,
+        /// Configured decision timeout.
+        timeout: u64,
+    },
     /// `worker_threads` is zero.
     #[error("worker_threads must be at least 1 when set")]
     ZeroWorkerThreads,

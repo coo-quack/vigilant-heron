@@ -52,10 +52,12 @@ positives on real traffic.
 When the decision backend cannot judge a request, the outcome depends on the
 failure and on the site settings:
 
-- A decision fails in one of two groups. `rate_limited` covers HTTP 429 and "no
-  concurrency slot free within `timeout_ms`" (`backend_busy`). `error` covers
-  timeouts, connection failures, other non-2xx statuses, `success: false`, and
-  malformed or out-of-range answers.
+- A decision fails in one of two groups. `rate_limited` covers HTTP 429 and
+  saturation: no concurrency slot obtained within `decision.queue_timeout_ms`
+  (`backend_busy`). Saturation is always this group, so it follows
+  `on_rate_limit` and never `on_decision_error`. `error` covers timeouts (also
+  after a slot was obtained), connection failures, other non-2xx statuses,
+  `success: false`, and malformed or out-of-range answers.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
   `"allow"` (the default) forwards the request, `"block"` applies the site's
   `action`.

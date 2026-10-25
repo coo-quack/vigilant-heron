@@ -12,6 +12,7 @@ use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
 use common::{BoxError, StubDecider, TestResult, Upstream, send, start_proxy_config};
 use http::Method;
 use serde_json::Value;
+use std::time::Duration;
 use tracing_subscriber::fmt::MakeWriter;
 use vigilant_heron::Config;
 
@@ -247,5 +248,87 @@ async fn server_error_is_logged_as_http_status() -> TestResult {
     assert_eq!(reply.status, http::StatusCode::OK);
     let fields = decision_fields("log-500-1").ok_or("no decision event")?;
     assert_eq!(fields["decision_error"], "http_status");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn saturated_request_is_logged_as_backend_busy() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    capture();
+    let text = format!(
+        r#"
+listen = "127.0.0.1:0"
+request_id_header = "x-request-id"
+
+[decision]
+backend = "jev"
+model = "jev-latest"
+api_token_env = "TEST_JEV_TOKEN"
+url = "{url}"
+timeout_ms = 300
+max_concurrency = 1
+inspect_body_bytes = 512
+max_body_bytes = 1024
+
+[default]
+status = 421
+
+[[sites]]
+hosts = ["example.com"]
+upstream = "{upstream}"
+mode = "enforce"
+action = "block"
+block_threshold = 0.9
+instruction_threshold = 0.5
+on_rate_limit = "block"
+"#,
+        url = fake.url,
+        upstream = upstream.url()
+    );
+    let config = Config::from_toml_str_with_lookup(&text, |name| {
+        (name == TOKEN_ENV).then(|| GOOD_TOKEN.to_owned())
+    })?;
+    let proxy = start_proxy_config(config).await?;
+    let base = proxy.base();
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move {
+        send(
+            &holder_base,
+            Method::GET,
+            "/articles/slowanswer",
+            "example.com",
+            &[],
+            Bytes::new(),
+        )
+        .await
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while fake.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        if std::time::Instant::now() > deadline {
+            return Err("the holding request never reached the backend".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let reply = send(
+        &base,
+        Method::GET,
+        "/articles/queued",
+        "example.com",
+        &[("x-request-id", "log-busy-1")],
+        Bytes::new(),
+    )
+    .await?;
+    holder.await??;
+
+    assert_eq!(
+        reply.status,
+        http::StatusCode::FORBIDDEN,
+        "on_rate_limit = block applies"
+    );
+    let fields = decision_fields("log-busy-1").ok_or("no decision event")?;
+    assert_eq!(fields["decision_error"], "backend_busy");
+    assert_eq!(fields["reason"], "rate_limited_blocked");
     proxy.stop().await
 }

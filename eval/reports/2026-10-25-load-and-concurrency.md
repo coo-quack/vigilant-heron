@@ -58,3 +58,26 @@ Budget guard under concurrency (`--offline --split dev --max-yen 0.02`): cumulat
 0.0169 JPY at concurrency 1 (4 rows) and 0.0084 JPY at concurrency 8 (2 rows), both under the limit.
 At concurrency 8 fewer rows are sent: each in-flight row reserves the larger of the average and
 the largest request so far, so the guard is conservative early in a run.
+
+
+## Saturation: busy decisions counted (after the queue_timeout_ms fix)
+
+Same machine and stub as above. The router runs with `decision.max_concurrency` 16 and
+`decision.queue_timeout_ms` 0 (the default), so a call that finds no free slot fails at once as
+`backend_busy`. The site's `on_rate_limit` is the default `allow`, so every request is forwarded
+(200), and the busy decisions are counted in the log.
+
+### Load run: concurrency 64, 2000 requests
+
+- Machine: Darwin 27.0.0 (arm64), 8 logical CPUs, model Mac14,2
+- Stub decision delay: 20 ms; router decision.max_concurrency: 16; decision.timeout_ms: 300
+- Router worker_threads: unset (tokio default, one per CPU core); max_connections: 1024 (default)
+- Duration: 0.39 s; throughput: 5137.2 req/s
+- Latency ms: p50 7.6, p95 31.6, p99 79.0, mean 11.9
+- Status counts: {200: 2000}
+- Client transport errors: 0 []
+- Decision events logged: 2000; decisions that failed, by decision_error: {'backend_busy': 1760}
+
+Queue-window behaviour is covered by tests, not by this load run: `failures.rs` checks that
+`backend_busy` follows `on_rate_limit` (allow and block) with `queue_timeout_ms` 0 and with an
+expired queue window, and that a request which gets a slot within the window is judged normally.

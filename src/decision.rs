@@ -16,7 +16,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::error::{DecisionError, ProbabilityError, ServeError};
 use crate::sanitize::DecisionEvent;
@@ -105,27 +105,46 @@ pub(crate) fn decision_client() -> Result<DecisionClient, ServeError> {
     Ok(Client::builder(TokioExecutor::new()).build(connector))
 }
 
+/// The limits that bound one decision call, shared by all calls of a backend.
+#[derive(Clone)]
+pub(crate) struct Limits {
+    /// Total time for one call, including any wait for a slot.
+    pub(crate) timeout: Duration,
+    /// Longest wait for a slot. Zero means a call fails at once when no slot is free.
+    pub(crate) queue_timeout: Duration,
+    /// Concurrent calls allowed.
+    pub(crate) slots: Arc<Semaphore>,
+}
+
 /// Posts a JSON payload and returns the response body, bounded in size and time.
 ///
-/// `bearer` is sent as an `Authorization: Bearer` header when given. Waiting for a
-/// slot in `slots` counts against the same `timeout`; running out of time while
-/// waiting is [`DecisionError::Busy`], and running out during the exchange is
-/// [`DecisionError::Timeout`].
+/// `bearer` is sent as an `Authorization: Bearer` header when given. The wait for
+/// a slot is bounded by `queue_timeout` only: if no slot is obtained in that
+/// window the result is always [`DecisionError::Busy`]. The exchange then gets
+/// the rest of `timeout`, and running out there is [`DecisionError::Timeout`].
 pub(crate) async fn post_json(
     client: &DecisionClient,
     url: &Uri,
     bearer: Option<&str>,
     payload: Vec<u8>,
-    timeout: Duration,
-    slots: &Semaphore,
+    limits: &Limits,
 ) -> Result<Bytes, DecisionError> {
-    let deadline = tokio::time::Instant::now() + timeout;
-    let Ok(Ok(_slot)) = tokio::time::timeout_at(deadline, slots.acquire()).await else {
-        return Err(DecisionError::Busy);
-    };
-    match tokio::time::timeout_at(deadline, exchange(client, url, bearer, payload)).await {
+    let started = tokio::time::Instant::now();
+    let _slot = acquire_slot(limits).await?;
+    let remaining = limits.timeout.saturating_sub(started.elapsed());
+    match tokio::time::timeout(remaining, exchange(client, url, bearer, payload)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(DecisionError::Timeout),
+    }
+}
+
+async fn acquire_slot(limits: &Limits) -> Result<SemaphorePermit<'_>, DecisionError> {
+    if limits.queue_timeout.is_zero() {
+        return limits.slots.try_acquire().map_err(|_| DecisionError::Busy);
+    }
+    match tokio::time::timeout(limits.queue_timeout, limits.slots.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) | Err(_) => Err(DecisionError::Busy),
     }
 }
 
@@ -171,24 +190,16 @@ async fn exchange(
 pub(crate) struct HttpDecisionBackend {
     client: DecisionClient,
     url: Uri,
-    timeout: Duration,
-    slots: Arc<Semaphore>,
+    limits: Limits,
 }
 
 impl HttpDecisionBackend {
-    /// Creates a backend that posts to `url`, gives up after `timeout`, and takes
-    /// a slot from `slots` for each call.
-    pub(crate) fn new(
-        client: DecisionClient,
-        url: Uri,
-        timeout: Duration,
-        slots: Arc<Semaphore>,
-    ) -> Self {
+    /// Creates a backend that posts to `url` under `limits`.
+    pub(crate) fn new(client: DecisionClient, url: Uri, limits: Limits) -> Self {
         Self {
             client,
             url,
-            timeout,
-            slots,
+            limits,
         }
     }
 }
@@ -196,15 +207,7 @@ impl HttpDecisionBackend {
 impl DecisionBackend for HttpDecisionBackend {
     async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         let payload = serde_json::to_vec(event)?;
-        let body = post_json(
-            &self.client,
-            &self.url,
-            None,
-            payload,
-            self.timeout,
-            &self.slots,
-        )
-        .await?;
+        let body = post_json(&self.client, &self.url, None, payload, &self.limits).await?;
         let raw: RawVerdict = serde_json::from_slice(&body)?;
         Ok(Verdict {
             attack: Probability::new(raw.attack)?,
@@ -248,24 +251,74 @@ mod tests {
 
     use super::*;
 
+    fn limits(queue_ms: u64, slots: Arc<Semaphore>) -> Limits {
+        Limits {
+            timeout: Duration::from_millis(500),
+            queue_timeout: Duration::from_millis(queue_ms),
+            slots,
+        }
+    }
+
+    fn closed_url() -> Result<Uri, Box<dyn std::error::Error>> {
+        Ok("http://127.0.0.1:9/decide".parse()?)
+    }
+
     #[tokio::test]
-    async fn post_json_reports_busy_when_no_slot_frees_within_the_timeout()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn no_free_slot_with_no_queue_is_busy_at_once() -> Result<(), Box<dyn std::error::Error>>
+    {
         let client = decision_client()?;
-        let url: Uri = "http://127.0.0.1:9/decide".parse()?;
-        let slots = Semaphore::new(1);
-        // Hold the only slot for the whole test, so the call can only wait.
+        let slots = Arc::new(Semaphore::new(1));
+        // Hold the only slot for the whole test.
         let _held = slots.acquire().await?;
         let result = post_json(
             &client,
-            &url,
+            &closed_url()?,
             None,
             Vec::new(),
-            Duration::from_millis(50),
-            &slots,
+            &limits(0, Arc::clone(&slots)),
         )
         .await;
         assert!(matches!(result, Err(DecisionError::Busy)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_slot_within_the_queue_window_is_busy() -> Result<(), Box<dyn std::error::Error>> {
+        let client = decision_client()?;
+        let slots = Arc::new(Semaphore::new(1));
+        let _held = slots.acquire().await?;
+        let result = post_json(
+            &client,
+            &closed_url()?,
+            None,
+            Vec::new(),
+            &limits(30, Arc::clone(&slots)),
+        )
+        .await;
+        assert!(matches!(result, Err(DecisionError::Busy)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slot_freed_within_the_queue_window_proceeds_to_the_exchange()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = decision_client()?;
+        let slots = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&slots).acquire_owned().await?;
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        let result = post_json(
+            &client,
+            &closed_url()?,
+            None,
+            Vec::new(),
+            &limits(500, slots),
+        )
+        .await;
+        // The exchange runs against a closed port, so it fails, but not as busy.
+        assert!(matches!(result, Err(DecisionError::Transport(_))));
         Ok(())
     }
 

@@ -49,9 +49,11 @@ pub struct DecisionConfig {
     pub inspect_body_bytes: usize,
     /// Largest request body the proxy reads at all.
     pub max_body_bytes: usize,
-    /// Most decision-backend calls in flight at the same time. Waiting for a slot
-    /// counts against `timeout`.
+    /// Most decision-backend calls in flight at the same time.
     pub max_concurrency: usize,
+    /// Longest wait for a free slot. Not getting one in this window is always
+    /// `backend_busy`. Zero means no queueing.
+    pub queue_timeout: Duration,
     /// Extra header names to drop before sending, lowercased.
     pub redact_headers: Vec<String>,
 }
@@ -256,6 +258,8 @@ struct RawDecision {
     #[serde(default = "default_max_concurrency")]
     max_concurrency: usize,
     #[serde(default)]
+    queue_timeout_ms: u64,
+    #[serde(default)]
     redact_headers: Vec<String>,
 }
 
@@ -405,6 +409,12 @@ impl RawDecision {
         if self.max_concurrency == 0 {
             return Err(ConfigError::ZeroMaxConcurrency);
         }
+        if self.queue_timeout_ms > self.timeout_ms {
+            return Err(ConfigError::QueueTimeoutExceedsTimeout {
+                queue: self.queue_timeout_ms,
+                timeout: self.timeout_ms,
+            });
+        }
         if self.inspect_body_bytes > self.max_body_bytes {
             return Err(ConfigError::InspectExceedsMax {
                 inspect: self.inspect_body_bytes,
@@ -418,6 +428,7 @@ impl RawDecision {
             inspect_body_bytes: self.inspect_body_bytes,
             max_body_bytes: self.max_body_bytes,
             max_concurrency: self.max_concurrency,
+            queue_timeout: Duration::from_millis(self.queue_timeout_ms),
             redact_headers: self
                 .redact_headers
                 .iter()
@@ -1243,6 +1254,39 @@ action = "block"
             Config::from_toml_str(&input),
             Err(ConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn queue_timeout_defaults_to_no_queueing() -> Result<(), ConfigError> {
+        let config = Config::from_toml_str(&config_with(""))?;
+        assert_eq!(config.decision.queue_timeout, Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn queue_timeout_longer_than_the_timeout_is_rejected() {
+        let input = DECISION.replace(
+            "timeout_ms = 150",
+            "timeout_ms = 150\nqueue_timeout_ms = 151",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&format!("{input}{SITE}")),
+            Err(ConfigError::QueueTimeoutExceedsTimeout {
+                queue: 151,
+                timeout: 150
+            })
+        ));
+    }
+
+    #[test]
+    fn queue_timeout_equal_to_the_timeout_is_accepted() -> Result<(), ConfigError> {
+        let input = DECISION.replace(
+            "timeout_ms = 150",
+            "timeout_ms = 150\nqueue_timeout_ms = 150",
+        );
+        let config = Config::from_toml_str(&format!("{input}{SITE}"))?;
+        assert_eq!(config.decision.queue_timeout, Duration::from_millis(150));
+        Ok(())
     }
 
     #[test]

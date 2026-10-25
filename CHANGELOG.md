@@ -11,6 +11,8 @@
   over both.
 - Concurrency: `max_connections`, `worker_threads` and `decision.max_concurrency`
   bound client connections, runtime threads and decision-backend calls.
+  `decision.queue_timeout_ms` (default 0) bounds the wait for a slot; a request
+  that does not get one in that window is always `backend_busy`, a rate limit.
 - `request_id_header` logs a request id with each decision event.
 - The example config ships a list of commonly probed deny paths.
 - Evaluation harness (`eval/`), a load tool, and the first Clef-flash and Jev

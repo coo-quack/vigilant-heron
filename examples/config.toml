@@ -55,6 +55,14 @@ timeout_ms = 150
 # Most decision-backend calls in flight at the same time. At least 1.
 max_concurrency = 64
 
+# Longest wait for a free concurrency slot, in milliseconds. Zero (default) means
+# no queueing: when no slot is free, the request fails at once as backend_busy.
+# A request that does not get a slot within this window is always backend_busy,
+# which is a rate limit (on_rate_limit applies). Once it has a slot, the rest of
+# timeout_ms is its budget, and running out there is a timeout (on_decision_error).
+# Must not exceed timeout_ms.
+# queue_timeout_ms = 0
+
 # Bytes of the request body that are sent to the backend. The rest is cut
 # on a UTF-8 character boundary and body_truncated is set.
 inspect_body_bytes = 8192
