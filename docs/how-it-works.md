@@ -15,9 +15,9 @@ decides the request ends the evaluation.
    before the body is read. A request over a limit gets the limit's status
    (503 by default) and is never forwarded. In a shadow site it is forwarded and
    recorded with `would_have=reject`.
-1. **Host.** A `Host` header that is not a hostname, an IPv4 address or a bracketed
-   IPv6 literal, with an optional `:port`, gets 400 (reason `invalid_host`) before the
-   access list. A request without a `Host` header is routed as before.
+1. **Host.** A `Host` header whose name has characters other than letters, digits,
+   `.`, `-` and `_`, and that is not a bracketed IPv6 literal, with an optional
+   digits-only `:port`, gets 400 (reason `invalid_host`) before the access list. A request without a `Host` header is routed as before.
 2. **Access list.** The `allow` and `deny` entries are checked in order by the
    client address. A denied client gets 403 with reason `access_denied`. The
    site's `action` does not apply.

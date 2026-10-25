@@ -174,9 +174,10 @@
 - Security (F7): the decision event's `meta.host` is the name of the matched
   site (its first name, or the pattern of a wildcard or regex site), never the
   client's `Host`. The client's `Host` stays in the `untrusted` headers only. A
-  `Host` that is not a hostname, an IPv4 address or a bracketed IPv6 literal with
-  an optional port now gets 400 with reason `invalid_host`, before the access
-  list. A request with no `Host` header is routed as before.
+  `Host` whose name has characters other than letters, digits, `.`, `-` and `_`
+  (and is not a bracketed IPv6 literal, with an optional digits-only port) now gets
+  400 with reason `invalid_host`, before the access list. Underscores are allowed,
+  since real deployments use them. A request with no `Host` header is routed as before.
 - Security (F1, F4, F5, F9): the security checks read the request path in six
   ways (decoded; with `;` parameters cut per segment; with `\` as `/`; both; and
   the raw path with `%2F` and `%5C` kept inside their segments, plain and with

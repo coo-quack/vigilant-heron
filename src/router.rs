@@ -227,7 +227,7 @@ pub(crate) fn normalize_host(raw: &str) -> String {
 
 /// Returns true when a `Host` value has the shape of a hostname or a literal, with an optional port.
 ///
-/// Accepted: letters, digits, `.` and `-` in the name (a trailing dot is allowed), or a
+/// Accepted: letters, digits, `.`, `-` and `_` in the name (a trailing dot is allowed), or a
 /// bracketed IPv6 literal of hex digits, `:` and `.`, then an optional `:port` of digits.
 /// Anything else, including an empty value, is refused before routing.
 pub(crate) fn is_valid_host(raw: &str) -> bool {
@@ -249,7 +249,7 @@ pub(crate) fn is_valid_host(raw: &str) -> bool {
     let name_ok = !name.is_empty()
         && name
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
     name_ok && port.is_none_or(port_ok)
 }
 
@@ -269,6 +269,7 @@ mod tests {
     #[case::name_with_port("example.com:8080")]
     #[case::trailing_dot("example.com.")]
     #[case::hyphen_and_digits("a-1.example.co")]
+    #[case::underscore("my_app.example.com")]
     #[case::ipv4("192.0.2.1:80")]
     #[case::ipv6("[2001:db8::1]")]
     #[case::ipv6_with_port("[::1]:8443")]
@@ -280,7 +281,7 @@ mod tests {
     #[case::empty("")]
     #[case::space("exa mple.com")]
     #[case::slash("example.com/x")]
-    #[case::underscore("my_host.example.com")]
+    #[case::slash_in_name("my/host.example.com")]
     #[case::semicolon("example.com;x")]
     #[case::empty_port("example.com:")]
     #[case::letter_port("example.com:80a")]

@@ -157,8 +157,9 @@ the top-level list for that site. An unknown id is a configuration error.
 
 For each request, in this order:
 
-1. A `Host` that is not a hostname or a literal, with an optional port, gets 400
-   (`reason invalid_host`).
+1. A `Host` whose name has characters other than letters, digits, `.`, `-` and
+   `_`, and that is not a bracketed IPv6 literal, with an optional digits-only port,
+   gets 400 (`reason invalid_host`).
 2. The access list. A denied client gets 403 (`reason access_denied`).
 3. `deny_path` entries of the site. A match is a rule block (`reason rule`, no
    `$rule_id`).

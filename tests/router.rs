@@ -435,6 +435,48 @@ async fn backend_meta_host_is_the_configured_site_name_not_the_client_host() -> 
 }
 
 #[tokio::test]
+async fn a_host_with_an_underscore_is_routed_to_its_site() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+client_max_body_size 1024;
+decision {{
+    backend http;
+    url "{decide}";
+    timeout {GENEROUS_TIMEOUT_MS}ms;
+    inspect_body 512;
+}}
+default_status 421;
+site *.example.com {{
+    upstream "{upstream}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        decide = stub.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "my_app.example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn backend_meta_host_is_the_wildcard_pattern_for_a_wildcard_site() -> TestResult {
     let upstream = Upstream::start().await?;
     let stub = StubDecider::start().await?;
