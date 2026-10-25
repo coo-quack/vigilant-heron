@@ -648,11 +648,22 @@ fn signal_reopen_keeps_serving_and_writes_to_a_new_access_log_file() -> Result<(
 
     let output = fixture.signal("reopen")?;
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
-    assert!(
-        wait_for(port, "example.com", "/after-reopen", 200).is_some(),
-        "the router stopped serving"
-    );
-    let written = std::fs::read_to_string(&log)?;
+    // `-s reopen` returns once the signal is sent; the router reopens the file
+    // and writes access lines asynchronously. Keep sending requests until one
+    // of them is in the new file, within a deadline.
+    let deadline = Instant::now() + READY;
+    let mut written = String::new();
+    while Instant::now() < deadline {
+        assert!(
+            wait_for(port, "example.com", "/after-reopen", 200).is_some(),
+            "the router stopped serving"
+        );
+        written = std::fs::read_to_string(&log).unwrap_or_default();
+        if written.contains("/after-reopen") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     assert!(
         written.contains("/after-reopen"),
         "the new log file lacks the request: {written}"

@@ -235,8 +235,19 @@ wait_for_status example.com "$attack" 418
 echo "e2e-cli: reopen the access log"
 mv "$ACCESS" "$ACCESS.1"
 expect_exit 0 "$VH" -s reopen -c "$CONF"
-curl -s -o /dev/null -H "Host: example.com" "http://127.0.0.1:$VH_PORT/reopen-check"
-wait_for_text "$ACCESS" "/reopen-check"
+# -s reopen returns once the signal is sent, and the router reopens the file
+# asynchronously: a request served before that is logged to the old file, so
+# keep sending requests until one reaches the new file.
+reopened=0
+for i in $(seq 1 50); do
+  curl -s -o /dev/null -H "Host: example.com" "http://127.0.0.1:$VH_PORT/reopen-check"
+  if [ -f "$ACCESS" ] && grep -qF -- "/reopen-check" "$ACCESS"; then
+    reopened=1
+    break
+  fi
+  sleep 0.2
+done
+[ "$reopened" = 1 ] || fail "$ACCESS does not contain \"/reopen-check\" after -s reopen"
 
 echo "e2e-cli: quit"
 expect_exit 0 "$VH" -s quit -c "$CONF"
