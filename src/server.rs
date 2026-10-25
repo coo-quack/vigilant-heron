@@ -45,7 +45,7 @@ use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, 
 use crate::logsink::{Writer, spawn_writer};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
-use crate::proxy::Proxy;
+use crate::proxy::{HeaderContext, HeaderOp, Proxy, upstream_headers};
 use crate::realip::RealIp;
 use crate::router::{Router, normalize_host};
 use crate::rules::RuleInput;
@@ -525,7 +525,29 @@ async fn pipeline<B: DecisionBackend>(
     } else {
         block.unwrap_or(&access_block)
     };
-    let outcome = respond(proxy, site, parts, body, peer, &decision, block).await;
+    // The request headers that proxy_set_header values may use, and the operations of the level in effect.
+    let header_ops = location
+        .map(|location| location.proxy_headers.as_slice())
+        .or_else(|| matched.map(|site| site.proxy_headers.as_slice()))
+        .unwrap_or_default();
+    let ctx = HeaderContext {
+        client_ip: trace.client_ip,
+        remote_addr: trace.remote_addr,
+        host: &host,
+        site: site_name(site),
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        request_id: trace.request_id.unwrap_or_default(),
+        headers: &parts.headers,
+    };
+    let delivery = Delivery {
+        proxy,
+        upstream: &site.upstream,
+        headers: header_ops,
+        block,
+        ctx,
+    };
+    let outcome = respond(&delivery, parts, body, peer, &decision).await;
     let mut response = outcome.response;
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
@@ -609,35 +631,50 @@ fn close(response: &mut Response<ResponseBody>) {
         .insert(CONNECTION, HeaderValue::from_static("close"));
 }
 
+/// Where an allowed request is forwarded, and what a block answers with.
+struct Delivery<'a> {
+    /// The upstream client of the site.
+    proxy: &'a Proxy,
+    /// The site's upstream URI.
+    upstream: &'a http::Uri,
+    /// The `proxy_set_header` operations of the level in effect.
+    headers: &'a [HeaderOp],
+    /// The block response of the level in effect.
+    block: &'a BlockResponse,
+    /// The values `proxy_set_header` values may use.
+    ctx: HeaderContext<'a>,
+}
+
 /// Forwards an allowed request, or answers a block or redirect.
 ///
 /// `complete` says whether the request body was read in full. When it was not,
 /// the response closes the connection, because the rest of the body would
 /// otherwise be read as the next request.
 async fn respond(
-    proxy: &Proxy,
-    site: &SiteConfig,
+    delivery: &Delivery<'_>,
     parts: &Parts,
     body: ClientBody,
     peer: SocketAddr,
     decision: &Decision,
-    block: &BlockResponse,
 ) -> Outcome {
     let complete = body.is_complete();
+    let block = delivery.block;
     match &decision.action {
         Action::Allow => {
             let path_and_query = parts
                 .uri
                 .path_and_query()
                 .map_or("/", |value| value.as_str());
-            match proxy
+            let headers =
+                upstream_headers(&parts.headers, peer.ip(), delivery.headers, &delivery.ctx);
+            match delivery
+                .proxy
                 .forward(
                     parts.method.clone(),
-                    &parts.headers,
+                    headers,
                     path_and_query,
                     body,
-                    &site.upstream,
-                    peer.ip(),
+                    delivery.upstream,
                 )
                 .await
             {

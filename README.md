@@ -481,6 +481,40 @@ site example.com {
 }
 ```
 
+### Proxy headers
+
+By default the upstream receives the request's headers without the hop-by-hop
+ones, with the peer address appended to `X-Forwarded-For`, and the `Host` the
+client sent. `proxy_set_header <name> <value>;` changes that. It is valid at the
+top level, in a `site`, and in a `location`:
+
+- The value may contain these variables: `$client_ip` (the address from the
+  realip settings), `$remote_addr` (the TCP peer), `$host`, `$site`, `$method`,
+  `$path`, `$request_id`, and `$http_<name>` (a request header, with `_` for `-`).
+  A value with `$` in it must be quoted when it has `{` or `}`, as in
+  `"${http_x_forwarded_proto}"`.
+- The operations of a level are applied in order after the defaults, so a later
+  line replaces an earlier one with the same name.
+- An empty value, or a value whose variable is empty (for example a missing
+  `$http_<name>`), removes the header.
+- A level with any `proxy_set_header` replaces the list it inherits. A location
+  without one uses its site's list, and a site without one uses the top level's.
+- The defaults are not switched off by an operation: `X-Forwarded-For` is still
+  appended unless the list sets or removes it, and `Host` is kept unless set.
+- Hop-by-hop headers (`Connection`, `Upgrade`, `Keep-Alive`, `Transfer-Encoding`,
+  `TE`, `Trailer`, `Proxy-Connection`) cannot be set, and are a configuration error.
+
+To add the usual proxy headers:
+
+```
+proxy_set_header X-Real-IP $client_ip;
+proxy_set_header X-Forwarded-Proto "$http_x_forwarded_proto";
+```
+
+`$http_x_forwarded_proto` is empty when the edge sends no such header, so the
+upstream gets no `X-Forwarded-Proto`. The edge (nginx or Cloudflare) has to set
+it for it to arrive.
+
 Times take `ms`, `s`, `m` or `h` (a bare number is seconds, as in nginx). Sizes
 take `k`, `m` or `g`. Every error names the file and line, for example
 `vigilant-heron.conf:12: "block_threshold" must be between 0 and 1`.

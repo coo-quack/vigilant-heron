@@ -32,6 +32,7 @@ use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::Directive;
 use crate::config::{block, invalid, once, one_arg, parse_size};
 use crate::error::ConfigError;
+use crate::proxy::HeaderOp;
 use crate::transport::lock;
 
 /// Bytes of memory per `limit_req` state, as in nginx.
@@ -676,6 +677,8 @@ pub(crate) struct PendingLocation<'a> {
     pub(crate) overrides: LimitOverrides,
     /// The block response directives written in the block.
     pub(crate) block: BlockOverrides,
+    /// The `proxy_set_header` operations of the block, which replace the site's when present.
+    pub(crate) headers: Option<Vec<HeaderOp>>,
 }
 
 /// Parses `location [=|~|~*|^~] <path> { ... }`, with only limit directives inside.
@@ -734,11 +737,16 @@ pub(crate) fn parse_location<'a>(
     };
     let mut overrides = LimitOverrides::default();
     let mut block_overrides = BlockOverrides::default();
+    let mut headers: Option<Vec<HeaderOp>> = None;
     let mut seen = HashSet::new();
     for child in block(directive)? {
         let name = child.name.as_str();
         if BLOCK_NAMES.contains(&name) {
             block_overrides.apply(child, &mut seen)?;
+        } else if name == "proxy_set_header" {
+            headers
+                .get_or_insert_with(Vec::new)
+                .push(HeaderOp::parse(child)?);
         } else if LIMIT_NAMES.contains(&name) {
             overrides.apply(child, zones, &mut seen)?;
         } else {
@@ -753,6 +761,7 @@ pub(crate) fn parse_location<'a>(
         matcher,
         overrides,
         block: block_overrides,
+        headers,
     })
 }
 
@@ -775,6 +784,8 @@ pub(crate) struct LocationConfig {
     pub(crate) limits: LimitSet,
     /// The block response for requests this location selects.
     pub(crate) block: BlockResponse,
+    /// The `proxy_set_header` operations for requests this location selects.
+    pub(crate) proxy_headers: Vec<HeaderOp>,
 }
 
 /// Chooses the location for a request path, with nginx's precedence.

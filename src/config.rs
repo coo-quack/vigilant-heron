@@ -20,6 +20,7 @@ use crate::conf::{self, Directive};
 use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig};
 use crate::logsink::Destination;
+use crate::proxy::HeaderOp;
 use crate::realip::{IpNet, RealIp};
 use crate::router::HostPattern;
 use crate::rules::{self, ParsedRule, Rule, Scope, SiteRules};
@@ -230,6 +231,8 @@ pub struct SiteConfig {
     pub default_server: bool,
     /// The response to a blocked request, unless a location overrides it.
     pub block: BlockResponse,
+    /// The `proxy_set_header` operations applied to forwarded requests, unless a location overrides them.
+    pub(crate) proxy_headers: Vec<HeaderOp>,
     /// The parsed host names, in configuration order.
     pub(crate) host_patterns: Vec<HostPattern>,
     /// Absolute `http://` URI requests are forwarded to.
@@ -689,6 +692,7 @@ where
     let mut disabled_top: Vec<String> = Vec::new();
     let mut top_access: Vec<AccessEntry> = Vec::new();
     let mut top_block = BlockOverrides::default();
+    let mut top_headers: Option<Vec<HeaderOp>> = None;
     let mut top_rules: Vec<ParsedRule> = Vec::new();
     let mut listen = None;
     let mut worker_threads = None;
@@ -882,6 +886,9 @@ where
             }
             "allow" | "deny" => top_access.push(access_entry(directive)?),
             name if BLOCK_NAMES.contains(&name) => top_block.apply(directive, &mut seen)?,
+            "proxy_set_header" => top_headers
+                .get_or_insert_with(Vec::new)
+                .push(HeaderOp::parse(directive)?),
             "builtin_rules" => {
                 once(&mut seen, directive)?;
                 builtin_top = parse_bool(directive, one_arg(directive)?)?;
@@ -920,6 +927,7 @@ where
     }
     let top_limits = top_overrides.resolve(&LimitSet::default());
     let top_block = top_block.resolve(&BlockResponse::default());
+    let top_headers = top_headers.unwrap_or_default();
     let access_logs = resolve_top_access(&access_directives, &formats)?;
 
     if site_directives.is_empty() {
@@ -938,6 +946,7 @@ where
         zones: &zones,
         limits: &top_limits,
         block: &top_block,
+        headers: &top_headers,
     };
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
@@ -1461,6 +1470,8 @@ struct Top<'a> {
     limits: &'a LimitSet,
     /// The top-level block response, inherited by every site.
     block: &'a BlockResponse,
+    /// The top-level `proxy_set_header` operations, inherited by every site.
+    headers: &'a [HeaderOp],
 }
 
 /// Reads one `allow` or `deny` directive.
@@ -1535,6 +1546,7 @@ fn parse_site(
     let mut site_limits = LimitOverrides::default();
     let mut pending_locations = Vec::new();
     let mut site_block = BlockOverrides::default();
+    let mut site_headers: Option<Vec<HeaderOp>> = None;
 
     for child in block(directive)? {
         match child.name.as_str() {
@@ -1659,6 +1671,9 @@ fn parse_site(
                 site_limits.apply(child, top.zones, &mut seen)?;
             }
             name if BLOCK_NAMES.contains(&name) => site_block.apply(child, &mut seen)?,
+            "proxy_set_header" => site_headers
+                .get_or_insert_with(Vec::new)
+                .push(HeaderOp::parse(child)?),
             "location" => pending_locations.push(limits::parse_location(child, top.zones)?),
             "default_server" => {
                 if !child.args.is_empty() {
@@ -1677,6 +1692,8 @@ fn parse_site(
     }
     let site_limit_set = site_limits.resolve(top.limits);
     let block_response = site_block.resolve(top.block);
+    // A site with its own proxy_set_header replaces the inherited list, as in nginx.
+    let proxy_headers = site_headers.unwrap_or_else(|| top.headers.to_vec());
     let mut locations: Vec<LocationConfig> = Vec::new();
     for pending in pending_locations {
         let duplicate = locations.iter().any(|earlier| {
@@ -1693,6 +1710,7 @@ fn parse_site(
             matcher: pending.matcher,
             limits: pending.overrides.resolve(&site_limit_set),
             block: pending.block.resolve(&block_response),
+            proxy_headers: pending.headers.unwrap_or_else(|| proxy_headers.clone()),
         });
     }
 
@@ -1734,6 +1752,7 @@ fn parse_site(
         default_server,
         host_patterns,
         block: block_response,
+        proxy_headers,
         upstream,
         mode,
         action,

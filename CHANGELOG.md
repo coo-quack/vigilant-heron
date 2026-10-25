@@ -7,6 +7,11 @@
   leading wildcard, then trailing wildcard, then regex precedence. `default_server;`
   marks the one site that takes hosts matching no site (at most one per
   configuration). A name claimed by two sites is still a configuration error.
+- `proxy_set_header <name> <value>;` at the top level, in a `site` and in a
+  `location`, with nginx's replace-per-level and empty-removes rules. Values take
+  `$client_ip`, `$remote_addr`, `$host`, `$site`, `$method`, `$path`,
+  `$request_id` and `$http_<name>`. The default headers (Host kept,
+  `X-Forwarded-For` appended) are unchanged. Hop-by-hop headers cannot be set.
 - `block_status <code>;` (4xx or 5xx, or 444 to close the connection without a
   response) and `block_page <file>;` (HTML, at most 64 KiB, read at load time) for
   blocked requests, at the top level, in a `site` and in a `location`. Limit
