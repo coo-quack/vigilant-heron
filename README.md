@@ -332,6 +332,7 @@ outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
 |---|---|---|
 | `max_connections` | client connections open at the same time | 1024 |
 | `worker_threads` | runtime threads that run the proxy | one per CPU core |
+| `worker_shutdown_timeout` | how long a shutdown waits for open connections and tunnels before closing them | unset (wait indefinitely) |
 | `decision` `max_concurrency` | decision-backend calls in flight at the same time | 64 |
 | `decision` `queue_timeout` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
 
@@ -537,8 +538,8 @@ Protocols`, the two connections are joined and their bytes are copied both ways.
 - The tunnel closes when either side closes, or when neither side has moved a
   byte for `proxy_read_timeout` (60s by default).
 - While a tunnel is open it counts against `limit_conn`, like any connection.
-- Shutdown does not wait for open tunnels: they end on their own timeout or when
-  the connection closes.
+- A shutdown waits for open tunnels until the client or the upstream closes
+  them, and `worker_shutdown_timeout` bounds that wait (see Shutdown below).
 
 The edge must forward the upgrade too. With nginx in front, use
 `proxy_http_version 1.1;` and pass `Upgrade` and `Connection` (see `e2e/`).
@@ -628,6 +629,27 @@ or use `latest`. To build the image yourself:
 ```bash
 docker build --target runtime -t vigilant-heron .
 ```
+
+### Shutdown
+
+`SIGINT` and `SIGTERM` stop the router. It stops accepting connections, and then:
+
+- Requests in flight finish, and idle keep-alive connections close.
+- Lingering closes that are in progress finish.
+- Open WebSocket tunnels stay open until one side closes them, or until
+  `proxy_read_timeout` passes with no traffic. No close is sent to them.
+
+Without `worker_shutdown_timeout`, the router waits for all of this indefinitely,
+as nginx does by default. A single WebSocket that stays busy then keeps the
+process running, so set the timeout when tunnels are used:
+
+```
+worker_shutdown_timeout 30s;
+```
+
+When the time expires, every connection and tunnel still open is closed, and the
+process exits. The directive takes a positive time, is read at the top level only,
+and is read at startup: a reload that changes it logs a warning.
 
 ## Decision backends
 

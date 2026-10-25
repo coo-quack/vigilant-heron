@@ -34,7 +34,7 @@ src/
   config.rs      # Directive tree -> validated Config; every error names file:line
   realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
   accesslog.rs   # log_format compiler, variables, escaping, built-in json and main formats
-  logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog, error log
+  logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog; error log with reloadable level and destination
   router.rs      # Host normalization and site lookup: exact, leading and trailing wildcards, ~regex, default_server
   block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
@@ -46,10 +46,10 @@ src/
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
   proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers, proxy_set_header
-  tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits
+  tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits; shutdown waits for tunnels and force-closes them at worker_shutdown_timeout
   transport.rs   # Client socket: header, keep-alive and send timers, header limits (414/400); upstream send timer
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
-  server.rs      # Accept loop, reload (watch channel of the state), per-request pipeline, access records
+  server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
   error.rs       # Error types
 tests/
   router.rs      # In-process integration tests with stub upstream and backend

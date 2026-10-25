@@ -5,8 +5,8 @@ mod common;
 
 use std::time::Duration;
 
-use common::{StubBehavior, StubDecider, TestResult, start_proxy};
-use http::{Request, Response, StatusCode};
+use common::{StubBehavior, StubDecider, TestResult, send, start_proxy};
+use http::{Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -214,4 +214,96 @@ async fn an_open_tunnel_counts_against_limit_conn() -> TestResult {
 
     drop(first);
     proxy.stop().await
+}
+
+#[tokio::test]
+async fn shutdown_waits_for_an_open_tunnel_until_the_client_closes() -> TestResult {
+    let upstream = start_echo_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+    let (socket, head) = handshake(proxy.addr, "/open").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    let stopping = tokio::spawn(proxy.stop());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !stopping.is_finished(),
+        "shutdown returned while a tunnel was open"
+    );
+
+    drop(socket);
+    tokio::time::timeout(Duration::from_secs(5), stopping).await???;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_expired_worker_shutdown_timeout_closes_the_open_tunnel() -> TestResult {
+    let upstream = start_echo_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream,
+        "worker_shutdown_timeout 300ms;",
+        "proxy_websocket on;",
+    ))
+    .await?;
+    let (mut socket, head) = handshake(proxy.addr, "/open").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    let started = std::time::Instant::now();
+    let stopping = tokio::spawn(proxy.stop());
+    // The client keeps the tunnel open, so only the timeout can close it.
+    let mut buf = [0u8; 16];
+    let read = tokio::time::timeout(Duration::from_secs(5), socket.read(&mut buf)).await??;
+    assert_eq!(read, 0, "the tunnel was not closed");
+    tokio::time::timeout(Duration::from_secs(5), stopping).await???;
+    let waited = started.elapsed();
+    assert!(
+        waited >= Duration::from_millis(250),
+        "stopped after {waited:?}"
+    );
+    assert!(waited < Duration::from_secs(4), "stopped after {waited:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_in_flight_request_finishes_before_shutdown_returns() -> TestResult {
+    let upstream = start_echo_upstream().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(StubBehavior {
+        delay: Duration::from_millis(600),
+        ..StubBehavior::default()
+    });
+    let proxy = start_proxy(&config(&stub.decide_url(), upstream, "", "")).await?;
+    let base = proxy.base();
+    let request = tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/slow",
+            "example.com",
+            &[],
+            Bytes::new(),
+        )
+        .await
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while stub.calls() == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the request never reached the decision".into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let stopping = tokio::spawn(proxy.stop());
+    let reply = request.await??;
+    assert_eq!(reply.status, StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(5), stopping).await???;
+    Ok(())
 }

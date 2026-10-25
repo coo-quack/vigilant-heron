@@ -23,6 +23,10 @@
 - `vigilant-heron -t [--config <path>]` checks the configuration like `nginx -t`:
   it validates the whole file (includes, rules, block pages, token variables),
   reports the result on stderr and exits 0 or 1. It never binds or serves.
+- `worker_shutdown_timeout <time>;` (top level, startup only, unset by default).
+  A shutdown now waits for open WebSocket tunnels as well as in-flight requests.
+  Without the directive it waits indefinitely, as nginx does; with it, every
+  connection and tunnel still open is closed when the time expires.
 - `proxy_websocket on|off;` in a `site` and a `location` (default off). With `on`,
   an HTTP/1.1 Upgrade handshake is screened like any request, then forwarded; a
   `101` from the upstream is spliced into a bidirectional tunnel that closes after

@@ -206,6 +206,7 @@ struct Startup {
     listen: String,
     worker_threads: Option<usize>,
     max_connections: usize,
+    worker_shutdown_timeout: Option<Duration>,
     connection: ConnectionConfig,
 }
 
@@ -215,6 +216,7 @@ impl Startup {
             listen: config.listen.clone(),
             worker_threads: config.worker_threads,
             max_connections: config.max_connections,
+            worker_shutdown_timeout: config.worker_shutdown_timeout,
             connection: config.connection.clone(),
         }
     }
@@ -229,6 +231,11 @@ impl Startup {
         }
         if config.max_connections != self.max_connections {
             tracing::warn!("max_connections changed; a restart is needed for it to take effect");
+        }
+        if config.worker_shutdown_timeout != self.worker_shutdown_timeout {
+            tracing::warn!(
+                "worker_shutdown_timeout changed; a restart is needed for it to take effect"
+            );
         }
         if config.connection != self.connection {
             tracing::warn!(
@@ -302,6 +309,7 @@ async fn run(
     reloads: Option<(mpsc::Receiver<()>, Loader, Applied)>,
 ) -> Result<(), ServeError> {
     let max_connections = config.max_connections;
+    let shutdown_timeout = config.worker_shutdown_timeout;
     let settings = ConnectionSettings {
         timers: ClientTimers::from_config(&config.connection),
         keepalive_requests: config.connection.keepalive_requests,
@@ -310,6 +318,9 @@ async fn run(
     let initial = Arc::new(AppState::from_config(config, &[])?);
     let (current_tx, current_rx) = watch::channel(initial);
     let (stop_tx, stop_rx) = watch::channel(false);
+    // Each connection and each tunnel holds a clone of `open_tx`; the drain ends when none is left.
+    let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
+    let (force_tx, force_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
     let mut shutdown = pin!(shutdown);
     let mut connections = JoinSet::new();
@@ -342,20 +353,48 @@ async fn run(
             }
             accepted = listener.accept() => accepted.map_err(ServeError::Accept)?,
         };
+        let lifetime = tunnel::Lifetime {
+            open: open_tx.clone(),
+            force: force_rx.clone(),
+        };
         connections.spawn(serve_connection(
             current_rx.clone(),
             settings,
             stream,
             peer,
             stop_rx.clone(),
+            lifetime,
             permit,
         ));
         while connections.try_join_next().is_some() {}
     }
     // Ignoring the send result is fine: it only fails when no connection is listening.
     let _ = stop_tx.send(true);
-    while connections.join_next().await.is_some() {}
+    drop(open_tx);
+    match shutdown_timeout {
+        None => drain(&mut connections, &mut open_rx).await,
+        Some(limit) => {
+            let drained = tokio::time::timeout(limit, drain(&mut connections, &mut open_rx))
+                .await
+                .is_ok();
+            if !drained {
+                tracing::warn!(
+                    "worker_shutdown_timeout expired; closing the connections and tunnels still open"
+                );
+                connections.abort_all();
+                let _ = force_tx.send(true);
+                drain(&mut connections, &mut open_rx).await;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Waits until every connection has finished and every tunnel has closed.
+async fn drain(connections: &mut JoinSet<()>, open: &mut mpsc::Receiver<()>) {
+    while connections.join_next().await.is_some() {}
+    // Nothing is ever sent, so this returns once every sender is dropped.
+    let _ = open.recv().await;
 }
 
 /// Waits for the next reload request. Without a reload source it never completes,
@@ -401,6 +440,8 @@ struct Connection {
     phase: Arc<PhaseCell>,
     /// Requests started on this connection.
     served: AtomicUsize,
+    /// Shutdown bookkeeping that a tunnel started by one of its requests holds.
+    lifetime: tunnel::Lifetime,
 }
 
 async fn serve_connection(
@@ -409,6 +450,7 @@ async fn serve_connection(
     stream: TcpStream,
     peer: SocketAddr,
     mut stop: watch::Receiver<bool>,
+    lifetime: tunnel::Lifetime,
     _permit: OwnedSemaphorePermit,
 ) {
     let started = Instant::now();
@@ -423,6 +465,7 @@ async fn serve_connection(
     let connection = Arc::new(Connection {
         phase,
         served: AtomicUsize::new(0),
+        lifetime,
     });
     let mut builder = http1::Builder::new();
     builder.keep_alive(settings.timers.keep_alive > Duration::ZERO);
@@ -481,6 +524,8 @@ struct Trace<'a> {
     limit_req: Mutex<Option<&'static str>>,
     /// `$limit_conn_status`, set once the limits have run.
     limit_conn: Mutex<Option<&'static str>>,
+    /// The connection's shutdown bookkeeping, given to a tunnel this request starts.
+    tunnels: tunnel::Lifetime,
 }
 
 /// Answers one request on a connection and records it.
@@ -516,6 +561,7 @@ async fn handle<B: DecisionBackend>(
         started,
         limit_req: Mutex::new(None),
         limit_conn: Mutex::new(None),
+        tunnels: connection.lifetime.clone(),
     };
     let mut held = Vec::new();
     let mut response = pipeline(state, &parts, body, &done, &trace, peer, &mut held).await;
@@ -726,6 +772,7 @@ async fn pipeline<B: DecisionBackend>(
     };
     let delivery = Delivery {
         proxy,
+        tunnels: &trace.tunnels,
         upstream: &site.upstream,
         headers: header_ops,
         block,
@@ -821,6 +868,8 @@ fn close(response: &mut Response<ResponseBody>) {
 struct Delivery<'a> {
     /// The upstream client of the site.
     proxy: &'a Proxy,
+    /// The shutdown bookkeeping of the connection, held by a tunnel that the request starts.
+    tunnels: &'a tunnel::Lifetime,
     /// The site's upstream URI.
     upstream: &'a http::Uri,
     /// The `proxy_set_header` operations of the level in effect.
@@ -902,6 +951,7 @@ async fn respond(
                             upstream,
                             delivery.proxy.read_timeout(),
                             std::mem::take(held),
+                            delivery.tunnels.clone(),
                         );
                     }
                     Outcome {
