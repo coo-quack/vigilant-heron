@@ -9,6 +9,7 @@ use std::time::Duration;
 use http::{HeaderName, HeaderValue, StatusCode, Uri};
 use serde::Deserialize;
 
+use crate::clef::{ApiToken, ClefModel};
 use crate::error::ConfigError;
 use crate::router::normalize_host;
 
@@ -32,8 +33,10 @@ pub struct Config {
 /// Settings for the HTTP decision backend and the body it receives.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecisionConfig {
-    /// Absolute `http://` URI the decision request is posted to.
+    /// Absolute `http://` or `https://` URI the decision request is posted to.
     pub url: Uri,
+    /// Protocol spoken to the decision backend.
+    pub backend: BackendConfig,
     /// Time allowed for the whole decision exchange.
     pub timeout: Duration,
     /// Bytes of the request body that are sent to the backend.
@@ -42,6 +45,20 @@ pub struct DecisionConfig {
     pub max_body_bytes: usize,
     /// Extra header names to drop before sending, lowercased.
     pub redact_headers: Vec<String>,
+}
+
+/// The protocol used to reach the decision backend.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BackendConfig {
+    /// The JSON protocol described in the README.
+    Http,
+    /// Cloudflare Clef, or a server that speaks its protocol.
+    Clef {
+        /// Model that answers the questions.
+        model: ClefModel,
+        /// Bearer token, read from the environment variable named in the config.
+        token: ApiToken,
+    },
 }
 
 /// Configuration for one site, selected by the request `Host`.
@@ -107,8 +124,25 @@ impl Config {
     /// Returns [`ConfigError::Parse`] when the text is not valid TOML for this
     /// schema, and the other [`ConfigError`] variants when a value is invalid.
     pub fn from_toml_str(input: &str) -> Result<Self, ConfigError> {
+        Self::from_toml_str_with_lookup(input, |name| std::env::var(name).ok())
+    }
+
+    /// Parses and validates a configuration, reading the Clef token through `lookup`.
+    ///
+    /// `lookup` receives the environment variable name from `api_token_env` and
+    /// returns its value. [`Config::from_toml_str`] passes the process environment.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Config::from_toml_str`], and
+    /// [`ConfigError::MissingApiToken`] or [`ConfigError::EmptyApiToken`] when
+    /// `lookup` gives no usable token.
+    pub fn from_toml_str_with_lookup<F>(input: &str, lookup: F) -> Result<Self, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         let raw: RawConfig = toml::from_str(input)?;
-        raw.validate()
+        raw.validate(&lookup)
     }
 
     /// Reads, parses and validates the configuration file at `path`.
@@ -144,11 +178,23 @@ struct RawConfig {
 #[serde(deny_unknown_fields)]
 struct RawDecision {
     url: String,
+    #[serde(default)]
+    backend: RawBackend,
+    model: Option<ClefModel>,
+    api_token_env: Option<String>,
     timeout_ms: u64,
     inspect_body_bytes: usize,
     max_body_bytes: usize,
     #[serde(default)]
     redact_headers: Vec<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+enum RawBackend {
+    #[default]
+    Http,
+    Clef,
 }
 
 #[derive(Deserialize)]
@@ -195,11 +241,14 @@ fn default_static_extensions() -> Vec<String> {
 }
 
 impl RawConfig {
-    fn validate(self) -> Result<Config, ConfigError> {
+    fn validate<F>(self, lookup: &F) -> Result<Config, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
         if self.sites.is_empty() {
             return Err(ConfigError::NoSites);
         }
-        let decision = self.decision.validate()?;
+        let decision = self.decision.validate(lookup)?;
         let default_status = validate_default_status(self.default_section.status)?;
         let client_ip_header = self
             .client_ip_header
@@ -231,10 +280,16 @@ impl RawConfig {
 }
 
 impl RawDecision {
-    fn validate(self) -> Result<DecisionConfig, ConfigError> {
-        let url = parse_http_uri(&self.url).ok_or_else(|| ConfigError::InvalidDecisionUrl {
-            value: self.url.clone(),
+    fn validate<F>(self, lookup: &F) -> Result<DecisionConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let url = parse_absolute_uri(&self.url, &["http", "https"]).ok_or_else(|| {
+            ConfigError::InvalidDecisionUrl {
+                value: self.url.clone(),
+            }
         })?;
+        let backend = self.backend_config(lookup)?;
         if self.timeout_ms == 0 {
             return Err(ConfigError::ZeroTimeout);
         }
@@ -246,6 +301,7 @@ impl RawDecision {
         }
         Ok(DecisionConfig {
             url,
+            backend,
             timeout: Duration::from_millis(self.timeout_ms),
             inspect_body_bytes: self.inspect_body_bytes,
             max_body_bytes: self.max_body_bytes,
@@ -255,6 +311,49 @@ impl RawDecision {
                 .map(|name| name.to_ascii_lowercase())
                 .collect(),
         })
+    }
+
+    fn backend_config<F>(&self, lookup: &F) -> Result<BackendConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        match self.backend {
+            RawBackend::Http => {
+                if self.model.is_some() {
+                    return Err(ConfigError::UnexpectedClefField { field: "model" });
+                }
+                if self.api_token_env.is_some() {
+                    return Err(ConfigError::UnexpectedClefField {
+                        field: "api_token_env",
+                    });
+                }
+                Ok(BackendConfig::Http)
+            }
+            RawBackend::Clef => {
+                let model = self
+                    .model
+                    .ok_or(ConfigError::MissingClefField { field: "model" })?;
+                let name = self
+                    .api_token_env
+                    .as_deref()
+                    .ok_or(ConfigError::MissingClefField {
+                        field: "api_token_env",
+                    })?;
+                let value = lookup(name).ok_or_else(|| ConfigError::MissingApiToken {
+                    name: name.to_owned(),
+                })?;
+                let token = value.trim();
+                if token.is_empty() {
+                    return Err(ConfigError::EmptyApiToken {
+                        name: name.to_owned(),
+                    });
+                }
+                Ok(BackendConfig::Clef {
+                    model,
+                    token: ApiToken::new(token.to_owned()),
+                })
+            }
+        }
     }
 }
 
@@ -274,11 +373,12 @@ impl RawSite {
             }
             hosts.push(normalized);
         }
-        let upstream =
-            parse_http_uri(&self.upstream).ok_or_else(|| ConfigError::InvalidUpstream {
+        let upstream = parse_absolute_uri(&self.upstream, &["http"]).ok_or_else(|| {
+            ConfigError::InvalidUpstream {
                 site,
                 value: self.upstream.clone(),
-            })?;
+            }
+        })?;
         check_threshold(site, "block_threshold", self.block_threshold)?;
         check_threshold(site, "instruction_threshold", self.instruction_threshold)?;
         let action = match (self.action, self.redirect_to) {
@@ -328,10 +428,13 @@ fn validate_default_status(status: u16) -> Result<StatusCode, ConfigError> {
     }
 }
 
-/// Parses `value` as an absolute `http://` URI with an authority.
-fn parse_http_uri(value: &str) -> Option<Uri> {
+/// Parses `value` as an absolute URI with one of `schemes` and an authority.
+fn parse_absolute_uri(value: &str, schemes: &[&str]) -> Option<Uri> {
     let uri = value.parse::<Uri>().ok()?;
-    (uri.scheme_str() == Some("http") && uri.authority().is_some()).then_some(uri)
+    let scheme_ok = uri
+        .scheme_str()
+        .is_some_and(|scheme| schemes.contains(&scheme));
+    (scheme_ok && uri.authority().is_some()).then_some(uri)
 }
 
 #[cfg(test)]
@@ -640,6 +743,169 @@ instruction_threshold = 0.5
         Config::from_toml_str(include_str!("../examples/config.toml"))?;
         Config::from_toml_str(include_str!("../e2e/config.toml"))?;
         Ok(())
+    }
+
+    const CLEF_URL: &str =
+        "https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/cloudflare/clef-flash";
+
+    fn clef_toml(backend_lines: &str) -> String {
+        format!(
+            r#"
+listen = "127.0.0.1:8080"
+
+[decision]
+url = "{CLEF_URL}"
+timeout_ms = 300
+inspect_body_bytes = 8192
+max_body_bytes = 10485760
+{backend_lines}
+
+[default]
+status = 421
+{SITE}"#
+        )
+    }
+
+    fn lookup(name: &str) -> Option<String> {
+        match name {
+            "CLEF_TOKEN" => Some("  tok-123-secret \n".to_owned()),
+            "BLANK_TOKEN" => Some("   ".to_owned()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn default_backend_is_http_and_needs_no_token() -> Result<(), ConfigError> {
+        let config = Config::from_toml_str_with_lookup(&config_with(""), |_| None)?;
+        assert_eq!(config.decision.backend, BackendConfig::Http);
+        Ok(())
+    }
+
+    #[test]
+    fn clef_backend_reads_the_model_and_a_trimmed_token() -> Result<(), ConfigError> {
+        let input =
+            clef_toml("backend = \"clef\"\nmodel = \"clef-flash\"\napi_token_env = \"CLEF_TOKEN\"");
+        let config = Config::from_toml_str_with_lookup(&input, lookup)?;
+        match &config.decision.backend {
+            BackendConfig::Clef { model, token } => {
+                assert_eq!(*model, ClefModel::Flash);
+                assert_eq!(token.expose(), "tok-123-secret");
+            }
+            BackendConfig::Http => return Err(ConfigError::NoSites),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn token_never_appears_in_the_debug_output_of_the_config() -> Result<(), ConfigError> {
+        let input =
+            clef_toml("backend = \"clef\"\nmodel = \"clef\"\napi_token_env = \"CLEF_TOKEN\"");
+        let config = Config::from_toml_str_with_lookup(&input, lookup)?;
+        let debug = format!("{config:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("tok-123-secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn clef_backend_accepts_an_https_url_and_http_for_self_hosted_servers()
+    -> Result<(), ConfigError> {
+        let input =
+            clef_toml("backend = \"clef\"\nmodel = \"clef\"\napi_token_env = \"CLEF_TOKEN\"")
+                .replace(CLEF_URL, "http://stub-decider:9000/decide");
+        Config::from_toml_str_with_lookup(&input, lookup)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clef_backend_without_a_model_is_rejected() {
+        let input = clef_toml("backend = \"clef\"\napi_token_env = \"CLEF_TOKEN\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::MissingClefField { field: "model" })
+        ));
+    }
+
+    #[test]
+    fn clef_backend_without_a_token_variable_name_is_rejected() {
+        let input = clef_toml("backend = \"clef\"\nmodel = \"clef-flash\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::MissingClefField {
+                field: "api_token_env"
+            })
+        ));
+    }
+
+    #[test]
+    fn unset_token_variable_is_rejected_by_name() {
+        let input =
+            clef_toml("backend = \"clef\"\nmodel = \"clef-flash\"\napi_token_env = \"ABSENT\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::MissingApiToken { name }) if name == "ABSENT"
+        ));
+    }
+
+    #[test]
+    fn blank_token_variable_is_rejected() {
+        let input = clef_toml(
+            "backend = \"clef\"\nmodel = \"clef-flash\"\napi_token_env = \"BLANK_TOKEN\"",
+        );
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::EmptyApiToken { name }) if name == "BLANK_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn http_backend_rejects_a_clef_model() {
+        let input = clef_toml("model = \"clef\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::UnexpectedClefField { field: "model" })
+        ));
+    }
+
+    #[test]
+    fn http_backend_rejects_a_token_variable_name() {
+        let input = clef_toml("api_token_env = \"CLEF_TOKEN\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::UnexpectedClefField {
+                field: "api_token_env"
+            })
+        ));
+    }
+
+    #[test]
+    fn unknown_backend_name_is_a_parse_error() {
+        let input = clef_toml("backend = \"gpt\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn unknown_clef_model_is_a_parse_error() {
+        let input =
+            clef_toml("backend = \"clef\"\nmodel = \"clef-mini\"\napi_token_env = \"CLEF_TOKEN\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[rstest]
+    #[case::ftp("ftp://decide.local/x")]
+    #[case::no_authority("http:/decide")]
+    fn decision_url_must_be_http_or_https(#[case] url: &str) {
+        let input = DECISION.replace("http://stub-decider:9000/decide", url);
+        assert!(matches!(
+            Config::from_toml_str(&format!("{input}{SITE}")),
+            Err(ConfigError::InvalidDecisionUrl { .. })
+        ));
     }
 
     #[test]

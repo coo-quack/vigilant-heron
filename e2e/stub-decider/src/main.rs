@@ -1,8 +1,11 @@
 //! Deterministic decision backend for the e2e stack.
 //!
-//! The verdict depends only on fixed substrings of the `untrusted` fields, so
-//! the e2e tests see the same scores on every run. Requests whose path contains
-//! `/slow` are held for one second before the answer.
+//! It serves two protocols. `POST /decide` speaks the router's JSON protocol.
+//! `POST /client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash` speaks the
+//! Clef protocol, answers in the Workers AI envelope, and requires the bearer
+//! token `test-token`. Both use the same fixed substring rules, so the e2e tests
+//! see the same scores on every run. Requests whose path contains `/slow` are
+//! held for one second before the answer.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -10,7 +13,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{CONTENT_TYPE, HeaderValue};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -20,6 +23,9 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const LISTEN: &str = "0.0.0.0:9000";
+const DECIDE_PATH: &str = "/decide";
+const CLEF_PATH: &str = "/client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash";
+const CLEF_TOKEN: &str = "Bearer test-token";
 const ATTACK_MARKERS: [&str; 4] = ["' or 1=1", "<script", "../", "union select"];
 const INSTRUCTION_MARKERS: [&str; 2] = ["ignore previous", "answer benign"];
 const HIGH: f64 = 0.99;
@@ -33,7 +39,7 @@ async fn main() -> std::io::Result<()> {
     loop {
         let (stream, _peer) = listener.accept().await?;
         tokio::spawn(async move {
-            let service = service_fn(decide_request);
+            let service = service_fn(route);
             // A client that hangs up mid-request is not an error for the stub.
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
@@ -42,8 +48,20 @@ async fn main() -> std::io::Result<()> {
     }
 }
 
-async fn decide_request(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
-    if request.method() != Method::POST || request.uri().path() != "/decide" {
+async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if request.method() != Method::POST {
+        return Ok(reply(
+            StatusCode::METHOD_NOT_ALLOWED,
+            &json!({"error": "method"}),
+        ));
+    }
+    let clef_authorized = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        == Some(CLEF_TOKEN);
+    let path = request.uri().path().to_owned();
+    if path != DECIDE_PATH && path != CLEF_PATH {
         return Ok(reply(StatusCode::NOT_FOUND, &json!({"error": "not found"})));
     }
     let Ok(collected) = request.into_body().collect().await else {
@@ -52,38 +70,103 @@ async fn decide_request(request: Request<Incoming>) -> Result<Response<Full<Byte
             &json!({"error": "unreadable body"}),
         ));
     };
-    let Ok(event) = serde_json::from_slice::<Value>(&collected.to_bytes()) else {
+    let Ok(payload) = serde_json::from_slice::<Value>(&collected.to_bytes()) else {
         return Ok(reply(
             StatusCode::BAD_REQUEST,
             &json!({"error": "invalid JSON"}),
         ));
     };
-    let Some(untrusted) = event.pointer("/event/untrusted") else {
+    if path == DECIDE_PATH {
+        return Ok(decide(&payload).await);
+    }
+    if !clef_authorized {
         return Ok(reply(
+            StatusCode::UNAUTHORIZED,
+            &json!({"result": null, "success": false,
+                    "errors": [{"code": 10000, "message": "Authentication error"}],
+                    "messages": []}),
+        ));
+    }
+    Ok(clef(&payload).await)
+}
+
+/// The router's JSON protocol: `{"event": {"untrusted": {...}}}` in, scores out.
+async fn decide(payload: &Value) -> Response<Full<Bytes>> {
+    let Some(untrusted) = payload.pointer("/event/untrusted") else {
+        return reply(
             StatusCode::BAD_REQUEST,
             &json!({"error": "missing event.untrusted"}),
-        ));
+        );
     };
+    let verdict = score(untrusted).await;
+    reply(
+        StatusCode::OK,
+        &json!({"attack": verdict.attack, "ai_instruction": verdict.ai_instruction}),
+    )
+}
 
+/// The Clef protocol: the request's `state.untrusted_http_request` is scored and
+/// the answers are returned in the Workers AI envelope.
+async fn clef(payload: &Value) -> Response<Full<Bytes>> {
+    let Some(untrusted) = payload.pointer("/state/untrusted_http_request") else {
+        return reply(StatusCode::BAD_REQUEST, &json!({"error": "missing state"}));
+    };
+    let verdict = score(untrusted).await;
+    let answers = json!({
+        "attack": {"type": "noul", "noul": verdict.attack},
+        "ai_instruction": {"type": "noul", "noul": verdict.ai_instruction},
+        "category": {
+            "type": "choice",
+            "choice": verdict.category,
+            "probabilities": {verdict.category: 0.9},
+            "confidence": 0.9,
+        },
+    });
+    reply(
+        StatusCode::OK,
+        &json!({
+            "result": {"model": "clef-flash", "answers": answers, "usage": {}},
+            "success": true,
+            "errors": [],
+            "messages": [],
+        }),
+    )
+}
+
+struct Verdict {
+    attack: f64,
+    ai_instruction: f64,
+    category: &'static str,
+}
+
+/// Applies the fixed rules to the attacker-controlled fields.
+async fn score(untrusted: &Value) -> Verdict {
     let path = decode_for_scan(untrusted.get("path").and_then(Value::as_str).unwrap_or(""));
     if path.contains(SLOW_MARKER) {
         tokio::time::sleep(SLOW_DELAY).await;
     }
     let content = decode_for_scan(&scan_text(untrusted));
-    let attack = if contains_any(&content, &ATTACK_MARKERS) {
-        HIGH
+    let attack = contains_any(&content, &ATTACK_MARKERS);
+    let category = if !attack {
+        "none"
+    } else if content.contains("union select") || content.contains("' or 1=1") {
+        "sql_injection"
+    } else if content.contains("<script") {
+        "xss"
+    } else if content.contains("../") {
+        "path_traversal"
     } else {
-        LOW
+        "other_attack"
     };
-    let ai_instruction = if contains_any(&content, &INSTRUCTION_MARKERS) {
-        HIGH
-    } else {
-        LOW
-    };
-    Ok(reply(
-        StatusCode::OK,
-        &json!({"attack": attack, "ai_instruction": ai_instruction}),
-    ))
+    Verdict {
+        attack: if attack { HIGH } else { LOW },
+        ai_instruction: if contains_any(&content, &INSTRUCTION_MARKERS) {
+            HIGH
+        } else {
+            LOW
+        },
+        category,
+    }
 }
 
 /// Joins the attacker-controlled text fields that the rules inspect.

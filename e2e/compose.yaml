@@ -7,6 +7,7 @@ services:
       - "127.0.0.1:18080:80"
     depends_on:
       - vigilant-heron
+      - vigilant-heron-clef
     configs:
       - source: edge_conf
         target: /etc/nginx/conf.d/default.conf
@@ -17,6 +18,19 @@ services:
       target: runtime
     volumes:
       - ./config.toml:/etc/vigilant-heron/config.toml:ro
+    depends_on:
+      - stub-decider
+      - upstream
+
+  vigilant-heron-clef:
+    build:
+      context: ..
+      target: runtime
+    volumes:
+      - ./config-clef.toml:/etc/vigilant-heron/config.toml:ro
+    environment:
+      # Test-only token. The stub decider accepts exactly this bearer token.
+      E2E_CLEF_TOKEN: test-token
     depends_on:
       - stub-decider
       - upstream
@@ -40,6 +54,17 @@ configs:
 
         location / {
           proxy_pass http://vigilant-heron:8080;
+          proxy_set_header Host $$host;
+          proxy_set_header X-Real-IP $$remote_addr;
+        }
+      }
+
+      server {
+        listen 80;
+        server_name clef.test;
+
+        location / {
+          proxy_pass http://vigilant-heron-clef:8080;
           proxy_set_header Host $$host;
           proxy_set_header X-Real-IP $$remote_addr;
         }

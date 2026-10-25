@@ -59,7 +59,7 @@ impl Reason {
 }
 
 /// Input to the decision table.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Assessment {
     /// A deny rule matched; the backend was not called.
     Rule,

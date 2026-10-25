@@ -19,6 +19,12 @@ can include personal data typed into forms, reaches the backend. Point the
 router at a backend you may disclose that data to, or run the decision model
 yourself.
 
+With `backend = "clef"`, the same sanitized event is sent to Cloudflare Workers
+AI (`api.cloudflare.com`), a third party, as the `state` of a Clef request. The
+bearer token is sent in the `Authorization` header to that endpoint only. Use
+an account whose Workers AI data handling you have accepted, and keep the token
+in the environment, not in the config file. The router never logs the token.
+
 ## Limits of the decision model
 
 The model judges text written by the attacker. Payloads can try to steer it,

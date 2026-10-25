@@ -41,7 +41,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Serves `handler` on `listener` until the returned task is aborted.
-fn spawn_server<H, Fut>(listener: TcpListener, handler: H) -> JoinHandle<()>
+pub(crate) fn spawn_server<H, Fut>(listener: TcpListener, handler: H) -> JoinHandle<()>
 where
     H: Fn(Request<Incoming>) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Response<Full<Bytes>>> + Send + 'static,
@@ -63,7 +63,7 @@ where
     })
 }
 
-fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
+pub(crate) fn json_response(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from(body.to_string())));
     *response.status_mut() = status;
     response
@@ -232,7 +232,11 @@ pub(crate) struct Proxy {
 
 /// Starts the proxy with `config_text` on an ephemeral loopback port.
 pub(crate) async fn start_proxy(config_text: &str) -> Result<Proxy, BoxError> {
-    let config = Config::from_toml_str(config_text)?;
+    start_proxy_config(Config::from_toml_str(config_text)?).await
+}
+
+/// Starts the proxy with an already validated `config` on an ephemeral loopback port.
+pub(crate) async fn start_proxy_config(config: Config) -> Result<Proxy, BoxError> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let (shutdown, shutdown_rx) = oneshot::channel::<()>();

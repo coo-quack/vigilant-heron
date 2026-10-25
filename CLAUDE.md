@@ -34,17 +34,21 @@ src/
   router.rs      # Host normalization and site lookup
   prefilter.rs   # Path normalization, deny rules, static skip
   sanitize.rs    # Backend event: header drop, body redaction, truncation
-  decision.rs    # DecisionBackend trait, HTTP backend, Probability, Verdict
+  decision.rs    # DecisionBackend trait, shared HTTPS transport, HTTP backend, backend enum, Probability, Verdict
+  clef.rs        # Cloudflare Clef backend: questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, fail-open/closed, shadow)
   proxy.rs       # Forwarding to upstreams, hop-by-hop headers
   server.rs      # Accept loop and per-request pipeline, decision log
   error.rs       # Error types
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
+  clef.rs        # In-process tests of the Clef backend against a fake endpoint
+  clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack
-  compose.yaml   # nginx edge, router, stub decider, upstream
+  config-clef.toml # Second router that uses backend = "clef" against the stub
+  compose.yaml   # nginx edge, two routers, stub decider, upstream
 ```
 
 ## Key Constraints
