@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- Command line, as nginx's: `-h`/`--help` and `-v`/`--version`, `-c <path>` as a
+  short form of `--config`, `-T` (test, then print the configuration with every
+  include expanded under its `# configuration file <path>:` header), and
+  `-s reload|reopen|stop|quit`. `-s` sends SIGHUP, SIGUSR1, SIGTERM or SIGQUIT to
+  the pid in the file the `pid` directive names. An unknown option prints the
+  usage and exits 1. `stop` and `quit` are both graceful in this version.
+- `pid <path>;` directive (default `/run/vigilant-heron.pid`). The router writes its
+  process id there once it is listening and removes it on exit. A write failure is
+  logged and the router keeps running. SIGQUIT now shuts down gracefully, like
+  SIGTERM and SIGINT.
+- `docs/cli.md` describes the command line, and `pid` is documented in
+  `docs/configuration.md`. The migration notes from the README moved to
+  `docs/configuration.md`.
+- README rewritten as a short introduction with install, a quick start, the
+  command line, the order of checks, and links to the documentation. The
+  reference stays in `docs/`.
+- Removed `rustfmt.toml`, which only repeated `edition = "2024"` from `Cargo.toml`.
+  `cargo fmt` output is unchanged.
+
+- Command line, as nginx's: `-h`/`--help` and `-v`/`--version`, `-c <path>` as a
+  short form of `--config`, `-T` (test, then print the configuration with every
+  include expanded under its `# configuration file <path>:` header), and
+  `-s reload|reopen|stop|quit`. `-s` sends SIGHUP, SIGUSR1, SIGTERM or SIGQUIT to
+  the pid in the file the `pid` directive names. An unknown option prints the
+  usage and exits 1. `stop` and `quit` are both graceful in this version.
+- `pid <path>;` directive (default `/run/vigilant-heron.pid`). The router writes its
+  process id there once it is listening and removes it on exit. A write failure is
+  logged and the router keeps running. SIGQUIT now shuts down gracefully, like
+  SIGTERM and SIGINT.
+- `docs/cli.md` describes the command line, and `pid` is documented in
+  `docs/configuration.md`. The migration notes from the README moved to
+  `docs/configuration.md`.
+- README rewritten as a short introduction with install, a quick start, the
+  command line, the order of checks, and links to the documentation. The
+  reference stays in `docs/`.
+- Removed `rustfmt.toml`, which only repeated `edition = "2024"` from `Cargo.toml`.
+  `cargo fmt` output is unchanged.
+
 - Host matching as in nginx `server_name`: exact names, `*.example.com`,
   `example.*`, `.example.com` and `~regex` names in a `site`, with exact, then
   leading wildcard, then trailing wildcard, then regex precedence. `default_server;`

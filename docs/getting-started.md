@@ -72,7 +72,8 @@ TYPESAFE_API_KEY=... vigilant-heron --config vigilant-heron.conf
 ```
 
 The config path can also come from `VIGILANT_HERON_CONFIG`. Without either, the
-binary reads `/etc/vigilant-heron/vigilant-heron.conf`.
+binary reads `/etc/vigilant-heron/vigilant-heron.conf`. All the options are listed
+in [Command line](/cli).
 
 ## Check the configuration with -t
 

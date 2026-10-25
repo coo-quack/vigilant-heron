@@ -185,3 +185,185 @@ fn sighup_applies_a_valid_file_and_keeps_the_old_one_for_a_broken_file()
     assert!(stderr.contains("reload.conf:6:"), "{stderr}");
     Ok(())
 }
+
+/// A configuration with a `pid` path and a top-level `default_status`, for the signal tests.
+fn server_config(listen: &str, pid: &std::path::Path, default_status: u16) -> String {
+    format!(
+        "listen {listen};\npid {};\ndecision {{\n    backend http;\n    url http://127.0.0.1:9/decide;\n}}\ndefault_status {default_status};\n\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n",
+        pid.display()
+    )
+}
+
+/// A fresh directory for one test, named after the test so parallel tests do not share files.
+fn test_dir(name: &str) -> Result<PathBuf, std::io::Error> {
+    let dir = std::env::temp_dir().join(format!("vh-cli-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Runs the binary with `args` and the config path, and returns its output.
+fn run_with(config: &std::path::Path, args: &[&str]) -> Result<Output, std::io::Error> {
+    Command::new(env!("CARGO_BIN_EXE_vigilant-heron"))
+        .arg("-c")
+        .arg(config)
+        .args(args)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .output()
+}
+
+#[test]
+fn dump_prints_the_configuration_with_each_include_under_its_header() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("dump")?;
+    let extra = dir.join("dump-extra.conf");
+    std::fs::write(&extra, "default_status 404;\n")?;
+    let main = dir.join("dump-main.conf");
+    std::fs::write(&main, config("127.0.0.1:8080", "include dump-extra.conf;"))?;
+    let output = run_with(&main, &["-T"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(stderr.contains("test is successful"), "{stderr}");
+    assert!(
+        stdout.contains(&format!("# configuration file {}:", main.display())),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("# configuration file {}:", extra.display())),
+        "{stdout}"
+    );
+    assert!(stdout.contains("default_status 404;"), "{stdout}");
+    assert!(stdout.contains("# include dump-extra.conf;"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn dump_prints_nothing_to_stdout_for_an_invalid_configuration() -> Result<(), std::io::Error> {
+    let dir = test_dir("dump-invalid")?;
+    let main = dir.join("invalid-dump.conf");
+    std::fs::write(&main, config("127.0.0.1:8080", "default_status 200;"))?;
+    let output = run_with(&main, &["-T"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.stdout.len(), 0);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("test failed"));
+    Ok(())
+}
+
+#[test]
+fn signal_with_a_missing_pid_file_fails_with_exit_one() -> Result<(), std::io::Error> {
+    let dir = test_dir("missing-pid")?;
+    let missing = dir.join("never-written.pid");
+    let path = write_config(
+        "missing-pid.conf",
+        &server_config("127.0.0.1:1", &missing, 421),
+    )?;
+    let output = run_with(&path, &["-s", "reload"])?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("cannot read the pid file"), "{stderr}");
+    assert!(stderr.contains(&missing.display().to_string()), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn signal_with_a_stale_pid_file_fails_with_exit_one() -> Result<(), std::io::Error> {
+    let dir = test_dir("stale-pid")?;
+    let pid = dir.join("stale.pid");
+    // A pid far above any a test host runs, so no process has it.
+    std::fs::write(&pid, "2147483646\n")?;
+    let path = write_config("stale-pid.conf", &server_config("127.0.0.1:1", &pid, 421))?;
+    let output = run_with(&path, &["-s", "stop"])?;
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("stale"));
+    Ok(())
+}
+
+/// Waits until `pid` holds a process id, or gives up after five seconds.
+fn wait_for_pid_file(pid: &std::path::Path) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::fs::read_to_string(pid).is_ok_and(|text| text.trim().parse::<u32>().is_ok()) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    false
+}
+
+/// Waits until the child exits, or gives up after five seconds.
+fn wait_for_exit(child: &mut Child) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(status)) = child.0.try_wait() {
+            return Some(status);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    None
+}
+
+#[test]
+fn signals_reload_reopen_and_quit_a_running_router() -> Result<(), std::io::Error> {
+    let dir = test_dir("signals")?;
+    let port = free_port()?;
+    let pid = dir.join("router.pid");
+    let path = dir.join("signals.conf");
+    std::fs::write(
+        &path,
+        server_config(&format!("127.0.0.1:{port}"), &pid, 421),
+    )?;
+    let child = Command::new(env!("CARGO_BIN_EXE_vigilant-heron"))
+        .arg("-c")
+        .arg(&path)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let mut child = Child(child);
+    assert!(wait_for_status(port, 421), "the server did not answer 421");
+    assert!(wait_for_pid_file(&pid), "the pid file was not written");
+    let written = std::fs::read_to_string(&pid)?;
+    assert_eq!(written.trim(), child.0.id().to_string());
+
+    // reload: a changed file takes effect.
+    std::fs::write(
+        &path,
+        server_config(&format!("127.0.0.1:{port}"), &pid, 404),
+    )?;
+    let output = run_with(&path, &["-s", "reload"])?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        wait_for_status(port, 404),
+        "the reloaded file was not applied"
+    );
+
+    // reopen: the router keeps serving and the command succeeds.
+    let output = run_with(&path, &["-s", "reopen"])?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(status_for(port, "unknown.test"), Some(404));
+
+    // quit: the process exits on its own and removes the pid file.
+    let output = run_with(&path, &["-s", "quit"])?;
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status = wait_for_exit(&mut child);
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "the router did not exit cleanly"
+    );
+    assert!(!pid.exists(), "the pid file was not removed on exit");
+    Ok(())
+}

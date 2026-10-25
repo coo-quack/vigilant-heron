@@ -6,7 +6,7 @@
 //! line of the directive that caused it.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +66,8 @@ const DEFAULT_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_PROXY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default `proxy_send_timeout`.
 const DEFAULT_PROXY_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `pid` path, where the router writes its process id.
+const DEFAULT_PID_FILE: &str = "/run/vigilant-heron.pid";
 /// The Jev endpoint used when `url` is omitted.
 const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 /// The Jev model used when `model` is omitted.
@@ -83,6 +85,7 @@ const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
 /// and `docs/configuration.md` must document each one (checked by `tests/docs.rs`).
 pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
     "listen",
+    "pid",
     "worker_threads",
     "worker_shutdown_timeout",
     "max_connections",
@@ -200,6 +203,8 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
 pub struct Config {
     /// Socket address the binary binds, such as `0.0.0.0:8080`.
     pub listen: String,
+    /// File where the router writes its process id while it runs, read by `-s`.
+    pub pid_file: PathBuf,
     /// Runtime worker threads. `None` means one per CPU core (tokio's default).
     pub worker_threads: Option<usize>,
     /// Most connections served at the same time.
@@ -490,6 +495,38 @@ impl Config {
         let directives = conf::parse_source(input, origin)?;
         build(&directives, &lookup)
     }
+}
+
+/// Returns the `pid` path of the configuration at `path`, or the default when the file sets none.
+///
+/// Only the file and its includes are read: the rest of the configuration is not
+/// validated, so `-s` works even when the token variables are not set in its shell.
+///
+/// # Errors
+///
+/// Returns the read, syntax and include errors of the file.
+pub fn pid_file_path(path: &Path) -> Result<PathBuf, ConfigError> {
+    let directives = conf::load_file(path)?;
+    let configured = directives
+        .iter()
+        .rev()
+        .find(|directive| directive.name == "pid")
+        .and_then(|directive| directive.args.first());
+    Ok(configured.map_or_else(|| PathBuf::from(DEFAULT_PID_FILE), PathBuf::from))
+}
+
+/// Returns the configuration at `path` as text, with each top-level include
+/// expanded in place. Each file starts with a `# configuration file <path>:` line.
+///
+/// The text is the file as written, so comments stay. Directives hold the names
+/// of token variables, never their values, so nothing secret is printed.
+///
+/// # Errors
+///
+/// Returns the same errors as [`Config::load`] for reading and parsing, and an
+/// include error when an include is not written on one line.
+pub fn dump_configuration(path: &Path) -> Result<String, ConfigError> {
+    conf::dump_file(path)
 }
 
 /// Where a directive came from, for error messages.
@@ -816,6 +853,7 @@ where
     let mut top_headers: Option<Vec<HeaderOp>> = None;
     let mut top_rules: Vec<ParsedRule> = Vec::new();
     let mut listen = None;
+    let mut pid_file = PathBuf::from(DEFAULT_PID_FILE);
     let mut worker_threads = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut worker_shutdown_timeout = None;
@@ -881,6 +919,10 @@ where
             "listen" => {
                 once(&mut seen, directive)?;
                 listen = Some(one_arg(directive)?.to_owned());
+            }
+            "pid" => {
+                once(&mut seen, directive)?;
+                pid_file = PathBuf::from(one_arg(directive)?);
             }
             "worker_threads" => {
                 once(&mut seen, directive)?;
@@ -1121,6 +1163,7 @@ where
 
     Ok(Config {
         listen,
+        pid_file,
         worker_threads,
         max_connections,
         worker_shutdown_timeout,
