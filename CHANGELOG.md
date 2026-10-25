@@ -132,3 +132,9 @@
 - Docker image (`runtime` target) and Compose-based e2e suite
 - Cloudflare Clef decision backend (`decision.backend = "clef"`), with the
   API token read from an environment variable and https support
+- Security (F10, F11): `escape json` now writes every control character (C0,
+  DEL and the C1 range) and U+2028/U+2029 as `\uXXXX`, so a log line cannot
+  carry terminal control sequences or be split by a Unicode line separator. The
+  built-in `main` format quotes `category`, `retry_after` and `request_id`, so a
+  client-chosen request id with spaces and `=` cannot add fields. Log lines in the
+  `main` format change for those three values (their values are now quoted).

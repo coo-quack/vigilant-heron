@@ -33,8 +33,9 @@ these keys in this order: `time`, `request_id`, `client_ip`, `site`, `host`,
 `main` writes a text line that starts with the time, the client address, the site
 and the request line, followed by `status`, `action`, `reason`, `would_have`,
 the scores, `category`, `decision_error`, `retry_after`, `input_tokens`,
-`latency_ms` and `request_id`, as `name=value` pairs. A missing value is `-` in
-`main` and an empty string in `json`.
+`latency_ms` and `request_id`, as `name=value` pairs. `category`, `retry_after` and
+`request_id` are quoted, so a value with spaces or `=` cannot add a field. A missing
+value is `-` in `main` and an empty string in `json`.
 
 ## Log formats
 
@@ -48,7 +49,9 @@ The syntax is `log_format <name> [escape=default|json] "<template>";`.
 
 - `escape default` (the default) escapes quotes, backslashes, and every byte
   outside `0x20` to `0x7e`. A value therefore cannot split a line.
-- `escape json` writes JSON string escapes.
+- `escape json` writes JSON string escapes. Every control character (C0, DEL and
+  the C1 range `0x80` to `0x9f`) and U+2028 and U+2029 are written as `\uXXXX`.
+  Printable non-ASCII text, such as Japanese, is kept as it is.
 - A missing value is `-` with `escape default`, and an empty string with
   `escape json`.
 

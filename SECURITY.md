@@ -29,7 +29,9 @@ Access logs contain the client address, the method, the path, the status and
 the decision fields, but never a request body, a query string or a credential
 header. A `$http_*` variable that names a credential or a redacted header is
 rejected when the configuration loads. Every logged value is escaped, so a
-request cannot inject a line break or a control character into the log.
+request cannot inject a line break or a control character into the log. The
+`json` format also escapes the C1 controls and U+2028 and U+2029, and the `main`
+format quotes its free-text values.
 
 With `backend = "jev"`, the same sanitized event is sent to TypeSafe
 (`api.typesafe.ai`), a third party, in the same System One request shape. The
