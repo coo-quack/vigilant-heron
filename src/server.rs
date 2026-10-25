@@ -489,7 +489,7 @@ async fn pipeline<B: DecisionBackend>(
             Screening::SkipRule(id) => Some(Arc::clone(id)),
             Screening::Skip | Screening::Inspect => None,
         };
-        let assessment = assess(state, site, parts, &sniffed, trace.client_ip, &screening).await;
+        let assessment = assess(state, parts, &sniffed, trace.client_ip, &screening).await;
         (assessment, rule_id)
     };
     let mut decision = policy::decide(site, &path, &assessment);
@@ -703,7 +703,6 @@ fn body_failure(
 
 async fn assess<B: DecisionBackend>(
     state: &AppState<B>,
-    site: &SiteConfig,
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
@@ -714,7 +713,8 @@ async fn assess<B: DecisionBackend>(
         Screening::SkipRule(_) => Assessment::SkipRule,
         Screening::Skip => Assessment::Skip,
         Screening::Inspect => {
-            let host = site.hosts.first().map_or("", String::as_str);
+            // The event carries the host the client asked for, which may match a wildcard or regex name.
+            let host = host_name(parts);
             let event = sanitize::build_event(&EventInput {
                 method: &parts.method,
                 path: parts.uri.path(),
@@ -722,7 +722,7 @@ async fn assess<B: DecisionBackend>(
                 headers: &parts.headers,
                 body: &sniffed.prefix,
                 body_continues: sniffed.truncated,
-                host,
+                host: &host,
                 client_ip,
                 redact_headers: &state.backend_redact,
                 inspect_body_bytes: state.inspect_body_bytes,

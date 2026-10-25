@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Host matching as in nginx `server_name`: exact names, `*.example.com`,
+  `example.*`, `.example.com` and `~regex` names in a `site`, with exact, then
+  leading wildcard, then trailing wildcard, then regex precedence. `default_server;`
+  marks the one site that takes hosts matching no site (at most one per
+  configuration). A name claimed by two sites is still a configuration error.
 - Request-rate and connection limits, with nginx's `limit_req` and `limit_conn`
   semantics: `limit_req_zone` and `limit_conn_zone` at the top level, `limit_req`,
   `limit_conn`, their status, dry-run and log-level directives at the top level,

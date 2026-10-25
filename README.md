@@ -427,6 +427,28 @@ The configuration uses nginx syntax: `directive arguments;` and blocks such as
 [`examples/vigilant-heron.conf`](examples/vigilant-heron.conf) for every
 directive with comments.
 
+### Host matching
+
+A `site` lists its names after the keyword, and a request is sent to the site
+whose name matches its `Host` header (port and trailing dot ignored, case
+ignored). The forms follow nginx `server_name`:
+
+- an exact name: `example.com`
+- a leading wildcard: `*.example.com` matches `a.example.com` and `a.b.example.com`, but not `example.com`
+- a trailing wildcard: `example.*` matches `example.com` and `example.jp`
+- `.example.com`, which is `example.com` and `*.example.com` together
+- a regular expression: `~^(www\.)?example\.(com|jp)$`, matched against the
+  lowercased host with the `regex` crate. Quote it if it contains spaces or `;`
+
+A host is matched in this order: the exact name, then the longest leading
+wildcard, then the longest trailing wildcard, then the first regular expression
+in the order the sites are written. A name may belong to one site only, and a
+duplicate is a configuration error.
+
+`default_server;` inside one `site` takes every request whose host matches no
+site. Without it, such a request gets `default_status` (421 by default). At most
+one site may be marked, and the request is judged by that site's settings.
+
 Times take `ms`, `s`, `m` or `h` (a bare number is seconds, as in nginx). Sizes
 take `k`, `m` or `g`. Every error names the file and line, for example
 `vigilant-heron.conf:12: "block_threshold" must be between 0 and 1`.

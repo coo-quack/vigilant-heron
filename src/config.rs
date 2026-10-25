@@ -20,7 +20,7 @@ use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig};
 use crate::logsink::Destination;
 use crate::realip::{IpNet, RealIp};
-use crate::router::normalize_host;
+use crate::router::HostPattern;
 use crate::rules::{self, ParsedRule, Rule, Scope, SiteRules};
 use crate::system_one::{ApiToken, ClefModel};
 
@@ -223,8 +223,12 @@ pub enum BackendConfig {
 /// Configuration for one site, selected by the request `Host`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SiteConfig {
-    /// Normalized host names that select this site.
+    /// Host names that select this site, as written in the configuration (normalized).
     pub hosts: Vec<String>,
+    /// Whether this site takes the requests whose host matches no site.
+    pub default_server: bool,
+    /// The parsed host names, in configuration order.
+    pub(crate) host_patterns: Vec<HostPattern>,
     /// Absolute `http://` URI requests are forwarded to.
     pub upstream: Uri,
     /// Whether verdicts are enforced or only recorded.
@@ -930,15 +934,27 @@ where
     };
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
+    let mut default_seen = false;
     for site in site_directives {
         let parsed = parse_site(site, &formats, &top, &mut claimed)?;
-        for host in &parsed.hosts {
-            if !hosts_seen.insert(host.clone()) {
-                return Err(invalid(
-                    site,
-                    format!("host \"{host}\" is listed by more than one site"),
-                ));
+        for pattern in &parsed.host_patterns {
+            for claim in pattern.claims() {
+                if !hosts_seen.insert(claim) {
+                    return Err(invalid(
+                        site,
+                        format!(
+                            "host \"{}\" is listed by more than one site",
+                            pattern.display()
+                        ),
+                    ));
+                }
             }
+        }
+        if parsed.default_server {
+            if default_seen {
+                return Err(invalid(site, "only one site may be marked default_server"));
+            }
+            default_seen = true;
         }
         sites.push(parsed);
     }
@@ -1474,19 +1490,20 @@ fn parse_site(
     if directive.args.is_empty() {
         return Err(invalid(directive, "\"site\" needs at least one host name"));
     }
-    let mut hosts = Vec::new();
+    let mut host_patterns = Vec::new();
     for host in &directive.args {
-        let normalized = normalize_host(host);
-        if normalized.is_empty() {
-            return Err(invalid(
+        let pattern = HostPattern::parse(host).map_err(|reason| {
+            invalid(
                 directive,
-                format!("\"site\" has an invalid host name: {host}"),
-            ));
-        }
-        hosts.push(normalized);
+                format!("\"site\" has an invalid host name {host}: {reason}"),
+            )
+        })?;
+        host_patterns.push(pattern);
     }
+    let hosts: Vec<String> = host_patterns.iter().map(HostPattern::display).collect();
 
     let mut seen = HashSet::new();
+    let mut default_server = false;
     let mut upstream = None;
     let mut mode = Mode::Enforce;
     let mut action = SiteAction::Block;
@@ -1632,6 +1649,13 @@ fn parse_site(
                 site_limits.apply(child, top.zones, &mut seen)?;
             }
             "location" => pending_locations.push(limits::parse_location(child, top.zones)?),
+            "default_server" => {
+                if !child.args.is_empty() {
+                    return Err(invalid(child, "\"default_server\" takes no arguments"));
+                }
+                once(&mut seen, child)?;
+                default_server = true;
+            }
             other => {
                 return Err(invalid(
                     child,
@@ -1694,6 +1718,8 @@ fn parse_site(
 
     Ok(SiteConfig {
         hosts,
+        default_server,
+        host_patterns,
         upstream,
         mode,
         action,
@@ -2340,6 +2366,101 @@ mod tests {
         fn parsing_arbitrary_text_never_panics(text in "[a-z0-9 ;{}\"'#$=/:.,\n-]{0,300}") {
             let _ = Config::parse_str_with_lookup(&text, "fuzz.conf", |_| None);
         }
+    }
+
+    /// A configuration with the given site blocks after the decision block.
+    fn with_sites(sites: &str) -> String {
+        format!(
+            "listen 127.0.0.1:8080;\ndecision {{\n    backend http;\n    url http://stub-decider:9000/decide;\n}}\n{sites}"
+        )
+    }
+
+    #[rstest]
+    #[case::domain_and_exact(
+        "site .example.com {\n    upstream http://u:80;\n}\nsite example.com {\n    upstream http://u:80;\n}\n"
+    )]
+    #[case::leading_twice(
+        "site *.example.com {\n    upstream http://u:80;\n}\nsite *.example.com {\n    upstream http://u:80;\n}\n"
+    )]
+    #[case::same_regex_in_two_sites(
+        "site ~^a\\.test$ {\n    upstream http://u:80;\n}\nsite ~^a\\.test$ {\n    upstream http://u:80;\n}\n"
+    )]
+    #[case::name_twice_in_one_site("site x.test x.test {\n    upstream http://u:80;\n}\n")]
+    fn a_name_claimed_by_two_sites_is_rejected(#[case] sites: &str) {
+        let result = Config::parse_str(&with_sites(sites), "hosts.conf");
+        assert!(message(result.map(|_| ())).contains("is listed by more than one site"));
+    }
+
+    #[test]
+    fn a_wildcard_and_its_bare_name_in_different_sites_do_not_clash() -> Result<(), ConfigError> {
+        let config = Config::parse_str(
+            &with_sites(
+                "site *.example.com {\n    upstream http://u:80;\n}\nsite example.com {\n    upstream http://u:80;\n}\n",
+            ),
+            "hosts.conf",
+        )?;
+        assert_eq!(config.sites.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_host_name_is_reported_with_its_line() {
+        let result = Config::parse_str(
+            &with_sites(
+                "site ok.test {\n    upstream http://u:80;\n}\nsite a*.test {\n    upstream http://u:80;\n}\n",
+            ),
+            "hosts.conf",
+        );
+        let text = message(result.map(|_| ()));
+        assert!(text.contains("hosts.conf:"), "{text}");
+        assert!(text.contains("invalid host name a*.test"), "{text}");
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_is_reported() {
+        let result = Config::parse_str(
+            &with_sites("site ~(unclosed {\n    upstream http://u:80;\n}\n"),
+            "hosts.conf",
+        );
+        assert!(message(result.map(|_| ())).contains("does not compile"));
+    }
+
+    #[test]
+    fn default_server_marks_one_site() -> Result<(), ConfigError> {
+        let config = Config::parse_str(
+            &with_sites(
+                "site a.test {\n    upstream http://u:80;\n}\nsite b.test {\n    upstream http://u:80;\n    default_server;\n}\n",
+            ),
+            "default.conf",
+        )?;
+        let flags: Vec<bool> = config.sites.iter().map(|s| s.default_server).collect();
+        assert_eq!(flags, [false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_default_server_is_rejected_at_its_site() {
+        let result = Config::parse_str(
+            &with_sites(
+                "site a.test {\n    upstream http://u:80;\n    default_server;\n}\nsite b.test {\n    upstream http://u:80;\n    default_server;\n}\n",
+            ),
+            "default.conf",
+        );
+        let text = message(result.map(|_| ()));
+        assert!(text.contains("default.conf:10:"), "{text}");
+        assert!(
+            text.contains("only one site may be marked default_server"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn default_server_takes_no_arguments() {
+        let result = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n    default_server yes;\n}\n"),
+            "default.conf",
+        );
+        assert!(message(result.map(|_| ())).contains("takes no arguments"));
     }
 }
 
