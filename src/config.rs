@@ -79,6 +79,121 @@ const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
     "css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "woff", "woff2", "ttf", "map",
 ];
 
+/// Every directive name the top level accepts. The parser rejects any other name,
+/// and `docs/configuration.md` must document each one (checked by `tests/docs.rs`).
+pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
+    "listen",
+    "worker_threads",
+    "max_connections",
+    "default_status",
+    "request_id_header",
+    "real_ip_from",
+    "real_ip_header",
+    "real_ip_recursive",
+    "decision",
+    "client_header_timeout",
+    "keepalive_timeout",
+    "keepalive_requests",
+    "send_timeout",
+    "large_client_header_buffers",
+    "lingering_close",
+    "lingering_time",
+    "lingering_timeout",
+    "client_body_timeout",
+    "client_max_body_size",
+    "proxy_connect_timeout",
+    "proxy_read_timeout",
+    "proxy_send_timeout",
+    "max_body",
+    "allow",
+    "deny",
+    "proxy_set_header",
+    "block_status",
+    "block_page",
+    "builtin_rules",
+    "disable_rule",
+    "rule",
+    "site",
+    "error_log",
+    "access_log",
+    "log_format",
+    "include",
+    "limit_req_zone",
+    "limit_conn_zone",
+    "limit_req",
+    "limit_conn",
+    "limit_req_status",
+    "limit_conn_status",
+    "limit_req_dry_run",
+    "limit_conn_dry_run",
+    "limit_req_log_level",
+    "limit_conn_log_level",
+];
+
+/// Every directive name a `site` block accepts, besides the ones it shares with the top level.
+pub const SITE_DIRECTIVES: &[&str] = &[
+    "upstream",
+    "mode",
+    "action",
+    "block_threshold",
+    "instruction_threshold",
+    "on_rate_limit",
+    "on_decision_error",
+    "deny_path",
+    "fail_closed_path",
+    "static_extensions",
+    "debug_headers",
+    "access_log",
+    "allow",
+    "deny",
+    "builtin_rules",
+    "disable_rule",
+    "rule",
+    "proxy_websocket",
+    "proxy_set_header",
+    "location",
+    "default_server",
+    "block_status",
+    "block_page",
+    "client_body_timeout",
+    "client_max_body_size",
+    "proxy_connect_timeout",
+    "proxy_read_timeout",
+    "proxy_send_timeout",
+    "limit_req",
+    "limit_conn",
+    "limit_req_status",
+    "limit_conn_status",
+    "limit_req_dry_run",
+    "limit_conn_dry_run",
+    "limit_req_log_level",
+    "limit_conn_log_level",
+    "limit_req_zone",
+    "limit_conn_zone",
+    "client_header_timeout",
+    "keepalive_timeout",
+    "keepalive_requests",
+    "send_timeout",
+    "large_client_header_buffers",
+    "lingering_close",
+    "lingering_time",
+    "lingering_timeout",
+];
+
+/// Every directive name a `decision` block accepts.
+pub const DECISION_DIRECTIVES: &[&str] = &[
+    "backend",
+    "url",
+    "model",
+    "api_token_env",
+    "timeout",
+    "queue_timeout",
+    "max_concurrency",
+    "inspect_body",
+    "max_body",
+    "redact_header",
+];
+
 /// Validated configuration for the whole proxy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -748,6 +863,12 @@ where
     let formats = collect_formats(&format_directives)?;
 
     for directive in directives {
+        if !TOP_LEVEL_DIRECTIVES.contains(&directive.name.as_str()) {
+            return Err(invalid(
+                directive,
+                format!("unknown directive \"{}\"", directive.name),
+            ));
+        }
         match directive.name.as_str() {
             "log_format" => {}
             name if limits::ZONE_NAMES.contains(&name) => {}
@@ -1266,6 +1387,12 @@ where
     let mut model_line = directive;
 
     for child in block(directive)? {
+        if !DECISION_DIRECTIVES.contains(&child.name.as_str()) {
+            return Err(invalid(
+                child,
+                format!("unknown directive \"{}\" in decision", child.name),
+            ));
+        }
         match child.name.as_str() {
             "backend" => {
                 once(&mut seen, child)?;
@@ -1552,6 +1679,12 @@ fn parse_site(
     let mut websocket = false;
 
     for child in block(directive)? {
+        if !SITE_DIRECTIVES.contains(&child.name.as_str()) {
+            return Err(invalid(
+                child,
+                format!("unknown directive \"{}\" in site", child.name),
+            ));
+        }
         match child.name.as_str() {
             name if SITE_TIMEOUT_NAMES.contains(&name) => {
                 once(&mut seen, child)?;
