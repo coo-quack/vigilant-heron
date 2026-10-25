@@ -30,12 +30,26 @@ ROUTER_BIN = ROOT / "target" / "release" / "vigilant-heron"
 STUB_BIN = ROOT / "target" / "release" / "stub-decider"
 
 SITE_HOST = "eval.example.com"
-TOKEN_ENV = "CLOUDFLARE_AI_TOKEN"
 OFFLINE_TOKEN = "test-token"
-OFFLINE_CLEF_URL = "http://127.0.0.1:9000/client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash"
 STUB_PORT = 9000
-USD_PER_MILLION_INPUT_TOKENS = 0.038
+JEV_DEFAULT_URL = "https://api.typesafe.ai/v1/systemone"
 JPY_PER_USD = 158
+# Per backend: the token variable, the model, the price per million input tokens
+# (Clef-flash $0.038, Jev $0.0375), and the stub endpoint used with --offline.
+BACKENDS = {
+    "clef": {
+        "token_env": "CLOUDFLARE_AI_TOKEN",
+        "model": "clef-flash",
+        "usd_per_mtok": 0.038,
+        "offline_url": "http://127.0.0.1:9000/client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash",
+    },
+    "jev": {
+        "token_env": "TYPESAFE_API_KEY",
+        "model": "jev-latest",
+        "usd_per_mtok": 0.0375,
+        "offline_url": "http://127.0.0.1:9000/v1/systemone",
+    },
+}
 # Used for the budget check before the first request, when no average exists yet.
 FIRST_REQUEST_TOKEN_ESTIMATE = 1500
 THRESHOLDS = (0.5, 0.7, 0.9)
@@ -168,13 +182,20 @@ class DecisionLog:
         return None
 
 
+def yen(tokens, usd_per_mtok):
+    return tokens * usd_per_mtok / 1_000_000 * JPY_PER_USD
+
+
 def run_split(split, rows, router_port, log, max_yen, result_handle, state):
-    """Sends the rows of one split. `state` is shared across splits for the budget."""
+    """Sends the rows of one split. `state` is shared across splits for the budget.
+
+    `state["base_yen"]` is what earlier runs spent; the budget covers base plus this run.
+    """
     results = []
     for row in rows:
         average = state["tokens"] / state["done"] if state["done"] else FIRST_REQUEST_TOKEN_ESTIMATE
-        spent_yen = state["tokens"] * USD_PER_MILLION_INPUT_TOKENS / 1_000_000 * JPY_PER_USD
-        next_yen = average * USD_PER_MILLION_INPUT_TOKENS / 1_000_000 * JPY_PER_USD
+        spent_yen = state["base_yen"] + yen(state["tokens"], state["price"])
+        next_yen = yen(average, state["price"])
         if spent_yen + next_yen > max_yen:
             state["stopped"] = True
             break
@@ -222,7 +243,7 @@ def percentile(values, fraction):
     return ordered[index]
 
 
-def report(split, rows_total, results, stopped, errors_missing_tokens):
+def report(split, rows_total, results, stopped, errors_missing_tokens, usd_per_mtok):
     lines = [f"## Split: {split}", ""]
     scored = [r for r in results if r["attack"] is not None]
     blocks = [r for r in results if r["label"] == "block"]
@@ -231,6 +252,8 @@ def report(split, rows_total, results, stopped, errors_missing_tokens):
     lines.append(f"- Stopped by the budget guard: {'yes, partial run' if stopped else 'no'}")
     lines.append(f"- Labels: {len(blocks)} block, {len(allows)} allow")
     lines.append(f"- Join mismatches (decision event not matching the row): {sum(not r['join_ok'] for r in results)}")
+    unjudged = [r["id"] for r in results if r["attack"] is None]
+    lines.append(f"- Rows with no decision event (never judged, e.g. rejected by the HTTP parser): {len(unjudged)} {unjudged}")
     lines.append(f"- Rows whose response had no input_tokens: {errors_missing_tokens}")
     lines.append("")
 
@@ -284,7 +307,7 @@ def report(split, rows_total, results, stopped, errors_missing_tokens):
     latencies = [r["latency_ms"] for r in results if isinstance(r["latency_ms"], int)]
     lines.append(f"- Latency ms: p50 {percentile(latencies, 0.5)}, p95 {percentile(latencies, 0.95)}")
     tokens = sum(r["input_tokens"] or 0 for r in results)
-    usd = tokens * USD_PER_MILLION_INPUT_TOKENS / 1_000_000
+    usd = tokens * usd_per_mtok / 1_000_000
     lines.append(f"- Input tokens: {tokens}; cost: ${usd:.6f} = {usd * JPY_PER_USD:.4f} JPY")
     false_negatives = [r["id"] for r in blocks if not predicted_block(r, PRIMARY_THRESHOLD)]
     false_positives = [r["id"] for r in allows if predicted_block(r, PRIMARY_THRESHOLD)]
@@ -305,24 +328,33 @@ def start_stub_if_needed():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--backend", choices=sorted(BACKENDS), default="clef")
     parser.add_argument("--split", choices=["dev", "holdout", "both"], default="both")
-    parser.add_argument("--offline", action="store_true", help="use the stub decider instead of Cloudflare")
-    parser.add_argument("--clef-url", help="full clef-flash endpoint URL (required without --offline)")
-    parser.add_argument("--max-yen", type=float, default=30.0, help="budget in JPY")
+    parser.add_argument("--offline", action="store_true", help="use the stub decider instead of the provider")
+    parser.add_argument("--clef-url", help="full clef-flash endpoint URL (Clef, without --offline)")
+    parser.add_argument("--jev-url", default=JEV_DEFAULT_URL, help="System One endpoint for Jev")
+    parser.add_argument("--usd-per-mtok", type=float, help="input price per million tokens (default per backend)")
+    parser.add_argument("--max-yen", type=float, default=30.0, help="budget in JPY for base spend plus this run")
+    parser.add_argument("--spent-yen", type=float, default=0.0, help="JPY already spent by earlier runs")
     parser.add_argument("--limit", type=int, help="send at most N rows of each split")
     parser.add_argument("--router", type=pathlib.Path, default=ROUTER_BIN)
     args = parser.parse_args()
 
+    backend = BACKENDS[args.backend]
+    price = args.usd_per_mtok if args.usd_per_mtok is not None else backend["usd_per_mtok"]
     if args.offline:
-        clef_url = OFFLINE_CLEF_URL
+        decision_url = backend["offline_url"]
         token = OFFLINE_TOKEN
     else:
-        if not args.clef_url:
-            raise SystemExit("--clef-url is required unless --offline is given")
-        clef_url = args.clef_url
-        token = os.environ.get(TOKEN_ENV, "")
+        if args.backend == "clef":
+            if not args.clef_url:
+                raise SystemExit("--clef-url is required for --backend clef unless --offline is given")
+            decision_url = args.clef_url
+        else:
+            decision_url = args.jev_url
+        token = os.environ.get(backend["token_env"], "")
         if not token.strip():
-            raise SystemExit(f"{TOKEN_ENV} must be set; the token is read from the environment only")
+            raise SystemExit(f"{backend['token_env']} must be set; the token is read from the environment only")
     if not args.router.exists():
         raise SystemExit(f"router binary not found: {args.router}; run cargo build --release")
 
@@ -340,18 +372,22 @@ def main():
         upstream_port = free_port()
         upstream = start_upstream(upstream_port)
         router_port = free_port()
-        config_path = RESULTS_DIR / f"{stamp}-config.toml"
+        config_path = RESULTS_DIR / f"{stamp}-{args.backend}-config.toml"
         config_text = TEMPLATE.read_text(encoding="utf-8")
-        config_text = (
-            config_text.replace("@LISTEN@", f"127.0.0.1:{router_port}")
-            .replace("@UPSTREAM@", f"http://127.0.0.1:{upstream_port}")
-            .replace("@CLEF_URL@", clef_url)
-        )
+        for placeholder, value in {
+            "@LISTEN@": f"127.0.0.1:{router_port}",
+            "@UPSTREAM@": f"http://127.0.0.1:{upstream_port}",
+            "@BACKEND@": args.backend,
+            "@MODEL@": backend["model"],
+            "@DECISION_URL@": decision_url,
+            "@TOKEN_ENV@": backend["token_env"],
+        }.items():
+            config_text = config_text.replace(placeholder, value)
         config_path.write_text(config_text, encoding="utf-8")
-        log_path = RESULTS_DIR / f"{stamp}-router.log"
+        log_path = RESULTS_DIR / f"{stamp}-{args.backend}-router.log"
         log_path.touch()
         env = dict(os.environ)
-        env[TOKEN_ENV] = token
+        env[backend["token_env"]] = token
         with log_path.open("ab") as log_file:
             router = subprocess.Popen(
                 [str(args.router), "--config", str(config_path)],
@@ -363,22 +399,29 @@ def main():
         wait_for_port(router_port, router)
 
         log = DecisionLog(log_path)
-        state = {"tokens": 0, "done": 0, "stopped": False}
+        state = {"tokens": 0, "done": 0, "stopped": False, "price": price, "base_yen": args.spent_yen}
         markdown = []
         for split in splits_to_run(args.split):
-            rows = [r for r in load_rows(split)]
+            rows = load_rows(split)
             if args.limit is not None:
                 rows = rows[: args.limit]
-            result_path = RESULTS_DIR / f"{stamp}-{split}.jsonl"
+            result_path = RESULTS_DIR / f"{stamp}-{args.backend}-{split}.jsonl"
             result_files[split] = result_path
             with result_path.open("w", encoding="utf-8") as handle:
                 results = run_split(split, rows, router_port, log, args.max_yen, handle, state)
             missing = sum(1 for r in results if r["input_tokens"] is None)
-            markdown.append(report(split, len(rows), results, state["stopped"], missing))
+            markdown.append(report(split, len(rows), results, state["stopped"], missing, price))
             if state["stopped"]:
                 break
-        spent = state["tokens"] * USD_PER_MILLION_INPUT_TOKENS / 1_000_000
-        markdown.append(f"## Budget\n\n- Input tokens billed: {state['tokens']}; ${spent:.6f} = {spent * JPY_PER_USD:.4f} JPY (limit {args.max_yen} JPY)\n")
+        run_yen = yen(state["tokens"], price)
+        total_yen = args.spent_yen + run_yen
+        markdown.append(
+            "## Budget\n\n"
+            f"- Backend: {args.backend} ({backend['model']}), price ${price} per million input tokens\n"
+            f"- Input tokens billed in this run: {state['tokens']}; {run_yen:.4f} JPY\n"
+            f"- Spent before this run: {args.spent_yen:.4f} JPY\n"
+            f"- Cumulative spend: {total_yen:.4f} JPY (limit {args.max_yen} JPY)\n"
+        )
         print("\n".join(markdown))
         for split, path in result_files.items():
             print(f"Per-row results ({split}): {path}")

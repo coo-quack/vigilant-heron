@@ -18,6 +18,16 @@ standard library.
   `static_extensions` means no row can skip the backend.
 - `results/`: per-row results and router logs. Git-ignored.
 
+## Backends
+
+`--backend clef` (default) uses Clef-flash at `$0.038` per million input tokens
+and reads the token from `CLOUDFLARE_AI_TOKEN`. `--backend jev` uses `jev-latest`
+at `$0.0375` per million input tokens, reads the token from `TYPESAFE_API_KEY`,
+and posts to `--jev-url` (default `https://api.typesafe.ai/v1/systemone`).
+`--usd-per-mtok` overrides the price. Both backends use a 3000 ms timeout, so a
+slow answer is not turned into a fail-open allow. Latency is still reported.
+Results are written as `results/<UTC>-<backend>-<split>.jsonl`.
+
 ## Offline run (free)
 
 The offline mode points the router at the stub decider's Clef route. It costs
@@ -29,7 +39,8 @@ cargo build --release --workspace
 python3 -I eval/run.py --offline --split both
 ```
 
-If nothing listens on port 9000, the script starts the stub itself.
+If nothing listens on port 9000, the script starts the stub itself. Use
+`--backend jev` for the Jev path of the stub.
 
 ## Real run (paid)
 
@@ -42,7 +53,10 @@ Options:
 
 - `--split dev|holdout|both` (default `both`)
 - `--limit N`: at most N rows of each split
-- `--max-yen X` (default 30): the budget in JPY
+- `--max-yen X` (default 30): the budget in JPY for base spend plus this run
+- `--spent-yen X` (default 0): JPY that earlier runs spent. Each run starts from
+  it, so the 30 JPY budget is shared by all runs. The report prints the
+  cumulative total.
 - `--router PATH`: another router binary
 
 ## Budget guard
