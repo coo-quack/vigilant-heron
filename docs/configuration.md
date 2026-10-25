@@ -105,7 +105,11 @@ Peers whose real-IP header is believed. Repeatable.
 - **Default:** `X-Real-IP`.
 - **Context:** top level.
 
-Header that holds the client address when the peer is in `real_ip_from`.
+Header that holds the client address when the peer is in `real_ip_from`. When the
+header comes in several lines, all of them are read in the order received and
+joined with commas, as nginx does. A proxy that appends its own line is therefore
+seen last. If any line is not valid text, the header is ignored and the peer is
+the client.
 
 ### `real_ip_recursive`
 
@@ -470,6 +474,14 @@ Longest wait for a free concurrency slot. A request that finds no slot in that t
 
 Most backend calls in flight at the same time. At least 1.
 
+### `max_concurrency_per_client`
+
+- **Syntax:** `max_concurrency_per_client <number>;`
+- **Default:** `8`, or `max_concurrency` when that is smaller.
+- **Context:** decision.
+
+Most backend calls in flight for one client address, keyed by the client address that the realip settings choose. A request from a client that already holds its share is not queued: it is a rate limit for that client (`decision_error=client_busy`, in the `on_rate_limit` group), so other clients keep getting the model. It must be at least 1 and at most `max_concurrency`. This limits a denial-of-service (DoS) attack from one address, but not one from many addresses. See [How it works](/how-it-works#failure-behavior).
+
 ### `inspect_body`
 
 - **Syntax:** `inspect_body <size>;`
@@ -492,6 +504,14 @@ Rejected with an error that names `client_max_body_size`, which is set at the to
 - **Context:** decision.
 
 Extra header names removed before the event is sent to the backend. Repeatable. They cannot be logged either.
+
+### `redact_field`
+
+- **Syntax:** `redact_field <name> ...;`
+- **Default:** none. Field names with password-, token-, card-like or other sensitive words are redacted already (see [How it works](/how-it-works)).
+- **Context:** decision.
+
+Extra form and JSON field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. Repeatable.
 
 ## Site block
 
@@ -549,7 +569,7 @@ AI-instruction score, from 0 to 1, at or above which a request is blocked.
 - **Default:** `allow`.
 - **Context:** site.
 
-What happens when the backend answers HTTP 429 or no slot is free within `queue_timeout`. Rules are not affected. See [How it works](/how-it-works#failure-behavior).
+What happens when the backend answers HTTP 429, when no slot is free within `queue_timeout`, or when a client already holds its `max_concurrency_per_client` share (`client_busy`). Rules are not affected. A denial-of-service (DoS) attack against the backend can use this to make requests skip the model, so a site that prefers safety over availability should set `block`, and limit each client with `limit_req` and `limit_conn`. See [How it works](/how-it-works#failure-behavior).
 
 ### `on_decision_error`
 
@@ -557,7 +577,7 @@ What happens when the backend answers HTTP 429 or no slot is free within `queue_
 - **Default:** `allow`.
 - **Context:** site.
 
-What happens when the backend fails in any other way: a timeout, a connection error, a non-2xx status or an unusable answer.
+What happens when the backend fails in any other way: a timeout, a connection error, a non-2xx status or an unusable answer. The default allows; a site that prefers blocking while the backend is down sets `block`.
 
 ### `deny_path`
 
@@ -565,7 +585,7 @@ What happens when the backend fails in any other way: a timeout, a connection er
 - **Default:** none.
 - **Context:** site.
 
-Path prefixes that are always blocked without calling the backend. They match the normalized path, lowercased, so `/wp-config.php` also covers `/wp-config.php.bak`. Repeatable.
+Path prefixes that are always blocked without calling the backend. A prefix matches when it starts any [reading of the path](/how-it-works#path-readings), lowercased, so `/wp-config.php` also covers `/wp-config.php.bak`, and `/manager` also covers `/;/manager/html` and `/x/..;/manager/html`. Repeatable.
 
 ### `fail_closed_path`
 
@@ -573,7 +593,7 @@ Path prefixes that are always blocked without calling the backend. They match th
 - **Default:** none.
 - **Context:** site.
 
-Path prefixes that are blocked whenever the decision fails, whatever `on_rate_limit` and `on_decision_error` say.
+Path prefixes that are blocked whenever the decision fails, whatever `on_rate_limit` and `on_decision_error` say. They match the path readings in the same way as `deny_path`, and a matching path is never a static skip.
 
 ### `static_extensions`
 
@@ -581,7 +601,15 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query and no body that skip the backend. When given, the list replaces the defaults. Repeatable.
+File extensions of plain GET or HEAD requests with no query and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+
+### `static_location`
+
+- **Syntax:** `static_location <prefix> ...;`
+- **Default:** none. The static skip applies under any path.
+- **Context:** site.
+
+Path prefixes under which the static skip (`static_extensions`) may apply. Every path reading must start with one of them, so `/static/..;/img/a.css` is inspected. Compared lowercased. Repeatable; each prefix must start with `/`. Set it when the static files live in known directories, so that a static extension elsewhere is always inspected.
 
 ### `debug_headers`
 

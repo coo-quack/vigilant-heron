@@ -132,3 +132,64 @@
 - Docker image (`runtime` target) and Compose-based e2e suite
 - Cloudflare Clef decision backend (`decision.backend = "clef"`), with the
   API token read from an environment variable and https support
+- Security (F10, F11): `escape json` now writes every control character (C0,
+  DEL and the C1 range) and U+2028/U+2029 as `\uXXXX`, so a log line cannot
+  carry terminal control sequences or be split by a Unicode line separator. The
+  built-in `main` format quotes `category`, `retry_after` and `request_id`, so a
+  client-chosen request id with spaces and `=` cannot add fields. Log lines in the
+  `main` format change for those three values (their values are now quoted).
+- Security (F3): every line of `real_ip_header` is read, in order, and the lines are
+  joined with commas before the right-to-left choice. Previously only the first
+  line was read, so a trusted proxy that appended its own line (HAProxy's
+  `option forwardfor`) could not stop a client from choosing its address. A
+  malformed line makes the whole header ignored, as before.
+- Security (F6): a denial-of-service (DoS) attack against the decision backend,
+  which keeps the concurrency slots full, could make requests skip the model. The
+  defaults of `on_rate_limit` and `on_decision_error` stay `allow`; an earlier
+  change that made them `block` is reverted. The new `decision`
+  `max_concurrency_per_client` directive (default 8, at most `max_concurrency`)
+  limits the calls in flight for one client address, keyed by the realip address.
+  A client beyond its share is refused at once with `decision_error=client_busy`,
+  in the rate-limit group, so only that client follows `on_rate_limit`, and other
+  clients keep being judged. A DoS attack from many addresses is not prevented.
+  Sites that prefer safety over availability can set `on_rate_limit block`.
+- Security (F8): the lexical redaction of JSON-like bodies computed the end of
+  every value, including the end of an unclosed container, for every key. A body
+  of `"":{` repeated filled the inspected prefix and took time quadratic in its
+  length. The end is now computed only for a value that is replaced or copied, so
+  the scan is linear. The output is unchanged; a property test compares it with
+  the previous implementation.
+- Security (F2): the sensitive field names now include `pass`, `passphrase`,
+  `passcode`, `pin`, `otp`, `credential`, `auth`, `session`, `private_key`,
+  `access_key`, `secret_key`, `jwt` and `cookie`. A Drupal login
+  (`name=alice&pass=...`) no longer sends its password to the decision backend.
+  Short words (`pass`, `pin`, `otp`, `auth`, `session`, `cookie`, `jwt`) match a
+  whole word of the field name, so `author`, `shipping` and `passenger` are not
+  redacted. The known names now also match with `_`, `-` or `.` removed
+  (`api_key`, `API-KEY`). New `redact_field <name> ...;` directive in the
+  `decision` block adds field names, matched exactly and case-insensitively.
+  The expectation `session=1` in the lexical test became `session=[REDACTED]`,
+  because the list now includes `session` (the previous expectation encoded the
+  shorter list).
+- Security (F7): the decision event's `meta.host` is the name of the matched
+  site (its first name, or the pattern of a wildcard or regex site), never the
+  client's `Host`. The client's `Host` stays in the `untrusted` headers only. A
+  `Host` whose name has characters other than letters, digits, `.`, `-` and `_`
+  (and is not a bracketed IPv6 literal, with an optional digits-only port) now gets
+  400 with reason `invalid_host`, before the access list. Underscores are allowed,
+  since real deployments use them. A request with no `Host` header is routed as before.
+- Security (F1, F4, F5, F9): the security checks read the request path in six
+  ways (decoded; with `;` parameters cut per segment; with `\` as `/`; both; and
+  the raw path with `%2F` and `%5C` kept inside their segments, plain and with
+  the first two). `deny_path`, `fail_closed_path` and a block rule's `path`
+  condition match when any reading matches. A skip rule's `path` condition matches
+  only when every reading does. Limits apply to every `location` any reading
+  selects. A static skip needs every reading to end in a static extension with no
+  earlier script extension, the raw path free of `;`, `\`, `%2F`, `%5C` and `%3B`,
+  and no `fail_closed_path` match. The request is still forwarded unchanged.
+  New directive `static_location <prefix> ...;` in a `site` restricts the static
+  skip to some prefixes.
+- Built-in rule `vh-cmdi-001` no longer matches a query parameter whose name starts
+  with a command name followed by `-` (such as `&id-from=3`, `&cat-name=x` or
+  `&nc-mode=1`). The command must now be followed by whitespace, the end of the
+  value, or a shell separator. The positive examples still match.

@@ -202,13 +202,13 @@ const JSON_TEMPLATE: &str = concat!(
     r#""input_tokens":"$input_tokens","latency_ms":"$latency_ms"}"#
 );
 
-/// The built-in `main` template.
+/// The built-in `main` template. The free-text values are quoted, so a value with spaces or `=` cannot add a field.
 const MAIN_TEMPLATE: &str = concat!(
     "$time_iso8601 $client_ip $site \"$method $path\" $status ",
     "action=$action reason=$reason would_have=$would_have ",
-    "attack=$attack ai_instruction=$ai_instruction category=$category ",
-    "decision_error=$decision_error retry_after=$retry_after ",
-    "input_tokens=$input_tokens latency_ms=$latency_ms request_id=$request_id"
+    "attack=$attack ai_instruction=$ai_instruction category=\"$category\" ",
+    "decision_error=$decision_error retry_after=\"$retry_after\" ",
+    "input_tokens=$input_tokens latency_ms=$latency_ms request_id=\"$request_id\""
 );
 
 /// Reads `$name` or `${name}` starting at the `$` at `start`.
@@ -362,7 +362,15 @@ fn write_value(out: &mut String, value: Option<&str>, escape: Escape) {
     }
 }
 
+/// Characters a log line must never contain: controls (C0, DEL and C1), and the Unicode line separators.
+fn is_log_breaking_char(c: char) -> bool {
+    c.is_control() || c == '\u{2028}' || c == '\u{2029}'
+}
+
 /// Appends `value` escaped for `escape`.
+///
+/// `Escape::Default` writes every byte outside printable ASCII as `\xNN`. `Escape::Json`
+/// keeps printable non-ASCII text (such as Japanese) and writes the breaking characters as `\uXXXX`.
 pub(crate) fn escape_into(out: &mut String, value: &str, escape: Escape) {
     match escape {
         Escape::Default => {
@@ -388,7 +396,7 @@ pub(crate) fn escape_into(out: &mut String, value: &str, escape: Escape) {
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
                     '\t' => out.push_str("\\t"),
-                    c if (c as u32) < 0x20 => {
+                    c if is_log_breaking_char(c) => {
                         let _ = write!(out, "\\u{:04x}", c as u32);
                     }
                     c => out.push(c),
@@ -672,6 +680,36 @@ mod tests {
         assert!(parsed.is_ok(), "not JSON: {line}");
     }
 
+    #[test]
+    fn json_escape_hides_c1_controls_and_line_separators() {
+        let mut out = String::new();
+        escape_into(&mut out, "a\u{9b}31m\u{85}b\u{2028}c\u{2029}", Escape::Json);
+        assert_eq!(out, "a\\u009b31m\\u0085b\\u2028c\\u2029");
+    }
+
+    #[test]
+    fn json_escape_keeps_printable_japanese_readable() {
+        let mut out = String::new();
+        escape_into(&mut out, "日本語 テキスト", Escape::Json);
+        assert_eq!(out, "日本語 テキスト");
+    }
+
+    #[test]
+    fn main_format_keeps_a_spaced_request_id_inside_its_quotes() {
+        let mut value = record(at(0));
+        value.request_id = Some("x action=allow reason=none attack=0 category=none");
+        value.category = Some("a b=c");
+        let rendered = LogFormat::main().render(&value, &HeaderMap::new());
+        // Text outside quotes, where a field name is recognized (this test has no escaped quotes).
+        let unquoted: String = rendered.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+        assert_eq!(unquoted.matches(" action=").count(), 1, "{rendered}");
+        assert!(
+            rendered.ends_with("request_id=\"x action=allow reason=none attack=0 category=none\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("category=\"a b=c\""), "{rendered}");
+    }
+
     proptest::proptest! {
         #[test]
         // Any char, control characters and newlines included: they are what the
@@ -688,7 +726,25 @@ mod tests {
             let value: String = chars.into_iter().collect();
             let mut out = String::new();
             escape_into(&mut out, &value, Escape::Json);
-            prop_assert!(out.chars().all(|c| (c as u32) >= 0x20));
+            prop_assert!(out.chars().all(|c| !c.is_control()));
+        }
+
+        #[test]
+        fn escapes_never_emit_c1_controls_or_line_separators(
+            chars in proptest::collection::vec(
+                prop_oneof![
+                    3 => proptest::arbitrary::any::<char>(),
+                    1 => proptest::sample::select(vec!['\u{7f}', '\u{85}', '\u{9b}', '\u{9d}', '\u{2028}', '\u{2029}']),
+                ],
+                0..64,
+            ),
+        ) {
+            let value: String = chars.into_iter().collect();
+            for escape in [Escape::Default, Escape::Json] {
+                let mut out = String::new();
+                escape_into(&mut out, &value, escape);
+                prop_assert!(!out.chars().any(is_log_breaking_char));
+            }
         }
     }
 }

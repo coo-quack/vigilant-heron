@@ -32,6 +32,8 @@ const DEFAULT_STATUS: u16 = 421;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// Default number of concurrent decision-backend calls.
 const DEFAULT_MAX_CONCURRENCY: usize = 64;
+/// Default `max_concurrency_per_client`, capped at `max_concurrency` when that is smaller.
+const DEFAULT_MAX_CONCURRENCY_PER_CLIENT: usize = 8;
 /// Default decision timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(300);
 /// Default block threshold for a site.
@@ -143,6 +145,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "deny_path",
     "fail_closed_path",
     "static_extensions",
+    "static_location",
     "debug_headers",
     "access_log",
     "allow",
@@ -190,9 +193,11 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
     "timeout",
     "queue_timeout",
     "max_concurrency",
+    "max_concurrency_per_client",
     "inspect_body",
     "max_body",
     "redact_header",
+    "redact_field",
 ];
 
 /// Validated configuration for the whole proxy.
@@ -244,10 +249,16 @@ pub struct DecisionConfig {
     pub queue_timeout: Duration,
     /// Most decision-backend calls in flight at the same time.
     pub max_concurrency: usize,
+    /// Most decision-backend calls in flight for one client address, keyed by the
+    /// realip-resolved address. A request beyond it is `client_busy` without waiting.
+    pub max_concurrency_per_client: usize,
     /// Bytes of the request body that are sent to the backend.
     pub inspect_body_bytes: usize,
     /// Extra header names to drop before sending, lowercased.
     pub redact_headers: Vec<String>,
+    /// Extra body field names to redact before sending, lowercased. Each name is
+    /// matched exactly, with the field name compared case-insensitively.
+    pub redact_fields: Vec<String>,
 }
 
 /// Timers and header limits of client connections, set at the top level only.
@@ -376,6 +387,8 @@ pub struct SiteConfig {
     pub on_decision_error: FailureAction,
     /// File extensions that may skip the backend, lowercased.
     pub static_extensions: Vec<String>,
+    /// Path prefixes under which a static skip may apply, lowercased. Empty means anywhere.
+    pub static_locations: Vec<String>,
     /// Whether responses carry the `x-vigilant-heron` header.
     pub debug_headers: bool,
     /// The site's own access logs. `None` inherits the top-level ones; `Some(empty)` is `access_log off`.
@@ -1391,8 +1404,10 @@ where
     let mut timeout = DEFAULT_TIMEOUT;
     let mut queue_timeout = Duration::ZERO;
     let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
+    let mut max_concurrency_per_client: Option<usize> = None;
     let mut inspect_body = DEFAULT_INSPECT_BODY;
     let mut redact_headers = Vec::new();
+    let mut redact_fields = Vec::new();
     let mut backend_line = directive;
     let mut token_line = directive;
     let mut model_line = directive;
@@ -1444,6 +1459,10 @@ where
                 once(&mut seen, child)?;
                 max_concurrency = parse_usize(child, one_arg(child)?)?;
             }
+            "max_concurrency_per_client" => {
+                once(&mut seen, child)?;
+                max_concurrency_per_client = Some(parse_usize(child, one_arg(child)?)?);
+            }
             "inspect_body" => {
                 once(&mut seen, child)?;
                 inspect_body = parse_size(child, one_arg(child)?)?;
@@ -1462,6 +1481,15 @@ where
                     ));
                 }
                 redact_headers.extend(child.args.iter().map(|h| h.to_ascii_lowercase()));
+            }
+            "redact_field" => {
+                if child.args.is_empty() {
+                    return Err(invalid(
+                        child,
+                        "\"redact_field\" needs at least one field name",
+                    ));
+                }
+                redact_fields.extend(child.args.iter().map(|f| f.to_ascii_lowercase()));
             }
             other => {
                 return Err(invalid(
@@ -1484,6 +1512,22 @@ where
     if max_concurrency == 0 {
         return Err(invalid(directive, "\"max_concurrency\" must be at least 1"));
     }
+    let max_concurrency_per_client = match max_concurrency_per_client {
+        Some(0) => {
+            return Err(invalid(
+                directive,
+                "\"max_concurrency_per_client\" must be at least 1",
+            ));
+        }
+        Some(per_client) if per_client > max_concurrency => {
+            return Err(invalid(
+                directive,
+                "\"max_concurrency_per_client\" must not exceed \"max_concurrency\"",
+            ));
+        }
+        Some(per_client) => per_client,
+        None => DEFAULT_MAX_CONCURRENCY_PER_CLIENT.min(max_concurrency),
+    };
 
     let (url_text, url_line) = match url_text {
         Some((text, line)) => (text, line),
@@ -1564,8 +1608,10 @@ where
         timeout,
         queue_timeout,
         max_concurrency,
+        max_concurrency_per_client,
         inspect_body_bytes: inspect_body,
         redact_headers,
+        redact_fields,
     })
 }
 
@@ -1675,6 +1721,7 @@ fn parse_site(
     let mut on_rate_limit = FailureAction::Allow;
     let mut on_decision_error = FailureAction::Allow;
     let mut static_extensions: Option<Vec<String>> = None;
+    let mut static_locations: Vec<String> = Vec::new();
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
@@ -1786,6 +1833,23 @@ fn parse_site(
             "static_extensions" => {
                 let list = static_extensions.get_or_insert_with(Vec::new);
                 list.extend(child.args.iter().map(|e| e.to_ascii_lowercase()));
+            }
+            "static_location" => {
+                if child.args.is_empty() {
+                    return Err(invalid(
+                        child,
+                        "\"static_location\" needs at least one path prefix",
+                    ));
+                }
+                for prefix in &child.args {
+                    if !prefix.starts_with('/') {
+                        return Err(invalid(
+                            child,
+                            format!("\"static_location\" prefix must start with /: {prefix}"),
+                        ));
+                    }
+                }
+                static_locations.extend(child.args.iter().map(|p| p.to_ascii_lowercase()));
             }
             "debug_headers" => {
                 once(&mut seen, child)?;
@@ -1921,6 +1985,7 @@ fn parse_site(
                 .map(|e| (*e).to_owned())
                 .collect()
         }),
+        static_locations,
         debug_headers,
         access_logs,
         timeouts,
@@ -2007,6 +2072,7 @@ mod tests {
         let site = first_site(&config)?;
         assert_eq!(site.block_threshold, 0.87);
         assert_eq!(site.instruction_threshold, 0.8);
+        // Restored to allow: the fail-closed default was reverted (see CHANGELOG).
         assert_eq!(site.on_rate_limit, FailureAction::Allow);
         assert_eq!(site.on_decision_error, FailureAction::Allow);
         assert_eq!(site.mode, Mode::Enforce);
@@ -2462,6 +2528,79 @@ mod tests {
             with_decision("    backend http;\n    redact_header X-Session;\n")
         );
         assert!(message(parse(&redact)).contains("never logged"));
+    }
+
+    #[test]
+    fn redact_field_names_are_read_lowercased_in_the_decision_block() -> Result<(), ConfigError> {
+        let config = parse(&with_decision(
+            "    backend http;\n    redact_field Ticket_Ref Internal-Note;\n    redact_field trace;\n",
+        ))?;
+        assert_eq!(
+            config.decision.redact_fields,
+            ["ticket_ref", "internal-note", "trace"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn static_location_prefixes_are_read_lowercased_and_must_start_with_a_slash()
+    -> Result<(), ConfigError> {
+        let config = parse(&with_site(
+            "    static_location /Static/ /wp-content/Uploads/;\n",
+        ))?;
+        assert_eq!(
+            first_site(&config)?.static_locations,
+            ["/static/", "/wp-content/uploads/"]
+        );
+        assert!(
+            message(parse(&with_site("    static_location static/;\n")))
+                .contains("\"static_location\" prefix must start with /: static/")
+        );
+        assert!(
+            message(parse(&with_site("    static_location;\n")))
+                .contains("\"static_location\" needs at least one path prefix")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn max_concurrency_per_client_defaults_to_eight_capped_at_the_global_cap()
+    -> Result<(), ConfigError> {
+        let config = parse(&with_decision("    backend http;\n"))?;
+        assert_eq!(config.decision.max_concurrency_per_client, 8);
+        let small = parse(&with_decision(
+            "    backend http;\n    max_concurrency 3;\n",
+        ))?;
+        assert_eq!(small.decision.max_concurrency_per_client, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn max_concurrency_per_client_must_be_between_one_and_the_global_cap() -> Result<(), ConfigError>
+    {
+        let set = parse(&with_decision(
+            "    backend http;\n    max_concurrency 10;\n    max_concurrency_per_client 4;\n",
+        ))?;
+        assert_eq!(set.decision.max_concurrency_per_client, 4);
+        assert!(
+            message(parse(&with_decision(
+                "    backend http;\n    max_concurrency_per_client 0;\n"
+            )))
+            .contains("\"max_concurrency_per_client\" must be at least 1")
+        );
+        assert!(
+            message(parse(&with_decision(
+                "    backend http;\n    max_concurrency 4;\n    max_concurrency_per_client 5;\n",
+            )))
+            .contains("\"max_concurrency_per_client\" must not exceed \"max_concurrency\"")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redact_field_needs_a_name() {
+        let text = with_decision("    backend http;\n    redact_field;\n");
+        assert!(message(parse(&text)).contains("\"redact_field\" needs at least one field name"));
     }
 
     #[test]

@@ -164,8 +164,14 @@ async fn rate_limit_is_logged_with_its_cause_and_retry_after() -> TestResult {
     let upstream = Upstream::start().await?;
     let path = log_path("rate-limit");
     let _ = std::fs::remove_file(&path);
-    let proxy =
-        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
+    let proxy = start_proxy_config(config_for(
+        "jev",
+        &fake.url,
+        &upstream.url(),
+        &path,
+        "on_rate_limit allow;",
+    )?)
+    .await?;
 
     let reply = get_with_id(&proxy.base(), "/articles/ratelimited", "log-rate-1").await?;
 
@@ -183,8 +189,14 @@ async fn backend_timeout_is_logged_as_timeout() -> TestResult {
     let upstream = Upstream::start().await?;
     let path = log_path("timeout");
     let _ = std::fs::remove_file(&path);
-    let proxy =
-        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
+    let proxy = start_proxy_config(config_for(
+        "jev",
+        &fake.url,
+        &upstream.url(),
+        &path,
+        "on_decision_error allow;",
+    )?)
+    .await?;
 
     let reply = get_with_id(&proxy.base(), "/articles/slowanswer", "log-timeout-1").await?;
 
@@ -201,8 +213,14 @@ async fn server_error_is_logged_as_http_status() -> TestResult {
     let upstream = Upstream::start().await?;
     let path = log_path("http-status");
     let _ = std::fs::remove_file(&path);
-    let proxy =
-        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
+    let proxy = start_proxy_config(config_for(
+        "jev",
+        &fake.url,
+        &upstream.url(),
+        &path,
+        "on_decision_error allow;",
+    )?)
+    .await?;
 
     let reply = get_with_id(&proxy.base(), "/articles/servererror", "log-500-1").await?;
 
@@ -223,6 +241,8 @@ async fn saturated_request_is_logged_as_backend_busy() -> TestResult {
 listen 127.0.0.1:0;
 request_id_header x-request-id;
 access_log {log} json;
+real_ip_from 127.0.0.0/8;
+real_ip_header x-real-ip;
 
 client_max_body_size 1024;
 decision {{
@@ -272,7 +292,16 @@ site example.com {{
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let reply = get_with_id(&base, "/articles/queued", "log-busy-1").await?;
+    // Another client, so that the per-client share does not apply: the global slot is full.
+    let reply = send(
+        &base,
+        Method::GET,
+        "/articles/queued",
+        "example.com",
+        &[("x-real-ip", "203.0.113.9"), ("x-request-id", "log-busy-1")],
+        Bytes::new(),
+    )
+    .await?;
     holder.await??;
 
     assert_eq!(
