@@ -28,9 +28,13 @@ ROUTER_BIN = ROOT / "target" / "release" / "vigilant-heron"
 STUB_BIN = ROOT / "target" / "release" / "stub-decider"
 STUB_PORT = 9000
 SITE_HOST = "load.example.com"
+# Requests are spread over this many client addresses (198.51.100.1 to .250).
+CLIENT_ADDRESSES = 250
 CONFIG_TEXT = """listen @LISTEN@;
 request_id_header x-request-id;
 access_log @ACCESS_LOG@ json;
+real_ip_from 127.0.0.0/8;
+real_ip_header x-real-ip;
 @WORKER_THREADS@
 
 client_max_body_size 10485760;
@@ -129,7 +133,14 @@ def run_load(port, concurrency, requests):
                 connection.request(
                     "GET",
                     f"/articles/{index % 500}",
-                    headers={"Host": SITE_HOST, "X-Request-Id": f"load-{index}"},
+                    # The load comes from many clients, so the per-client cap applies as in
+                    # production: each request names one of CLIENT_ADDRESSES through the
+                    # trusted X-Real-IP header.
+                    headers={
+                        "Host": SITE_HOST,
+                        "X-Request-Id": f"load-{index}",
+                        "X-Real-IP": f"198.51.100.{index % CLIENT_ADDRESSES + 1}",
+                    },
                 )
                 response = connection.getresponse()
                 response.read()

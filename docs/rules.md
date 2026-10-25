@@ -86,8 +86,10 @@ request that a block rule matches.
 Matching uses the normalized request. The forwarded request is never changed by
 this.
 
-- **Path**: one percent-decode, dot segments resolved, NUL bytes removed. The case
-  is kept, so `path` and `path ~` are case-sensitive, as in nginx.
+- **Path**: six readings of the path, see [How it works](/how-it-works#path-readings).
+  A block rule's `path` condition matches when any reading matches, and a skip
+  rule's `path` condition only when every reading matches. The case is kept, so
+  `path` and `path ~` are case-sensitive, as in nginx.
 - **Query and form body**: `+` becomes a space, percent-decoding is applied at
   most twice, so a double-encoded escape is undone, and NUL bytes are removed.
 - **Header values**: the same decoding as the query, except that `+` is literal.

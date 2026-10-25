@@ -109,7 +109,11 @@ follows nginx.
 4. Otherwise the longest prefix is used.
 
 The path is the normalized request path. Plain paths are compared lowercased, as
-`deny_path` is, and must start with `/`. A `~` regex matches the decoded path with
+`deny_path` is, and must start with `/`. A request is limited by every location that
+any [reading of the path](/how-it-works#path-readings) selects, so `/login;x` is
+limited by `location = /login`, and a request cannot escape a location's limits by
+choosing another reading. The block response comes from the location that the
+decoded path selects. A `~` regex matches the decoded path with
 case kept, and `~*` ignores case. Regexes use the `regex` crate, which has no
 backreferences or look-around, unlike nginx's PCRE. A repeated plain location is
 an error, as in nginx.

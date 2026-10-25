@@ -29,6 +29,12 @@ struct Setup {
     max_concurrency: usize,
     queue_timeout_ms: u64,
     timeout_ms: u64,
+    /// When false, the configuration omits the two failure directives and uses their defaults.
+    explicit_failures: bool,
+    /// Per-client cap on decision calls, when set.
+    per_client: Option<usize>,
+    /// Access log file, when set (JSON lines).
+    log: Option<std::path::PathBuf>,
 }
 
 impl Setup {
@@ -42,6 +48,9 @@ impl Setup {
             max_concurrency: 64,
             queue_timeout_ms: 0,
             timeout_ms: 2000,
+            explicit_failures: true,
+            per_client: None,
+            log: None,
         }
     }
 
@@ -51,9 +60,18 @@ impl Setup {
         } else {
             "action block;"
         };
+        let access = self.log.as_ref().map_or(String::new(), |path| {
+            format!("access_log \"{}\" json;\n", path.display())
+        });
+        let per_client = self.per_client.map_or(String::new(), |n| {
+            format!("    max_concurrency_per_client {n};\n")
+        });
         let text = format!(
             r#"
 listen 127.0.0.1:0;
+{access}request_id_header x-request-id;
+real_ip_from 127.0.0.0/8;
+real_ip_header x-real-ip;
 
 client_max_body_size 1024;
 decision {{
@@ -63,7 +81,7 @@ decision {{
     api_token_env "{TOKEN_ENV}";
     timeout {timeout}ms;
     max_concurrency {concurrency};
-    queue_timeout {queue}ms;
+{per_client}    queue_timeout {queue}ms;
     inspect_body 512;
 }}
 
@@ -77,17 +95,24 @@ site example.com {{
     instruction_threshold 0.5;
     deny_path /.env;
     fail_closed_path /wp-login.php;
-    on_rate_limit {rate};
-    on_decision_error {error};
+    {failure_lines}
 }}
 "#,
             url = self.decide_url,
             timeout = self.timeout_ms,
             concurrency = self.max_concurrency,
+            per_client = per_client,
+            access = access,
             queue = self.queue_timeout_ms,
             upstream = self.upstream_url,
-            rate = self.on_rate_limit,
-            error = self.on_decision_error,
+            failure_lines = if self.explicit_failures {
+                format!(
+                    "on_rate_limit {};\n    on_decision_error {};",
+                    self.on_rate_limit, self.on_decision_error
+                )
+            } else {
+                String::new()
+            },
         );
         let token = GOOD_TOKEN;
         Ok(Config::parse_str_with_lookup(
@@ -304,6 +329,51 @@ async fn saturated_request_is_a_rate_limit_and_follows_on_rate_limit(
     proxy.stop().await
 }
 
+/// With no failure directives, a saturated backend blocks an ordinary path.
+#[tokio::test]
+async fn saturated_backend_allows_an_ordinary_path_by_default() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.explicit_failures = false;
+    setup.max_concurrency = 1;
+    setup.timeout_ms = 1000;
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move { get(&holder_base, "/articles/slowanswer").await });
+    wait_until_backend_busy(&fake).await?;
+    let queued = get(&base, "/articles/queued").await?;
+    holder.await??;
+
+    assert_eq!(
+        queued.status.as_u16(),
+        200,
+        "the default on_rate_limit is allow"
+    );
+    proxy.stop().await
+}
+
+/// With no failure directives, an unreachable backend blocks an ordinary path.
+#[tokio::test]
+async fn unreachable_backend_allows_an_ordinary_path_by_default() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decide_url = format!("{}{JEV_PATH}", closed_port_url().await?);
+    let mut setup = Setup::new(decide_url, upstream.url());
+    setup.explicit_failures = false;
+    let proxy = start_proxy_config(setup.config()?).await?;
+
+    let reply = get(&proxy.base(), "/articles/normal").await?;
+
+    assert_eq!(
+        reply.status.as_u16(),
+        200,
+        "the default on_decision_error is allow"
+    );
+    proxy.stop().await
+}
+
 /// A request that gets a slot within the queue window is judged normally.
 #[tokio::test]
 async fn request_that_gets_a_slot_within_the_queue_window_is_judged() -> TestResult {
@@ -318,9 +388,10 @@ async fn request_that_gets_a_slot_within_the_queue_window_is_judged() -> TestRes
     let base = proxy.base();
 
     // The first request is answered 429 at once, so the second gets the slot well inside the window.
+    // The two come from different clients: one client may not wait for a slot beyond its share.
     let (first, second) = tokio::join!(
-        get(&base, "/articles/ratelimited"),
-        get(&base, "/articles/normal"),
+        get_as(&base, "/articles/ratelimited", "203.0.113.1", "queue-first"),
+        get_as(&base, "/articles/normal", "203.0.113.2", "queue-second"),
     );
 
     assert_eq!(
@@ -338,5 +409,114 @@ async fn request_that_gets_a_slot_within_the_queue_window_is_judged() -> TestRes
         2,
         "both requests reached the backend"
     );
+    proxy.stop().await
+}
+
+/// Sends a GET as the client `address` (through the trusted `X-Real-IP` header), with a request id.
+async fn get_as(base: &str, path: &str, address: &str, id: &str) -> Result<Reply, BoxError> {
+    send(
+        base,
+        Method::GET,
+        path,
+        "example.com",
+        &[("x-real-ip", address), ("x-request-id", id)],
+        Bytes::new(),
+    )
+    .await
+}
+
+/// The access-log line of `request_id`, parsed as JSON once it has been written.
+async fn wait_for_access_line(
+    path: &std::path::Path,
+    request_id: &str,
+) -> Result<serde_json::Value, BoxError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        for line in text.lines() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                && value.get("request_id").and_then(serde_json::Value::as_str) == Some(request_id)
+            {
+                return Ok(value);
+            }
+        }
+        if Instant::now() > deadline {
+            return Err(format!("no access log line for {request_id}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// One client holds its per-client share of the backend while it floods; another client
+/// must still be judged by the model, and the flooder's excess must follow `on_rate_limit`.
+#[rstest]
+#[case::allow_excess("allow", 200)]
+#[case::block_excess("block", 403)]
+#[tokio::test]
+async fn one_client_flooding_cannot_push_another_client_into_busy(
+    #[case] on_rate_limit: &'static str,
+    #[case] excess_expected: u16,
+) -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let log = std::env::temp_dir().join(format!(
+        "vh-failures-client-{}-{on_rate_limit}.log",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&log);
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    // Four global slots, of which the flooder may hold one.
+    setup.max_concurrency = 4;
+    setup.per_client = Some(1);
+    setup.timeout_ms = 1000;
+    setup.on_rate_limit = on_rate_limit;
+    setup.on_decision_error = "allow";
+    setup.log = Some(log.clone());
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    // The flooder's first call holds its one per-client slot until the timeout.
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "flood-holder",
+        )
+        .await
+    });
+    wait_until_backend_busy(&fake).await?;
+
+    // The same client again: refused at once, without reaching the backend.
+    let calls_before_excess = fake.calls.load(Ordering::SeqCst);
+    let excess = get_as(&base, "/articles/normal", "203.0.113.1", "flood-excess").await?;
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        calls_before_excess,
+        "the excess of a client over its share does not reach the backend"
+    );
+    assert_eq!(
+        excess.status.as_u16(),
+        excess_expected,
+        "the excess follows on_rate_limit"
+    );
+    let excess_line = wait_for_access_line(&log, "flood-excess").await?;
+    assert_eq!(excess_line["decision_error"], "client_busy");
+
+    // Another client is judged by the model while the flooder holds its share.
+    let calls_before_other = fake.calls.load(Ordering::SeqCst);
+    let other = get_as(&base, "/articles/normal", "203.0.113.2", "other-client").await?;
+    assert_eq!(other.status.as_u16(), 200);
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        calls_before_other + 1,
+        "the other client reached the model"
+    );
+    let other_line = wait_for_access_line(&log, "other-client").await?;
+    assert_eq!(other_line["decision_error"], "");
+    assert_eq!(other_line["reason"], "below_threshold");
+
+    holder.await??;
     proxy.stop().await
 }

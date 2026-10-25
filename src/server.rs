@@ -41,7 +41,9 @@ use crate::config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, MAX_REQUEST_ID_BYTES, Mode,
     SiteConfig,
 };
-use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
+use crate::decision::{
+    Backend, ClientSlots, DecisionBackend, HttpDecisionBackend, Limits, decision_client,
+};
 use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
@@ -50,7 +52,7 @@ use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
 use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
 use crate::realip::RealIp;
-use crate::router::{Router, normalize_host};
+use crate::router::{Router, is_valid_host, normalize_host};
 use crate::rules::RuleInput;
 use crate::sanitize::{self, EventInput, truncate_utf8};
 use crate::system_one::SystemOneBackend;
@@ -85,6 +87,10 @@ pub(crate) struct AppState<B> {
     inspect_body_bytes: usize,
     /// Header names dropped before the event is sent to the backend.
     backend_redact: Vec<String>,
+    /// Body field names redacted before the event is sent to the backend (`redact_field`).
+    backend_redact_fields: Vec<String>,
+    /// Decision calls in flight per client address (`max_concurrency_per_client`).
+    client_slots: Arc<ClientSlots>,
     backend: B,
     default_status: StatusCode,
     realip: RealIp,
@@ -168,6 +174,8 @@ impl AppState<Backend> {
             proxies,
             inspect_body_bytes: config.decision.inspect_body_bytes,
             backend_redact,
+            backend_redact_fields: config.decision.redact_fields.clone(),
+            client_slots: ClientSlots::new(config.decision.max_concurrency_per_client),
             backend,
             default_status: config.default_status,
             realip: config.realip,
@@ -605,11 +613,18 @@ async fn pipeline<B: DecisionBackend>(
     let index = state.router.lookup(parts.headers.get(HOST));
     let matched = index.and_then(|index| state.sites.get(index));
     let decoded = prefilter::decoded_path(parts.uri.path());
+    let views = prefilter::path_views(parts.uri.path());
+    // The location of the decoded path sets the block response, the headers and the tunnel.
     let location = matched.and_then(|site| limits::select_location(&site.locations, &decoded));
-    let limit_set = location
-        .map(|location| &location.limits)
-        .or_else(|| matched.map(|site| &site.limits))
-        .unwrap_or(&state.top_limits);
+    // Every location that any reading of the path selects is limited.
+    let selected = matched.map_or_else(Vec::new, |site| {
+        limits::select_locations(&site.locations, &views)
+    });
+    let limit_sets: Vec<&LimitSet> = if selected.is_empty() {
+        vec![matched.map_or(&state.top_limits, |site| &site.limits)]
+    } else {
+        selected.iter().map(|location| &location.limits).collect()
+    };
     let host = host_name(parts);
     let key_vars = KeyVars {
         client_ip: trace.client_ip,
@@ -624,7 +639,7 @@ async fn pipeline<B: DecisionBackend>(
     let site_block = matched.map(|site| &site.block);
     let block = location.map(|location| &location.block).or(site_block);
     let shadow = matched.is_some_and(|site| site.mode == Mode::Shadow);
-    let screened = limits::screen(&state.zones, limit_set, shadow, &key_vars, held).await;
+    let screened = limits::screen(&state.zones, &limit_sets, shadow, &key_vars, held).await;
     *lock(&trace.limit_req) = screened.req_status.map(ReqStatus::name);
     *lock(&trace.limit_conn) = screened.conn_status.map(ConnStatus::name);
     if let Some(refusal) = screened.refusal {
@@ -641,6 +656,19 @@ async fn pipeline<B: DecisionBackend>(
             refusal.reason,
             limit_sinks,
             true,
+        );
+    }
+    // A Host that is not a hostname or a literal is refused before it is routed.
+    let host_header = parts.headers.get(HOST);
+    if host_header.is_some_and(|value| !value.to_str().is_ok_and(is_valid_host)) {
+        return reject(
+            parts,
+            trace,
+            "",
+            StatusCode::BAD_REQUEST,
+            "invalid_host",
+            &state.global_sinks,
+            !done.load(Ordering::Acquire),
         );
     }
     // The access list comes next, before the body is read and before the host is judged.
@@ -723,7 +751,6 @@ async fn pipeline<B: DecisionBackend>(
     };
 
     let raw_path = parts.uri.path();
-    let path = prefilter::normalized_path(raw_path);
     let (assessment, rule_id) = if access_denied {
         (Assessment::AccessDenied, None)
     } else {
@@ -741,10 +768,20 @@ async fn pipeline<B: DecisionBackend>(
             Screening::SkipRule(id) => Some(Arc::clone(id)),
             Screening::Skip | Screening::Inspect => None,
         };
-        let assessment = assess(state, parts, &sniffed, trace.client_ip, &screening).await;
+        let assessment = assess(
+            state,
+            parts,
+            &sniffed,
+            trace.client_ip,
+            trace.client_addr,
+            site_name(site),
+            &screening,
+        )
+        .await;
         (assessment, rule_id)
     };
-    let mut decision = policy::decide(site, &path, &assessment);
+    let lowered: Vec<String> = views.iter().map(|view| view.to_lowercase()).collect();
+    let mut decision = policy::decide(site, &lowered, &assessment);
     if decision.would_have.is_none() {
         decision.would_have = screened.would_have.map(Action::Reject);
     }
@@ -1053,6 +1090,8 @@ async fn assess<B: DecisionBackend>(
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
+    client: IpAddr,
+    site: &str,
     screening: &Screening,
 ) -> Assessment {
     match screening {
@@ -1060,8 +1099,16 @@ async fn assess<B: DecisionBackend>(
         Screening::SkipRule(_) => Assessment::SkipRule,
         Screening::Skip => Assessment::Skip,
         Screening::Inspect => {
-            // The event carries the host the client asked for, which may match a wildcard or regex name.
-            let host = host_name(parts);
+            // A client that holds its share of decision calls is refused without waiting,
+            // so its excess is a rate limit for that client alone (`client_busy`).
+            let Some(_client_slot) = state.client_slots.take(client) else {
+                return Assessment::RateLimited {
+                    cause: "client_busy",
+                    retry_after: None,
+                };
+            };
+            // The event carries the name of the matched site, never the client's Host. The
+            // Host the client sent stays in the untrusted headers.
             let event = sanitize::build_event(&EventInput {
                 method: &parts.method,
                 path: parts.uri.path(),
@@ -1069,9 +1116,10 @@ async fn assess<B: DecisionBackend>(
                 headers: &parts.headers,
                 body: &sniffed.prefix,
                 body_continues: sniffed.truncated,
-                host: &host,
+                host: site,
                 client_ip,
                 redact_headers: &state.backend_redact,
+                redact_fields: &state.backend_redact_fields,
                 inspect_body_bytes: state.inspect_body_bytes,
             });
             match state.backend.decide(&event).await {
@@ -1093,11 +1141,18 @@ async fn assess<B: DecisionBackend>(
 }
 
 /// The client address chosen by the realip settings.
+///
+/// Every line of the realip header is read, in the order received, and joined with
+/// commas, so a trusted proxy that appends its own line is seen after the client's
+/// lines. A line that is not valid text makes the whole header untrusted.
 fn client_addr<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
-    let header = headers
-        .get(&state.realip.header)
-        .and_then(|value| value.to_str().ok());
-    state.realip.client_ip(peer.ip(), header)
+    let lines: Option<Vec<&str>> = headers
+        .get_all(&state.realip.header)
+        .iter()
+        .map(|value| value.to_str().ok())
+        .collect();
+    let joined = lines.map(|lines| lines.join(", "));
+    state.realip.client_ip(peer.ip(), joined.as_deref())
 }
 
 /// The host of the request, normalized, or an empty string when it has none.

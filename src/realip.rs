@@ -2,7 +2,8 @@
 //!
 //! The configured header (`X-Real-IP` by default) is believed only when the
 //! peer is a trusted proxy, listed in `real_ip_from`. Otherwise the client
-//! address is the peer address.
+//! address is the peer address. When the header comes in several lines, the
+//! caller joins them in order, as nginx does, before the address is chosen.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 

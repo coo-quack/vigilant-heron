@@ -15,18 +15,25 @@ decides the request ends the evaluation.
    before the body is read. A request over a limit gets the limit's status
    (503 by default) and is never forwarded. In a shadow site it is forwarded and
    recorded with `would_have=reject`.
-1. **Access list.** The `allow` and `deny` entries are checked in order by the
+1. **Host.** A `Host` header whose name has characters other than letters, digits,
+   `.`, `-` and `_`, and that is not a bracketed IPv6 literal, with an optional
+   digits-only `:port`, gets 400 (reason `invalid_host`) before the access list. A request without a `Host` header is routed as before.
+2. **Access list.** The `allow` and `deny` entries are checked in order by the
    client address. A denied client gets 403 with reason `access_denied`. The
    site's `action` does not apply.
-2. **`deny_path`.** A path prefix of the site that matches the normalized request
+3. **`deny_path`.** A path prefix of the site that matches the normalized request
    is a block (reason `rule`, no rule id).
-3. **Block rules.** The built-in rules that are on, then the top-level block
+4. **Block rules.** The built-in rules that are on, then the top-level block
    rules in file order, then the site's block rules. The first match blocks.
-4. **Skip rules.** The top-level skip rules, then the site's. The first match
+5. **Skip rules.** The top-level skip rules, then the site's. The first match
    forwards the request without calling the backend (reason `skip_rule`).
-5. **Static assets.** A plain GET or HEAD for a path with a static extension and
+6. **Static assets.** A plain GET or HEAD for a path with a static extension and
    no query and no body is forwarded without calling the backend (reason `skip`).
-6. **Decision model.** The request is sent to the backend, and the policy
+   It is skipped only when every [path reading](#path-readings) ends in a static
+   extension with no earlier script extension, the raw path has no `;`, `\`, `%2F`,
+   `%5C` or `%3B`, and no `fail_closed_path` matches. A `static_location` restricts
+   it to some prefixes.
+7. **Decision model.** The request is sent to the backend, and the policy
    compares the returned scores with `block_threshold` and
    `instruction_threshold`. The outcome is `model` when a threshold is reached and
    `below_threshold` otherwise.
@@ -41,6 +48,29 @@ The normalized request is used for matching only. What reaches the upstream is
 the request as the client sent it, apart from the headers changed by
 `proxy_set_header`.
 
+### Path readings
+
+The request path is read in six ways, because upstreams resolve the same bytes
+differently. Each reading is percent-decoded once, or resolved on the raw path, as
+described below, and dot segments are resolved on `/`:
+
+1. The decoded path.
+2. As 1, with each segment cut at its first `;`. Tomcat, Jetty and Spring drop
+   these path parameters.
+3. As 1, with `\` read as `/`. IIS and ASP.NET do this.
+4. As 2 and 3 together.
+5. The raw path, with `%2F` and `%5C` kept inside their segments, then
+   percent-decoded once. Express matches the raw path this way.
+6. As 5, with `;` parameters cut and `\` read as `/`.
+
+NUL bytes are removed from each reading. A reading that equals another is counted
+once. The forwarded request is never changed.
+
+A block rule, `deny_path`, `fail_closed_path` and a block rule's `path` condition
+match when any reading matches. A skip rule's `path` condition must match every
+reading. Limits apply to every `location` that any reading selects. The block
+response and the location headers come from the location of the decoded path.
+
 ## Block, redirect or forward
 
 A blocked request gets the site's `action`: `block` (the `block_status`, 403 by
@@ -52,7 +82,7 @@ for the decision and streams the rest as the upstream reads it.
 ## Failure behavior
 
 A decision can fail in two ways, and each has its own site setting. Both default
-to `allow`.
+to `block` (fail closed).
 
 - **`on_rate_limit`** covers the backend's HTTP 429 and a request that finds no
   free concurrency slot within `queue_timeout` (`backend_busy`).
@@ -61,6 +91,8 @@ to `allow`.
 
 Set each to `allow` or `block`. A saturated backend is always in the rate-limit
 group, so `on_decision_error` never applies to it.
+
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
 
 Two more rules apply to failures:
 
@@ -113,11 +145,17 @@ sent:
 - Credential headers are removed. `cookie`, `authorization`,
   `proxy-authorization`, `x-api-key` and `x-auth-token` are always dropped, and
   each name in `redact_header` is dropped too.
-- Form and JSON bodies are scanned for sensitive fields. A field whose name
-  contains `password`, `passwd`, `pwd`, `secret`, `token`, `api_key`, `apikey`,
-  `card`, `cvv` or `ssn` has its value replaced by `[REDACTED]`. Text that is
+- Form and JSON bodies are scanned for sensitive fields. A field is sensitive
+  when its name contains one of `password`, `passwd`, `pwd`, `secret`, `token`,
+  `apikey`, `card`, `cvv`, `ssn`, `passphrase`, `passcode`, `credential`,
+  `private_key` or `access_key` (case and `_`, `-`, `.` ignored), or when one of
+  its words is `pass`, `pin`, `otp`, `auth`, `session`, `cookie` or `jwt`. A word
+  is a run of letters and digits, split at other characters and at a lowercase to
+  uppercase change, so `author`, `shipping` and `passenger` are not sensitive. The
+  value is replaced by `[REDACTED]`. A field named in `redact_field` is also
+  replaced, when its name equals that name, case-insensitively. Text that is
   neither form data nor valid JSON is scanned for `key=value` pairs and
-  `"key": value` pairs with the same names.
+  `"key": value` pairs with the same rules.
 - Only the first `inspect_body` bytes of the body are sent, cut on a UTF-8 boundary.
   `body_truncated` is set when the body was longer.
 
@@ -131,6 +169,11 @@ it as data and not as instructions. The event has this shape:
   "meta": {"host": "example.com", "client_ip": "203.0.113.7", "body_truncated": false}
 }}
 ```
+
+`meta.host` is the name of the site the request matched: the first name of the
+`site` block, or its pattern for a wildcard or regex site. It is not the client's
+`Host`, so a client cannot choose it. The client's `Host` is still sent, as one of
+the `untrusted` headers.
 
 The `path` and `query` are the raw values. Normalization applies to matching only.
 The `meta` fields are set by the router, not by the client.

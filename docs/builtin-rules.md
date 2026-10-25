@@ -39,7 +39,7 @@ checks that this table lists exactly the ids of `builtin.conf`.
 | `vh-traversal-001` | Path traversal | on | A `../` sequence, with plain or encoded dots and slashes, in a query string | query |
 | `vh-traversal-002` | Path traversal | on | `etc/passwd`, `etc/shadow`, `win.ini`, `boot.ini` or `/proc/self/` in a query string | query |
 | `vh-traversal-003` | Path traversal | on | `etc/passwd`, `etc/shadow`, `win.ini`, `boot.ini` or `/proc/self/` in the path | path |
-| `vh-cmdi-001` | Command injection | on | A shell separator (`;`, `|`, `&` or a backtick) followed by a common command (`cat`, `id`, `whoami`, `uname`, `wget`, `curl`, `nc`, `bash`, `sh`) in a query string | query |
+| `vh-cmdi-001` | Command injection | on | A shell separator (`;`, `|`, `&` or a backtick) followed by a common command (`cat`, `id`, `whoami`, `uname`, `wget`, `curl`, `nc`, `bash`, `sh`) in a query string, where the command is followed by whitespace, the end of the value, or a separator. A parameter such as `&id-from=3` or `&cat-name=x` is not matched | query |
 | `vh-cmdi-002` | Command injection | on | A `$(` command substitution in a query string | query |
 | `vh-cmdi-003` | Command injection | on | A backtick followed by `cat`, `id`, `whoami`, `uname`, `wget` or `curl` in a query string | query |
 | `vh-lfi-001` | File inclusion | on | A PHP stream wrapper (`php://filter`, `input`, `memory`, `temp` or `fd`) in any input | any |
@@ -53,8 +53,8 @@ checks that this table lists exactly the ids of `builtin.conf`.
 | `vh-expr-003` | Template and expression injection | on | The Spring class loader property path (`class.module.classloader`) | any |
 | `vh-xxe-001` | XML external entities | on | An entity declared with `SYSTEM` in the body prefix | body |
 | `vh-scanner-001` | Known scanners | on | The user agent of a known scanner (sqlmap, nikto, nuclei, masscan, zgrab, acunetix, havij, commix, wpscan, dirbuster, gobuster or nmap) | header user-agent |
-| `vh-cve-2026-9103` | Opt-in virtual patch (CVE-2026-9103, IBM Langflow OSS) | off | Any request to `/api/v1/login/auto_login`, which issues superuser tokens without authentication when `AUTO_LOGIN` is on | path |
-| `vh-cve-2026-8481` | Opt-in virtual patch (CVE-2026-8481, IBM Langflow OSS) | off | A `POST` to `/api/v1/validate/code`, which runs user-supplied Python without a sandbox | method and path |
+| `vh-cve-2026-9103` | Opt-in virtual patch (CVE-2026-9103, IBM Langflow OSS) | off | Any request to `/api/v1/login/auto_login`, which issues superuser tokens without authentication when `AUTO_LOGIN` is enabled, which is the default | path |
+| `vh-cve-2026-8481` | Opt-in virtual patch (CVE-2026-8481, IBM Langflow OSS) | off | A `POST` to `/api/v1/validate/code`, which runs user-supplied Python through `exec()` without a sandbox; an authenticated user can exploit it, so the rule also covers a stolen or self-registered account | method and path |
 
 ## Opt-in rules
 
@@ -70,13 +70,20 @@ site langflow.example.com {
 }
 ```
 
-Both rules block until the product is upgraded past the affected versions. The
-policy for these rules, and how to write rules of your own for other advisories, is
-in [From CVE advisories to rules](/cve-rules).
+The two rules cover IBM Langflow OSS 1.0.0 through 1.10.0:
 
-The rules are for IBM Langflow OSS 1.0.0 through 1.10.0. Upgrade Langflow past 1.10.0
-and check the vendor advisory for the fixed version before you remove a rule.
+- `vh-cve-2026-9103`: [IBM bulletin](https://www.ibm.com/support/pages/node/7278926).
+  IBM recommends upgrading to 1.10.1.
+- `vh-cve-2026-8481`: [IBM bulletin](https://www.ibm.com/support/pages/node/7278923).
+  Upgrade past 1.10.0, and check the bulletin for the fixed release.
+
+Both rules block until the product is upgraded. Later Langflow bulletins can list
+newer fixed releases, so run the latest release. The policy for these rules, and how
+to write rules of your own for other advisories, is in
+[From CVE advisories to rules](/cve-rules).
 
 CVE-2026-8505 (a webhook that runs a flow without an API key when
 `WEBHOOK_AUTH_ENABLE` is false) has no shipped rule, because the rule language cannot
-express a missing header. Its mitigation is in [From CVE advisories to rules](/cve-rules#worked-example-cve-2026-8505).
+express a missing header. The fix IBM gives is an upgrade to 1.10.1; see
+[its bulletin](https://www.ibm.com/support/pages/security-bulletin-authentication-bypass-webhook-endpoints-allowed-unauthorized-flow-execution)
+and [From CVE advisories to rules](/cve-rules#worked-example-cve-2026-8505).

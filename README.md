@@ -106,8 +106,8 @@ a prefix, `~` is a case-sensitive regex and `~*` is a case-insensitive one.
 
 Matching uses the normalized request and never changes what is forwarded:
 
-- Path: one percent-decode, dot segments resolved, NUL bytes removed. The case
-  is kept, so `path` and `path ~` are case-sensitive, as in nginx.
+- Path: six readings of the path, see "Path readings" below. The case is kept,
+  so `path` and `path ~` are case-sensitive, as in nginx.
 - Query and form body: `+` becomes a space, the percent-decoding is applied at
   most twice (so a double-encoded escape is undone), and NUL bytes are removed.
 - Header values: the same decoding as the query, except that `+` is literal.
@@ -161,15 +161,23 @@ default, and the nearest level that names a rule decides; see
 
 For each request, in this order:
 
-1. The access list. A denied client gets 403 (`reason access_denied`).
-2. `deny_path` entries of the site. A match is a rule block (`reason rule`, no
+1. A `Host` whose name has characters other than letters, digits, `.`, `-` and
+   `_`, and that is not a bracketed IPv6 literal, with an optional digits-only port,
+   gets 400 (`reason invalid_host`).
+2. The access list. A denied client gets 403 (`reason access_denied`).
+3. `deny_path` entries of the site. A match is a rule block (`reason rule`, no
    `$rule_id`).
-3. Block rules: the built-in rules that are on, then the top-level block rules
+4. Block rules: the built-in rules that are on, then the top-level block rules
    in the order of the file, then the site's block rules. The first match blocks.
-4. Skip rules: the top-level skip rules, then the site's. The first match
+5. Skip rules: the top-level skip rules, then the site's. The first match
    forwards the request without calling the backend (`reason skip_rule`).
-5. The static asset skip (`static_extensions`), which also forwards.
-6. The decision model. The thresholds and failure settings apply here only.
+6. The static asset skip (`static_extensions`), which also forwards. It applies
+   only to a plain GET or HEAD with no query and no body, whose raw path has no
+   `;`, `\`, `%2F`, `%5C` or `%3B`, whose every reading ends in a static
+   extension with no earlier script extension, and which no `fail_closed_path`
+   matches. With `static_location`, every reading must also lie under one of its
+   prefixes.
+7. The decision model. The thresholds and failure settings apply here only.
 
 Limits (see [Limits](#limits)) run before all of these, at step 0. A request
 refused by a limit gets its status and never reaches steps 1 to 6. In a shadow
@@ -178,6 +186,29 @@ site a limited request is forwarded and recorded with `would_have=reject`.
 Block rules are always checked before skip rules, so a skip rule never lets
 through a request that a block rule matches. No failure setting changes steps 1
 to 5: a rule decision holds when the backend rate-limits, errors or is slow.
+
+### Path readings
+
+The request path is read in six ways, because upstreams resolve the same bytes
+differently. Each reading is percent-decoded once, or resolved on the raw path, as
+described below, and dot segments are resolved on `/`:
+
+1. The decoded path.
+2. As 1, with each segment cut at its first `;`. Tomcat, Jetty and Spring drop
+   these path parameters.
+3. As 1, with `\` read as `/`. IIS and ASP.NET do this.
+4. As 2 and 3 together.
+5. The raw path, with `%2F` and `%5C` kept inside their segments, then
+   percent-decoded once. Express matches the raw path this way.
+6. As 5, with `;` parameters cut and `\` read as `/`.
+
+NUL bytes are removed from each reading. A reading that equals another is counted
+once. The forwarded request is never changed.
+
+A block rule, `deny_path`, `fail_closed_path` and a block rule's `path` condition
+match when any reading matches. A skip rule's `path` condition must match every
+reading. Limits apply to every `location` that any reading selects. The block
+response and the location headers come from the location of the decoded path.
 
 ### Logs
 
@@ -273,7 +304,9 @@ is the normalized request path. Plain paths are compared lowercased, as
 `deny_path` is, and must start with `/`. A regex with `~` matches the decoded
 path with case kept, and `~*` ignores case. Regexes use the `regex` crate, so
 they are linear-time and have no backreferences or lookaround, which differs from
-nginx's PCRE. A repeated plain location is an error, as in nginx.
+nginx's PCRE. A repeated plain location is an error, as in nginx. The request is
+limited by every location that any [path reading](#path-readings) selects, and the
+block response comes from the location of the decoded path.
 
 Only the eight limit directives may appear inside a `location`. Any other
 directive is an error at its line.
@@ -324,6 +357,8 @@ Saturation is always in the rate-limit group: a request that gets no
 concurrency slot within `decision` `queue_timeout` is `backend_busy`, and that
 never falls under `on_decision_error`.
 
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
+
 `fail_closed_paths` wins over both: a failure on such a path is always blocked.
 A blocked failure uses the site's `action`. The decision log records the
 outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
@@ -339,6 +374,7 @@ outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
 | `worker_shutdown_timeout` | how long a shutdown waits for open connections and tunnels before closing them | unset (wait indefinitely) |
 | `decision` `max_concurrency` | decision-backend calls in flight at the same time | 64 |
 | `decision` `queue_timeout` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
+| `decision` `max_concurrency_per_client` | decision-backend calls in flight for one client address; a call beyond it is `client_busy` without waiting | 8, at most `max_concurrency` |
 
 Waiting for a slot is bounded by `queue_timeout` only. A call that gets a
 slot then has the rest of `timeout`. Saturation is therefore always a rate
@@ -346,7 +382,8 @@ limit, and it follows `on_rate_limit`, never `on_decision_error`.
 
 The defaults are: `backend jev` (its URL, model and token variable
 are set by default too), `timeout 300ms`, `block_threshold 0.87`,
-`instruction_threshold 0.8`, and both failure settings `"allow"`. Configs that
+`instruction_threshold 0.8`, both failure settings `"allow"`, and
+`max_concurrency_per_client` 8 (at most `max_concurrency`). Configs that
 want the JSON protocol must set `backend http;`.
 
 ## Timeouts and limits
