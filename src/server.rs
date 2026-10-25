@@ -33,9 +33,12 @@ use tokio::task::JoinSet;
 use crate::access::{self, AccessEntry};
 use crate::accesslog::{AccessRecord, LogFormat};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
-use crate::config::{AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, SiteConfig};
+use crate::config::{
+    AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, Mode, SiteConfig,
+};
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
 use crate::error::{DecisionError, ProxyError, ServeError};
+use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
 use crate::logsink::{Writer, spawn_writer};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
@@ -83,6 +86,10 @@ pub(crate) struct AppState<B> {
     site_sinks: Vec<Vec<Sink>>,
     /// Access logs of requests that match no site, and of connections closed by the transport.
     global_sinks: Vec<Sink>,
+    /// Runtime state of the `limit_req_zone` and `limit_conn_zone` zones, in definition order.
+    zones: Vec<Arc<ZoneStore>>,
+    /// The limits of requests that match no site.
+    top_limits: LimitSet,
 }
 
 impl AppState<Backend> {
@@ -160,6 +167,12 @@ impl AppState<Backend> {
             request_id_header: config.request_id_header,
             site_sinks,
             global_sinks,
+            zones: config
+                .zones
+                .into_iter()
+                .map(|zone| Arc::new(ZoneStore::new(zone)))
+                .collect(),
+            top_limits: config.limits,
         })
     }
 }
@@ -276,6 +289,10 @@ struct Trace<'a> {
     remote_addr: &'a str,
     request_id: Option<&'a str>,
     started: Instant,
+    /// `$limit_req_status`, set once the limits have run.
+    limit_req: Mutex<Option<&'static str>>,
+    /// `$limit_conn_status`, set once the limits have run.
+    limit_conn: Mutex<Option<&'static str>>,
 }
 
 /// Answers one request on a connection and records it.
@@ -303,8 +320,11 @@ async fn handle<B: DecisionBackend>(
         remote_addr: &remote,
         request_id: request_id.as_deref(),
         started,
+        limit_req: Mutex::new(None),
+        limit_conn: Mutex::new(None),
     };
-    let mut response = pipeline(state, &parts, body, &done, &trace, peer).await;
+    let mut held = Vec::new();
+    let mut response = pipeline(state, &parts, body, &done, &trace, peer, &mut held).await;
     if served >= state.keepalive_requests {
         response
             .headers_mut()
@@ -313,7 +333,9 @@ async fn handle<B: DecisionBackend>(
     let (parts, body) = response.into_parts();
     Response::from_parts(
         parts,
-        Finish::new(body, Arc::clone(&connection.phase), done).boxed(),
+        Finish::new(body, Arc::clone(&connection.phase), done)
+            .holding(held)
+            .boxed(),
     )
 }
 
@@ -328,10 +350,48 @@ async fn pipeline<B: DecisionBackend>(
     done: &Arc<AtomicBool>,
     trace: &Trace<'_>,
     peer: SocketAddr,
+    held: &mut Vec<ConnPermit>,
 ) -> Response<ResponseBody> {
-    // The access list comes first, before the body is read and before the host is judged.
+    // The limits come first, before the access list, the body and the rules.
     let index = state.router.lookup(parts.headers.get(HOST));
     let matched = index.and_then(|index| state.sites.get(index));
+    let decoded = prefilter::decoded_path(parts.uri.path());
+    let location = matched.and_then(|site| limits::select_location(&site.locations, &decoded));
+    let limit_set = location
+        .map(|location| &location.limits)
+        .or_else(|| matched.map(|site| &site.limits))
+        .unwrap_or(&state.top_limits);
+    let host = host_name(parts);
+    let key_vars = KeyVars {
+        client_ip: trace.client_ip,
+        remote_addr: trace.remote_addr,
+        site: matched.map_or("", site_name),
+        host: &host,
+        method: parts.method.as_str(),
+        path: &decoded,
+        headers: &parts.headers,
+    };
+    let shadow = matched.is_some_and(|site| site.mode == Mode::Shadow);
+    let screened = limits::screen(&state.zones, limit_set, shadow, &key_vars, held).await;
+    *lock(&trace.limit_req) = screened.req_status.map(ReqStatus::name);
+    *lock(&trace.limit_conn) = screened.conn_status.map(ConnStatus::name);
+    if let Some(refusal) = screened.refusal {
+        // A refused request keeps no count, and its body is not read.
+        held.clear();
+        let limit_sinks = index
+            .and_then(|index| state.site_sinks.get(index))
+            .map_or(state.global_sinks.as_slice(), Vec::as_slice);
+        return reject(
+            parts,
+            trace,
+            matched.map_or("", site_name),
+            refusal.status,
+            refusal.reason,
+            limit_sinks,
+            true,
+        );
+    }
+    // The access list comes next, before the body is read and before the host is judged.
     let entries = matched.map_or(state.access.as_slice(), |site| site.access.as_slice());
     let access_denied = !access::permits(entries, trace.client_addr);
     if access_denied && matched.is_none() {
@@ -432,7 +492,10 @@ async fn pipeline<B: DecisionBackend>(
         let assessment = assess(state, site, parts, &sniffed, trace.client_ip, &screening).await;
         (assessment, rule_id)
     };
-    let decision = policy::decide(site, &path, &assessment);
+    let mut decision = policy::decide(site, &path, &assessment);
+    if decision.would_have.is_none() {
+        decision.would_have = screened.would_have.map(Action::Reject);
+    }
     let outcome = respond(proxy, site, parts, body, peer, &decision).await;
     let mut response = outcome.response;
     if site.debug_headers {
@@ -470,6 +533,8 @@ async fn pipeline<B: DecisionBackend>(
         upstream_status: outcome.upstream_status,
         upstream_error: outcome.upstream_error,
         latency_ms: latency(trace.started),
+        limit_req_status: *lock(&trace.limit_req),
+        limit_conn_status: *lock(&trace.limit_conn),
     };
     write_access(sinks, &record, &parts.headers);
     response
@@ -562,6 +627,13 @@ async fn respond(
         }
         Action::Block => {
             let mut response = status_response(StatusCode::FORBIDDEN, "Forbidden\n");
+            if !complete {
+                close(&mut response);
+            }
+            Outcome::answered(response)
+        }
+        Action::Reject(status) => {
+            let mut response = status_response(*status, "");
             if !complete {
                 close(&mut response);
             }
@@ -789,6 +861,8 @@ fn reject(
         upstream_status: None,
         upstream_error: None,
         latency_ms: latency(trace.started),
+        limit_req_status: *lock(&trace.limit_req),
+        limit_conn_status: *lock(&trace.limit_conn),
     };
     write_access(sinks, &record, &parts.headers);
     let mut response = status_response(status, "");
@@ -824,6 +898,8 @@ fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, start
         upstream_status: None,
         upstream_error: None,
         latency_ms: latency(started),
+        limit_req_status: None,
+        limit_conn_status: None,
     };
     write_access(sinks, &record, &HeaderMap::new());
 }
