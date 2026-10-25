@@ -12,6 +12,9 @@
   `$client_ip`, `$remote_addr`, `$host`, `$site`, `$method`, `$path`,
   `$request_id` and `$http_<name>`. The default headers (Host kept,
   `X-Forwarded-For` appended) are unchanged. Hop-by-hop headers cannot be set.
+- `vigilant-heron -t [--config <path>]` checks the configuration like `nginx -t`:
+  it validates the whole file (includes, rules, block pages, token variables),
+  reports the result on stderr and exits 0 or 1. It never binds or serves.
 - `block_status <code>;` (4xx or 5xx, or 444 to close the connection without a
   response) and `block_page <file>;` (HTML, at most 64 KiB, read at load time) for
   blocked requests, at the top level, in a `site` and in a `location`. Limit

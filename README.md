@@ -548,6 +548,13 @@ be set or the router refuses to start.
 The config path can also come from `VIGILANT_HERON_CONFIG`; the default is
 `/etc/vigilant-heron/vigilant-heron.conf`.
 
+`vigilant-heron -t [--config <path>]` checks the configuration the way
+`nginx -t` does. It reads the includes, rules, block pages and token variables,
+validates everything, and then exits. It never binds the listen address or
+starts serving. On success it writes `configuration file <path> test is
+successful` to stderr and exits 0. On failure it writes the error, with its
+file and line, and `configuration file <path> test failed`, and exits 1.
+
 With Docker, use the published image (`linux/amd64` and `linux/arm64`). The
 package is private while the repository is private, so log in to `ghcr.io`
 first:
