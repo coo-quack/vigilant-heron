@@ -189,3 +189,7 @@
   and no `fail_closed_path` match. The request is still forwarded unchanged.
   New directive `static_location <prefix> ...;` in a `site` restricts the static
   skip to some prefixes.
+- Built-in rule `vh-cmdi-001` no longer matches a query parameter whose name starts
+  with a command name followed by `-` (such as `&id-from=3`, `&cat-name=x` or
+  `&nc-mode=1`). The command must now be followed by whitespace, the end of the
+  value, or a shell separator. The positive examples still match.

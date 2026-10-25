@@ -36,7 +36,7 @@ checks that this table lists exactly the ids of `builtin.conf`.
 | `vh-traversal-001` | Path traversal | A `../` sequence, with plain or encoded dots and slashes, in a query string | query |
 | `vh-traversal-002` | Path traversal | `etc/passwd`, `etc/shadow`, `win.ini`, `boot.ini` or `/proc/self/` in a query string | query |
 | `vh-traversal-003` | Path traversal | `etc/passwd`, `etc/shadow`, `win.ini`, `boot.ini` or `/proc/self/` in the path | path |
-| `vh-cmdi-001` | Command injection | A shell separator (`;`, `|`, `&` or a backtick) followed by a common command (`cat`, `id`, `whoami`, `uname`, `wget`, `curl`, `nc`, `bash`, `sh`) in a query string | query |
+| `vh-cmdi-001` | Command injection | A shell separator (`;`, `|`, `&` or a backtick) followed by a common command (`cat`, `id`, `whoami`, `uname`, `wget`, `curl`, `nc`, `bash`, `sh`) in a query string, where the command is followed by whitespace, the end of the value, or a separator. A parameter such as `&id-from=3` or `&cat-name=x` is not matched | query |
 | `vh-cmdi-002` | Command injection | A `$(` command substitution in a query string | query |
 | `vh-cmdi-003` | Command injection | A backtick followed by `cat`, `id`, `whoami`, `uname`, `wget` or `curl` in a query string | query |
 | `vh-lfi-001` | File inclusion | A PHP stream wrapper (`php://filter`, `input`, `memory`, `temp` or `fd`) in any input | any |
