@@ -25,17 +25,17 @@ const SENSITIVE_KEY_PARTS: [&str; 10] = [
 /// The JSON body posted to the decision backend.
 #[derive(Debug, Serialize)]
 pub(crate) struct DecisionEvent {
-    event: Event,
+    pub(crate) event: Event,
 }
 
 #[derive(Debug, Serialize)]
-struct Event {
-    untrusted: Untrusted,
-    meta: Meta,
+pub(crate) struct Event {
+    pub(crate) untrusted: Untrusted,
+    pub(crate) meta: Meta,
 }
 
 #[derive(Debug, Serialize)]
-struct Untrusted {
+pub(crate) struct Untrusted {
     method: String,
     path: String,
     query: Option<String>,
@@ -44,7 +44,7 @@ struct Untrusted {
 }
 
 #[derive(Debug, Serialize)]
-struct Meta {
+pub(crate) struct Meta {
     host: String,
     client_ip: String,
     body_truncated: bool,

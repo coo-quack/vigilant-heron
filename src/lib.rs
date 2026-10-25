@@ -9,6 +9,7 @@
 //! Shadow mode forwards every request and only records what would have happened.
 //! The [`serve`] function runs the proxy on a listener that the caller binds.
 
+mod clef;
 mod config;
 mod decision;
 mod error;
@@ -21,6 +22,7 @@ mod server;
 #[cfg(test)]
 mod test_support;
 
-pub use config::{Config, DecisionConfig, LogFormat, Mode, SiteAction, SiteConfig};
+pub use clef::{ApiToken, ClefModel};
+pub use config::{BackendConfig, Config, DecisionConfig, LogFormat, Mode, SiteAction, SiteConfig};
 pub use error::{ConfigError, ServeError};
 pub use server::serve;

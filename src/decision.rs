@@ -1,22 +1,31 @@
-//! The decision backend: the model-facing HTTP call and its verdict type.
+//! The decision backends: the transport shared by all of them, the JSON HTTP
+//! protocol, the Clef protocol in [`crate::clef`], and the backend enum.
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::CONTENT_TYPE;
+use http::header::{AUTHORIZATION, CONTENT_TYPE};
 use http::{Method, Request, Uri};
 use http_body_util::{BodyExt, Full, Limited};
+use hyper_rustls::HttpsConnector;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
 
-use crate::error::{DecisionError, ProbabilityError};
+use crate::clef::ClefBackend;
+use crate::error::{DecisionError, ProbabilityError, ServeError};
 use crate::sanitize::DecisionEvent;
 
 /// Largest decision response body that is read.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// The client used for every decision request, with TLS for `https` URIs.
+pub(crate) type DecisionClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 
 /// A number in `0..=1`, validated on construction.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -38,19 +47,23 @@ impl Probability {
     }
 }
 
-/// The two scores returned by the decision backend.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// The scores returned by a decision backend.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Verdict {
     /// Probability that the request is an attack.
     pub(crate) attack: Probability,
     /// Probability that the request tries to instruct the AI.
     pub(crate) ai_instruction: Probability,
+    /// Kind of attack, when the backend names one. Logged only.
+    pub(crate) category: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct RawVerdict {
     attack: f64,
     ai_instruction: f64,
+    #[serde(default)]
+    category: Option<String>,
 }
 
 /// Something that can score a sanitized event.
@@ -62,67 +75,133 @@ pub(crate) trait DecisionBackend: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Verdict, DecisionError>> + Send;
 }
 
-/// Calls the decision backend over HTTP with a JSON body.
+/// Builds the HTTP client. TLS uses the operating system's root certificates.
+pub(crate) fn decision_client() -> Result<DecisionClient, ServeError> {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for certificate in native.certs {
+        // A certificate the store rejects is skipped; the others still apply.
+        let _ = roots.add(certificate);
+    }
+    if roots.is_empty() {
+        tracing::warn!(
+            "no operating system root certificates were loaded; https decision backends will fail"
+        );
+    }
+    let tls =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(ServeError::Tls)?
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    let connector = HttpsConnectorBuilder::new()
+        .with_tls_config(tls)
+        .https_or_http()
+        .enable_http1()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(connector))
+}
+
+/// Posts a JSON payload and returns the response body, bounded in size and time.
+///
+/// `bearer` is sent as an `Authorization: Bearer` header when given.
+pub(crate) async fn post_json(
+    client: &DecisionClient,
+    url: &Uri,
+    bearer: Option<&str>,
+    payload: Vec<u8>,
+    timeout: Duration,
+) -> Result<Bytes, DecisionError> {
+    match tokio::time::timeout(timeout, exchange(client, url, bearer, payload)).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(DecisionError::Timeout),
+    }
+}
+
+async fn exchange(
+    client: &DecisionClient,
+    url: &Uri,
+    bearer: Option<&str>,
+    payload: Vec<u8>,
+) -> Result<Bytes, DecisionError> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(url.clone())
+        .header(CONTENT_TYPE, "application/json");
+    if let Some(token) = bearer {
+        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let request = builder.body(Full::new(Bytes::from(payload)))?;
+    let response = client
+        .request(request)
+        .await
+        .map_err(DecisionError::Transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DecisionError::Status(status));
+    }
+    let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
+        .collect()
+        .await
+        .map_err(DecisionError::Body)?
+        .to_bytes();
+    Ok(body)
+}
+
+/// Calls a backend that speaks the JSON protocol documented in the README.
 pub(crate) struct HttpDecisionBackend {
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: DecisionClient,
     url: Uri,
     timeout: Duration,
 }
 
 impl HttpDecisionBackend {
     /// Creates a backend that posts to `url` and gives up after `timeout`.
-    pub(crate) fn new(url: Uri, timeout: Duration) -> Self {
+    pub(crate) fn new(client: DecisionClient, url: Uri, timeout: Duration) -> Self {
         Self {
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            client,
             url,
             timeout,
         }
-    }
-
-    async fn exchange(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
-        let payload = serde_json::to_vec(event)?;
-        let request = Request::builder()
-            .method(Method::POST)
-            .uri(self.url.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .body(Full::new(Bytes::from(payload)))?;
-        let response = self
-            .client
-            .request(request)
-            .await
-            .map_err(DecisionError::Transport)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(DecisionError::Status(status));
-        }
-        let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
-            .collect()
-            .await
-            .map_err(DecisionError::Body)?
-            .to_bytes();
-        let raw: RawVerdict = serde_json::from_slice(&body)?;
-        Ok(Verdict {
-            attack: Probability::new(raw.attack)?,
-            ai_instruction: Probability::new(raw.ai_instruction)?,
-        })
     }
 }
 
 impl DecisionBackend for HttpDecisionBackend {
     async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
-        match tokio::time::timeout(self.timeout, self.exchange(event)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(DecisionError::Timeout),
+        let payload = serde_json::to_vec(event)?;
+        let body = post_json(&self.client, &self.url, None, payload, self.timeout).await?;
+        let raw: RawVerdict = serde_json::from_slice(&body)?;
+        Ok(Verdict {
+            attack: Probability::new(raw.attack)?,
+            ai_instruction: Probability::new(raw.ai_instruction)?,
+            category: raw.category,
+        })
+    }
+}
+
+/// The configured decision backend.
+pub(crate) enum Backend {
+    /// The JSON protocol over HTTP.
+    Http(HttpDecisionBackend),
+    /// Cloudflare Clef on Workers AI, or a server that speaks its protocol.
+    Clef(ClefBackend),
+}
+
+impl DecisionBackend for Backend {
+    async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
+        match self {
+            Self::Http(backend) => backend.decide(event).await,
+            Self::Clef(backend) => backend.decide(event).await,
         }
     }
 }
 
-/// Builds a verdict from literals; only for values inside `0..=1`.
 #[cfg(test)]
 pub(crate) fn verdict(attack: f64, ai_instruction: f64) -> Verdict {
     Verdict {
         attack: Probability(attack),
         ai_instruction: Probability(ai_instruction),
+        category: None,
     }
 }
 

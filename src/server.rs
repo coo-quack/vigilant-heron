@@ -21,8 +21,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::config::{Config, DecisionConfig, SiteConfig};
-use crate::decision::{DecisionBackend, HttpDecisionBackend};
+use crate::clef::ClefBackend;
+use crate::config::{BackendConfig, Config, DecisionConfig, SiteConfig};
+use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, decision_client};
 use crate::error::ServeError;
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
@@ -48,11 +49,22 @@ pub(crate) struct AppState<B> {
     client_ip_header: Option<HeaderName>,
 }
 
-impl AppState<HttpDecisionBackend> {
-    fn from_config(config: Config) -> Self {
-        let backend =
-            HttpDecisionBackend::new(config.decision.url.clone(), config.decision.timeout);
-        Self {
+impl AppState<Backend> {
+    fn from_config(config: Config) -> Result<Self, ServeError> {
+        let client = decision_client()?;
+        let url = config.decision.url.clone();
+        let timeout = config.decision.timeout;
+        let backend = match &config.decision.backend {
+            BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, timeout)),
+            BackendConfig::Clef { model, token } => Backend::Clef(ClefBackend::new(
+                client,
+                url,
+                *model,
+                token.clone(),
+                timeout,
+            )),
+        };
+        Ok(Self {
             router: Router::new(&config.sites),
             sites: config.sites,
             decision: config.decision,
@@ -60,7 +72,7 @@ impl AppState<HttpDecisionBackend> {
             proxy: Proxy::new(),
             default_status: config.default_status,
             client_ip_header: config.client_ip_header,
-        }
+        })
     }
 }
 
@@ -86,7 +98,7 @@ pub(crate) async fn serve_with_limit(
     shutdown: impl Future<Output = ()>,
     max_connections: usize,
 ) -> Result<(), ServeError> {
-    let state = Arc::new(AppState::from_config(config));
+    let state = Arc::new(AppState::from_config(config)?);
     let (stop_tx, stop_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
     let mut shutdown = pin!(shutdown);
@@ -216,7 +228,7 @@ async fn handle<B: DecisionBackend>(
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
     }
-    let (attack, ai_instruction) = scores(&assessment);
+    let (attack, ai_instruction, category) = verdict_fields(&assessment);
     emit(&LogRecord {
         site: site_name(site),
         method: &parts.method,
@@ -226,6 +238,7 @@ async fn handle<B: DecisionBackend>(
         would_have: decision.would_have.as_ref().map_or("none", Action::name),
         attack,
         ai_instruction,
+        category,
         client_ip: &client_ip,
         started,
     });
@@ -322,13 +335,15 @@ fn site_name(site: &SiteConfig) -> &str {
     site.hosts.first().map_or("", String::as_str)
 }
 
-fn scores(assessment: &Assessment) -> (Option<f64>, Option<f64>) {
+/// Returns the scores and category to log. They are empty when no backend answered.
+fn verdict_fields(assessment: &Assessment) -> (Option<f64>, Option<f64>, Option<&str>) {
     match assessment {
         Assessment::Model(verdict) => (
             Some(verdict.attack.value()),
             Some(verdict.ai_instruction.value()),
+            verdict.category.as_deref(),
         ),
-        _ => (None, None),
+        _ => (None, None, None),
     }
 }
 
@@ -350,6 +365,7 @@ fn reject(
         would_have: "none",
         attack: None,
         ai_instruction: None,
+        category: None,
         client_ip,
         started,
     });
@@ -378,6 +394,7 @@ struct LogRecord<'a> {
     would_have: &'a str,
     attack: Option<f64>,
     ai_instruction: Option<f64>,
+    category: Option<&'a str>,
     client_ip: &'a str,
     started: Instant,
 }
@@ -394,6 +411,7 @@ fn emit(record: &LogRecord<'_>) {
         would_have = record.would_have,
         attack = record.attack,
         ai_instruction = record.ai_instruction,
+        category = record.category,
         latency_ms,
         client_ip = record.client_ip,
     );

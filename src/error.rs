@@ -78,11 +78,35 @@ pub enum ConfigError {
         /// Value that was rejected.
         value: String,
     },
-    /// `decision.url` is not an absolute `http://` URI.
-    #[error("decision.url must be an absolute http:// URI, got {value:?}")]
+    /// `decision.url` is not an absolute `http://` or `https://` URI.
+    #[error("decision.url must be an absolute http:// or https:// URI, got {value:?}")]
     InvalidDecisionUrl {
         /// Value that was rejected.
         value: String,
+    },
+    /// A Clef-only key is missing while `decision.backend = "clef"`.
+    #[error("decision.{field} is required when decision.backend is \"clef\"")]
+    MissingClefField {
+        /// Name of the missing key.
+        field: &'static str,
+    },
+    /// A Clef-only key is set while the HTTP backend is selected.
+    #[error("decision.{field} is only valid when decision.backend is \"clef\"")]
+    UnexpectedClefField {
+        /// Name of the key that was set.
+        field: &'static str,
+    },
+    /// The environment variable named by `api_token_env` is not set.
+    #[error("environment variable {name} (decision.api_token_env) is not set")]
+    MissingApiToken {
+        /// Name of the environment variable.
+        name: String,
+    },
+    /// The environment variable named by `api_token_env` is empty.
+    #[error("environment variable {name} (decision.api_token_env) is empty")]
+    EmptyApiToken {
+        /// Name of the environment variable.
+        name: String,
     },
     /// `client_ip_header` is not a valid header name.
     #[error("client_ip_header is not a valid header name: {value:?}")]
@@ -117,6 +141,9 @@ pub enum ServeError {
     /// The listener failed to accept a connection.
     #[error("accepting a connection failed")]
     Accept(#[source] std::io::Error),
+    /// The TLS client for the decision backend could not be set up.
+    #[error("TLS setup for the decision backend failed")]
+    Tls(#[source] rustls::Error),
 }
 
 /// A value that is not a probability.
@@ -151,6 +178,24 @@ pub(crate) enum DecisionError {
     /// A returned score is not a probability.
     #[error(transparent)]
     Probability(#[from] ProbabilityError),
+    /// The backend reported `success: false`.
+    #[error("decision backend reported success = false")]
+    Rejected,
+    /// The response has no answer with this id.
+    #[error("decision backend returned no answer for {id}")]
+    MissingAnswer {
+        /// Question id that was expected.
+        id: &'static str,
+    },
+    /// An answer has a different type than its question.
+    #[error("decision backend returned the wrong answer type for {id}")]
+    AnswerType {
+        /// Question id whose answer was malformed.
+        id: &'static str,
+    },
+    /// The category answer is not one of the known options.
+    #[error("decision backend returned an unknown category {0:?}")]
+    UnknownChoice(String),
 }
 
 /// Why an upstream request could not be sent.
