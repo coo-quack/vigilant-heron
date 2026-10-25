@@ -3,7 +3,7 @@
 //! The directive names come from the parser's own lists, so a directive that the
 //! parser accepts but the reference does not describe fails this test.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::PathBuf;
 
@@ -94,5 +94,65 @@ fn builtin_rule_table_lists_exactly_the_built_in_rules() -> TestResult {
         unknown.is_empty(),
         "docs/builtin-rules.md lists ids that src/rules/builtin.conf does not define: {unknown:?}"
     );
+    Ok(())
+}
+
+#[test]
+fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResult {
+    // The ids whose rule block in builtin.conf says `default off;`.
+    let mut off_in_conf = BTreeSet::new();
+    let mut current: Option<String> = None;
+    for line in read("src/rules/builtin.conf")?.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("rule ") {
+            current = rest.split_whitespace().next().map(str::to_owned);
+        } else if trimmed == "default off;"
+            && let Some(id) = &current
+        {
+            off_in_conf.insert(id.clone());
+        }
+    }
+    assert!(
+        !off_in_conf.is_empty(),
+        "no rule in builtin.conf is off by default"
+    );
+
+    // The Default column is the third cell; ids and categories contain no `|`.
+    let mut table: BTreeMap<String, String> = BTreeMap::new();
+    for line in read("docs/builtin-rules.md")?.lines() {
+        let mut cells = line.split('|');
+        let (Some(_), Some(id_cell), Some(_category), Some(default_cell)) =
+            (cells.next(), cells.next(), cells.next(), cells.next())
+        else {
+            continue;
+        };
+        let Some(id) = id_cell
+            .trim()
+            .strip_prefix('`')
+            .and_then(|rest| rest.strip_suffix('`'))
+        else {
+            continue;
+        };
+        if id.starts_with("vh-") {
+            table.insert(id.to_owned(), default_cell.trim().to_owned());
+        }
+    }
+
+    for (id, default) in &table {
+        let expected = if off_in_conf.contains(id) {
+            "off"
+        } else {
+            "on"
+        };
+        assert_eq!(
+            default, expected,
+            "docs/builtin-rules.md gives {id} the default \"{default}\", builtin.conf says \"{expected}\""
+        );
+    }
+    let missing: Vec<&String> = off_in_conf
+        .iter()
+        .filter(|id| !table.contains_key(*id))
+        .collect();
+    assert!(missing.is_empty(), "no Default cell for {missing:?}");
     Ok(())
 }

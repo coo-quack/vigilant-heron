@@ -68,6 +68,7 @@ one condition.
   directive.
 - Rule ids are unique across all files. An error names both places.
 - Ids that start with `vh-` are reserved for the [built-in rules](/builtin-rules).
+- A built-in rule written with `default off;` runs only where `enable_rule` names it. The directive is valid only in the built-in rules; a user rule is on as soon as it is written. See [Built-in rules](/builtin-rules#opt-in-rules).
 
 ### Block and skip
 

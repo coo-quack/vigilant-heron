@@ -68,6 +68,17 @@ pub(crate) struct Rule {
     pub(crate) body: Vec<Pattern>,
     /// `any`: each pattern must match one of the path, query, header values or body prefix.
     pub(crate) any: Vec<Pattern>,
+    /// Whether a built-in rule runs without `enable_rule`. Always true for user rules.
+    pub(crate) default_on: bool,
+}
+
+/// The `disable_rule` and `enable_rule` ids written at one level of the configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RuleSwitches {
+    /// Ids from `disable_rule`.
+    pub(crate) disabled: Vec<String>,
+    /// Ids from `enable_rule`.
+    pub(crate) enabled: Vec<String>,
 }
 
 /// Where a rule block was written.
@@ -124,6 +135,7 @@ pub(crate) fn parse_rule(directive: &Directive, scope: Scope) -> Result<ParsedRu
     })?;
 
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut default_on = true;
     let mut description: Option<String> = None;
     let mut action: Option<RuleAction> = None;
     let mut sites: Option<Vec<String>> = None;
@@ -139,7 +151,7 @@ pub(crate) fn parse_rule(directive: &Directive, scope: Scope) -> Result<ParsedRu
         let name = child.name.as_str();
         let single = matches!(
             name,
-            "description" | "action" | "site" | "method" | "path" | "client"
+            "description" | "action" | "default" | "site" | "method" | "path" | "client"
         );
         if single && !seen.insert(name) {
             return Err(invalid(child, format!("duplicate directive \"{name}\"")));
@@ -160,6 +172,18 @@ pub(crate) fn parse_rule(directive: &Directive, scope: Scope) -> Result<ParsedRu
                         return Err(invalid(child, "\"action\" must be \"block\" or \"skip\""));
                     }
                 });
+            }
+            "default" => {
+                if scope != Scope::Builtin {
+                    return Err(invalid(
+                        child,
+                        "\"default\" is only valid in a built-in rule; a user rule is on as soon as it is written",
+                    ));
+                }
+                match child.args.as_slice() {
+                    [word] if word == "off" => default_on = false,
+                    _ => return Err(invalid(child, "\"default\" must be \"off\"")),
+                }
             }
             "site" => {
                 if scope != Scope::Top {
@@ -260,6 +284,7 @@ pub(crate) fn parse_rule(directive: &Directive, scope: Scope) -> Result<ParsedRu
             headers,
             body,
             any,
+            default_on,
         }),
         sites,
         file: Arc::clone(&directive.file),
@@ -476,27 +501,34 @@ fn position(error: ConfigError) -> (usize, String) {
 
 /// Builds the rule lists of one site.
 ///
-/// Built-in rules come first, when enabled and not disabled. Then the top-level
-/// rules that apply to the site, then the rules inside the site's own block.
-/// Block and skip rules go into separate lists, and the list of block rules is
-/// always checked first.
+/// Built-in rules come first, when they are active for the site (see
+/// [`builtin_active`]). Then the top-level rules that apply to the site, then the
+/// rules inside the site's own block. Block and skip rules go into separate
+/// lists, and the list of block rules is always checked first.
 pub(crate) fn site_rules(
     hosts: &[String],
     builtin: &[Arc<Rule>],
     builtin_enabled: bool,
-    disabled: &[String],
+    top_switches: &RuleSwitches,
+    own_switches: &RuleSwitches,
     top: &[ParsedRule],
     own: &[ParsedRule],
 ) -> SiteRules {
     let mut rules = SiteRules::default();
-    if builtin_enabled {
-        rules.block.extend(
-            builtin
-                .iter()
-                .filter(|rule| !disabled.iter().any(|id| id.as_str() == &*rule.id))
-                .cloned(),
-        );
-    }
+    rules.block.extend(
+        builtin
+            .iter()
+            .filter(|rule| {
+                builtin_active(
+                    &rule.id,
+                    rule.default_on,
+                    builtin_enabled,
+                    top_switches,
+                    own_switches,
+                )
+            })
+            .cloned(),
+    );
     let applies = |parsed: &&ParsedRule| {
         parsed
             .sites
@@ -512,15 +544,43 @@ pub(crate) fn site_rules(
     rules
 }
 
-/// Checks that `disable_rule` names only built-in rules, and returns the ids.
-pub(crate) fn disabled_ids(
+/// Decides whether a built-in rule runs at a site.
+///
+/// The nearest level that names the id decides, and the site's own lists are
+/// nearer than the top level's. Inside one level, `disable_rule` wins over
+/// `enable_rule`. A rule that no list names runs when the built-in set is on
+/// and the rule is on by default.
+pub(crate) fn builtin_active(
+    id: &str,
+    default_on: bool,
+    builtin_enabled: bool,
+    top: &RuleSwitches,
+    own: &RuleSwitches,
+) -> bool {
+    if own.disabled.iter().any(|name| name == id) {
+        return false;
+    }
+    if own.enabled.iter().any(|name| name == id) {
+        return true;
+    }
+    if top.disabled.iter().any(|name| name == id) {
+        return false;
+    }
+    if top.enabled.iter().any(|name| name == id) {
+        return true;
+    }
+    builtin_enabled && default_on
+}
+
+/// Checks that the ids of `disable_rule` or `enable_rule` name only built-in rules, and returns them.
+pub(crate) fn builtin_ids(
     directive: &Directive,
     builtin: &[Arc<Rule>],
 ) -> Result<Vec<String>, ConfigError> {
     if directive.args.is_empty() {
         return Err(invalid(
             directive,
-            "\"disable_rule\" needs at least one rule id",
+            format!("\"{}\" needs at least one rule id", directive.name),
         ));
     }
     let mut ids = Vec::new();
@@ -528,7 +588,7 @@ pub(crate) fn disabled_ids(
         if !builtin.iter().any(|rule| &*rule.id == id.as_str()) {
             return Err(invalid(
                 directive,
-                format!("\"disable_rule\" names no built-in rule: {id}"),
+                format!("\"{}\" names no built-in rule: {id}", directive.name),
             ));
         }
         ids.push(id.clone());
