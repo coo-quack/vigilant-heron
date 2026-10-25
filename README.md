@@ -288,11 +288,15 @@ directive is an error at its line.
 - `limit_conn` counts a request from the moment its header is read until its
   response body is done, or dropped on a client disconnect. A refused request is
   not counted.
-- When a zone has no free state, nginx's behavior applies: the least recently used
-  idle state is evicted first. If every state is in use (a delayed request in
-  `limit_req`, or a request in progress in `limit_conn`), the request gets an error
-  status: 500 for `limit_req` and 503 for `limit_conn`. These two statuses are not
-  configurable.
+- When a zone has no free state, the least recently used idle state is evicted
+  first, as in nginx. If every state is in use (a delayed request in `limit_req`,
+  or a request in progress in `limit_conn`), the request is treated as a rejection,
+  as nginx does: it gets the configured status (`limit_req_status` or
+  `limit_conn_status`), and `$limit_req_status` or `$limit_conn_status` is
+  `REJECTED`. In dry run it is `REJECTED_DRY_RUN` and the request goes on. The
+  error log tells this apart from an ordinary excess with the field
+  `limit_error=zone_exhausted`, and the access log reason is still `limit_req` or
+  `limit_conn`.
 
 These limits are per process. A router with several processes keeps separate
 counts.

@@ -447,3 +447,109 @@ async fn a_client_that_disconnects_mid_request_releases_its_connection_count() -
     proxy.stop().await?;
     Ok(())
 }
+
+/// Sends `/slow` with `key` in the `x-key` header, from a background task.
+fn spawn_slow(base: &str, key: &str) -> tokio::task::JoinHandle<Result<common::Reply, BoxError>> {
+    let base = base.to_owned();
+    let key = key.to_owned();
+    tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/slow",
+            "example.com",
+            &[("x-key", key.as_str())],
+            Bytes::new(),
+        )
+        .await
+    })
+}
+
+#[tokio::test]
+async fn an_exhausted_conn_zone_answers_with_the_configured_status() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let slow_url = slow_upstream().await?;
+    let log = log_path("conn-exhausted");
+    let _ = std::fs::remove_file(&log);
+    // A 64-byte zone holds one state, so a second key has nowhere to go while the first is in progress.
+    let top = "limit_conn_zone $http_x_key zone=c:64;";
+    let site = "location /slow {\n        limit_conn c 1;\n        limit_conn_status 429;\n    }";
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let base = proxy.base();
+    let first = spawn_slow(&base, "a");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let other = send(
+        &base,
+        Method::GET,
+        "/slow",
+        "example.com",
+        &[("x-key", "b")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(other.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.await??.status, StatusCode::OK);
+    proxy.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_exhausted_conn_zone_in_dry_run_lets_the_request_through() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let slow_url = slow_upstream().await?;
+    let log = log_path("conn-exhausted-dry");
+    let _ = std::fs::remove_file(&log);
+    let top = "limit_conn_zone $http_x_key zone=c:64;";
+    let site = "location /slow {\n        limit_conn c 1;\n        limit_conn_status 429;\n        limit_conn_dry_run on;\n    }";
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let base = proxy.base();
+    let first = spawn_slow(&base, "a");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let other = send(
+        &base,
+        Method::GET,
+        "/slow",
+        "example.com",
+        &[("x-key", "b")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(other.status, StatusCode::OK);
+    let line = wait_for_line(&log, "REJECTED_DRY_RUN").await?;
+    assert!(line.starts_with("200 "), "{line}");
+    assert_eq!(first.await??.status, StatusCode::OK);
+    proxy.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_exhausted_req_zone_answers_with_the_configured_status() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let slow_url = slow_upstream().await?;
+    let log = log_path("req-exhausted");
+    let _ = std::fs::remove_file(&log);
+    // One state. The second request of key "a" waits for its turn, and that wait holds the state.
+    let top = "limit_req_zone $http_x_key zone=r:128 rate=1r/s;";
+    let site =
+        "location /slow {\n        limit_req zone=r burst=1;\n        limit_req_status 429;\n    }";
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let base = proxy.base();
+    let first = spawn_slow(&base, "a");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let waiting = spawn_slow(&base, "a");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let other = send(
+        &base,
+        Method::GET,
+        "/slow",
+        "example.com",
+        &[("x-key", "b")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(other.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(first.await??.status, StatusCode::OK);
+    assert_eq!(waiting.await??.status, StatusCode::OK);
+    proxy.stop().await?;
+    Ok(())
+}

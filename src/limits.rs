@@ -14,8 +14,8 @@
 //! Zones live in the router process. A zone holds as many states as its size
 //! allows, 128 bytes per `limit_req` state and 64 per `limit_conn` state, as in
 //! nginx. The least recently used idle state is evicted when the zone is full.
-//! When no state can be evicted, the request gets an error status, see
-//! [`REQ_EXHAUSTED`] and [`CONN_EXHAUSTED`].
+//! When no state can be created even after eviction, the request is handled as a
+//! rejection: with the configured status, or as a dry-run rejection in dry run.
 //!
 //! Time comes from [`tokio::time`], so tests can pause and advance it.
 
@@ -41,12 +41,6 @@ const CONN_STATE_BYTES: usize = 64;
 
 /// Units of one request in a bucket. A request drains in `interval` nanoseconds.
 const UNITS_PER_REQUEST: u64 = 1000;
-
-/// Status for a `limit_req` request that finds no free state in its zone.
-pub(crate) const REQ_EXHAUSTED: StatusCode = StatusCode::INTERNAL_SERVER_ERROR;
-
-/// Status for a `limit_conn` request that finds no free state in its zone.
-pub(crate) const CONN_EXHAUSTED: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 
 /// The directives that set limits, at any level where they are allowed.
 pub(crate) const LIMIT_NAMES: [&str; 8] = [
@@ -1274,14 +1268,21 @@ fn screen_req(
             continue;
         };
         let Ok(admission) = zone.admit(&key, limit, dry_run, now) else {
-            log_event(limits.req_log, zone.name(), vars.client_ip, "no free state");
+            // nginx treats an allocation failure like a rejection, with the same status.
+            log_exhausted(limits.req_log, zone.name(), vars.client_ip);
+            let status = if dry_run {
+                ReqStatus::RejectedDryRun
+            } else {
+                ReqStatus::Rejected
+            };
+            screened.req_status = Some(worst(screened.req_status, status));
             if dry_run {
-                screened.would_have.get_or_insert(REQ_EXHAUSTED);
+                screened.would_have.get_or_insert(limits.req_status);
                 continue;
             }
             screened.refusal = Some(Refusal {
                 reason: "limit_req",
-                status: REQ_EXHAUSTED,
+                status: limits.req_status,
             });
             break;
         };
@@ -1328,19 +1329,24 @@ fn screen_conn(
             continue;
         };
         let Ok(admission) = zone.acquire(&key, limit.max, dry_run, now) else {
-            log_event(
-                limits.conn_log,
-                zone.name(),
-                vars.client_ip,
-                "no free state",
-            );
+            // nginx releases what the request holds and treats it like a rejection.
+            log_exhausted(limits.conn_log, zone.name(), vars.client_ip);
+            let status = if dry_run {
+                ConnStatus::RejectedDryRun
+            } else {
+                ConnStatus::Rejected
+            };
+            screened.conn_status = Some(match screened.conn_status {
+                Some(previous) => previous.max(status),
+                None => status,
+            });
             if dry_run {
-                screened.would_have.get_or_insert(CONN_EXHAUSTED);
+                screened.would_have.get_or_insert(limits.conn_status);
                 continue;
             }
             screened.refusal = Some(Refusal {
                 reason: "limit_conn",
-                status: CONN_EXHAUSTED,
+                status: limits.conn_status,
             });
             break;
         };
@@ -1373,6 +1379,21 @@ fn screen_conn(
 
 fn worst(previous: Option<ReqStatus>, status: ReqStatus) -> ReqStatus {
     previous.map_or(status, |previous| previous.max(status))
+}
+
+/// Writes a zone-exhaustion event, distinct from an ordinary excess, to the error log.
+fn log_exhausted(level: LimitLog, zone: &str, client: &str) {
+    match level {
+        LimitLog::Error => {
+            tracing::error!(zone, client, limit_error = "zone_exhausted", "limit event");
+        }
+        LimitLog::Warn => {
+            tracing::warn!(zone, client, limit_error = "zone_exhausted", "limit event");
+        }
+        LimitLog::Info | LimitLog::Notice => {
+            tracing::info!(zone, client, limit_error = "zone_exhausted", "limit event");
+        }
+    }
 }
 
 /// Writes one limit event to the error log at the configured severity.
@@ -2067,6 +2088,148 @@ mod tests {
         assert_eq!(refusal.status.as_u16(), 429);
         assert_eq!(ReqStatus::RejectedDryRun.name(), "REJECTED_DRY_RUN");
         assert_eq!(ConnStatus::RejectedDryRun.name(), "REJECTED_DRY_RUN");
+    }
+
+    fn vars_for<'a>(client: &'a str, headers: &'a HeaderMap) -> KeyVars<'a> {
+        KeyVars {
+            client_ip: client,
+            remote_addr: "10.0.0.2",
+            site: "example.com",
+            host: "example.com",
+            method: "GET",
+            path: "/",
+            headers,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_req_zone_answers_with_the_configured_status() {
+        let zones = vec![store(1, 1_000_000_000)];
+        let limit = req(1, 0);
+        let limits = LimitSet {
+            req: vec![limit.clone()],
+            req_status: StatusCode::TOO_MANY_REQUESTS,
+            ..LimitSet::default()
+        };
+        // One delayed request holds the only state of the zone.
+        let now = Instant::now();
+        let _first = zones
+            .first()
+            .map(|zone| zone.admit("held", &limit, false, now));
+        let _holder = zones
+            .first()
+            .map(|zone| zone.admit("held", &limit, false, now));
+        let headers = HeaderMap::new();
+        let mut permits = Vec::new();
+        let screened = screen(
+            &zones,
+            &limits,
+            false,
+            &vars_for("other", &headers),
+            &mut permits,
+        )
+        .await;
+        assert_eq!(screened.req_status, Some(ReqStatus::Rejected));
+        assert_eq!(
+            screened.refusal,
+            Some(Refusal {
+                reason: "limit_req",
+                status: StatusCode::TOO_MANY_REQUESTS,
+            })
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_req_zone_in_dry_run_lets_the_request_through() {
+        let zones = vec![store(1, 1_000_000_000)];
+        let limit = req(1, 0);
+        let limits = LimitSet {
+            req: vec![limit.clone()],
+            req_status: StatusCode::TOO_MANY_REQUESTS,
+            req_dry_run: true,
+            ..LimitSet::default()
+        };
+        let now = Instant::now();
+        let _first = zones
+            .first()
+            .map(|zone| zone.admit("held", &limit, false, now));
+        let _holder = zones
+            .first()
+            .map(|zone| zone.admit("held", &limit, false, now));
+        let headers = HeaderMap::new();
+        let mut permits = Vec::new();
+        let screened = screen(
+            &zones,
+            &limits,
+            false,
+            &vars_for("other", &headers),
+            &mut permits,
+        )
+        .await;
+        assert_eq!(screened.req_status, Some(ReqStatus::RejectedDryRun));
+        assert!(screened.refusal.is_none());
+        assert_eq!(screened.would_have, Some(StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_conn_zone_answers_with_the_configured_status_and_keeps_no_count() {
+        let zones = vec![conn_store(1)];
+        let limits = LimitSet {
+            conn: vec![ConnLimit { zone: 0, max: 5 }],
+            conn_status: StatusCode::TOO_MANY_REQUESTS,
+            ..LimitSet::default()
+        };
+        let now = Instant::now();
+        let _holder = zones
+            .first()
+            .map(|zone| zone.acquire("held", 5, false, now));
+        let headers = HeaderMap::new();
+        let mut permits = Vec::new();
+        let screened = screen(
+            &zones,
+            &limits,
+            false,
+            &vars_for("other", &headers),
+            &mut permits,
+        )
+        .await;
+        assert_eq!(screened.conn_status, Some(ConnStatus::Rejected));
+        assert_eq!(
+            screened.refusal,
+            Some(Refusal {
+                reason: "limit_conn",
+                status: StatusCode::TOO_MANY_REQUESTS,
+            })
+        );
+        assert!(permits.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_exhausted_conn_zone_in_dry_run_lets_the_request_through() {
+        let zones = vec![conn_store(1)];
+        let limits = LimitSet {
+            conn: vec![ConnLimit { zone: 0, max: 5 }],
+            conn_status: StatusCode::TOO_MANY_REQUESTS,
+            conn_dry_run: true,
+            ..LimitSet::default()
+        };
+        let now = Instant::now();
+        let _holder = zones
+            .first()
+            .map(|zone| zone.acquire("held", 5, false, now));
+        let headers = HeaderMap::new();
+        let mut permits = Vec::new();
+        let screened = screen(
+            &zones,
+            &limits,
+            false,
+            &vars_for("other", &headers),
+            &mut permits,
+        )
+        .await;
+        assert_eq!(screened.conn_status, Some(ConnStatus::RejectedDryRun));
+        assert!(screened.refusal.is_none());
+        assert_eq!(screened.would_have, Some(StatusCode::TOO_MANY_REQUESTS));
     }
 
     proptest! {

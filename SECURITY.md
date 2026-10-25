@@ -151,9 +151,10 @@ client has tried a hundred passwords. Throttling that is the job of
 A limit is a rate, not a verdict: the model's scores do not change it.
 
 Zones live in the router process. When a zone has no free state, the request is
-answered with 500 (`limit_req`) or 503 (`limit_conn`) rather than forwarded.
-Those statuses are fixed, so a flood of distinct keys can make a zone refuse
-requests that have not reached the limit. Size the zones for the number of
+treated as a rejection: it gets the configured status (503 unless
+`limit_req_status` or `limit_conn_status` says otherwise), and in dry run it goes
+on. The error log marks such events with `limit_error=zone_exhausted`, so a flood
+of distinct keys is visible to operators. Size the zones for the number of
 distinct keys (`$client_ip`) you expect; a larger zone holds more states, at
 128 bytes (`limit_req`) or 64 bytes (`limit_conn`) per state.
 
