@@ -38,8 +38,8 @@ use crate::accesslog::{AccessRecord, LogFormat};
 use crate::block::{BlockResponse, BlockStatus};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
 use crate::config::{
-    AccessLogConfig, BackendConfig, Config, ConnectionConfig, ErrorLogConfig, MAX_REQUEST_ID_BYTES,
-    Mode, SiteConfig,
+    AccessLogConfig, BackendConfig, Config, ConnectionConfig, MAX_REQUEST_ID_BYTES, Mode,
+    SiteConfig,
 };
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
 use crate::error::ConfigError;
@@ -206,8 +206,8 @@ struct Startup {
     listen: String,
     worker_threads: Option<usize>,
     max_connections: usize,
+    worker_shutdown_timeout: Option<Duration>,
     connection: ConnectionConfig,
-    error_log: ErrorLogConfig,
 }
 
 impl Startup {
@@ -216,8 +216,8 @@ impl Startup {
             listen: config.listen.clone(),
             worker_threads: config.worker_threads,
             max_connections: config.max_connections,
+            worker_shutdown_timeout: config.worker_shutdown_timeout,
             connection: config.connection.clone(),
-            error_log: config.error_log.clone(),
         }
     }
 
@@ -232,21 +232,25 @@ impl Startup {
         if config.max_connections != self.max_connections {
             tracing::warn!("max_connections changed; a restart is needed for it to take effect");
         }
+        if config.worker_shutdown_timeout != self.worker_shutdown_timeout {
+            tracing::warn!(
+                "worker_shutdown_timeout changed; a restart is needed for it to take effect"
+            );
+        }
         if config.connection != self.connection {
             tracing::warn!(
                 "connection timers and header limits changed; a restart is needed for them to take effect"
             );
-        }
-        if config.error_log.destination != self.error_log.destination
-            || config.error_log.level != self.error_log.level
-        {
-            tracing::warn!("error_log changed; a restart is needed for it to take effect");
         }
     }
 }
 
 /// Where a reload gets its configuration: a function that reads and validates it.
 type Loader = Box<dyn Fn() -> Result<Config, ConfigError> + Send>;
+
+/// Called with a reloaded configuration once it is in service, for the settings
+/// that live outside the server (the error log).
+type Applied = Box<dyn Fn(&Config) + Send>;
 
 /// Serves requests on `listener` until `shutdown` completes.
 ///
@@ -274,6 +278,10 @@ pub async fn serve(
 /// with the same name and size exists. The listen address, `worker_threads`,
 /// `max_connections` and the connection timers apply only at startup.
 ///
+/// `applied` is called with the new configuration after it is in service, and
+/// before the reload is logged. It is not called for a reload that fails, so the
+/// caller can stage a change in `load` and apply it here.
+///
 /// # Errors
 ///
 /// Returns the same errors as [`serve`].
@@ -283,17 +291,25 @@ pub async fn serve_reloadable(
     shutdown: impl Future<Output = ()>,
     reloads: mpsc::Receiver<()>,
     load: impl Fn() -> Result<Config, ConfigError> + Send + 'static,
+    applied: impl Fn(&Config) + Send + 'static,
 ) -> Result<(), ServeError> {
-    run(listener, config, shutdown, Some((reloads, Box::new(load)))).await
+    run(
+        listener,
+        config,
+        shutdown,
+        Some((reloads, Box::new(load), Box::new(applied))),
+    )
+    .await
 }
 
 async fn run(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()>,
-    reloads: Option<(mpsc::Receiver<()>, Loader)>,
+    reloads: Option<(mpsc::Receiver<()>, Loader, Applied)>,
 ) -> Result<(), ServeError> {
     let max_connections = config.max_connections;
+    let shutdown_timeout = config.worker_shutdown_timeout;
     let settings = ConnectionSettings {
         timers: ClientTimers::from_config(&config.connection),
         keepalive_requests: config.connection.keepalive_requests,
@@ -302,12 +318,15 @@ async fn run(
     let initial = Arc::new(AppState::from_config(config, &[])?);
     let (current_tx, current_rx) = watch::channel(initial);
     let (stop_tx, stop_rx) = watch::channel(false);
+    // Each connection and each tunnel holds a clone of `open_tx`; the drain ends when none is left.
+    let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
+    let (force_tx, force_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
     let mut shutdown = pin!(shutdown);
     let mut connections = JoinSet::new();
-    let (mut requests, load) = match reloads {
-        Some((requests, load)) => (Some(requests), Some(load)),
-        None => (None, None),
+    let (mut requests, load, applied) = match reloads {
+        Some((requests, load, applied)) => (Some(requests), Some(load), Some(applied)),
+        None => (None, None, None),
     };
     loop {
         // Both waits race with shutdown, so a full connection limit cannot block the stop.
@@ -315,8 +334,8 @@ async fn run(
         let permit = tokio::select! {
             () = &mut shutdown => break,
             Some(()) = next_reload(&mut requests) => {
-                if let Some(load) = &load {
-                    reload(load.as_ref(), &startup, &current_tx);
+                if let (Some(load), Some(applied)) = (&load, &applied) {
+                    reload(load.as_ref(), applied.as_ref(), &startup, &current_tx);
                 }
                 continue;
             }
@@ -327,12 +346,16 @@ async fn run(
         let (stream, peer) = tokio::select! {
             () = &mut shutdown => break,
             Some(()) = next_reload(&mut requests) => {
-                if let Some(load) = &load {
-                    reload(load.as_ref(), &startup, &current_tx);
+                if let (Some(load), Some(applied)) = (&load, &applied) {
+                    reload(load.as_ref(), applied.as_ref(), &startup, &current_tx);
                 }
                 continue;
             }
             accepted = listener.accept() => accepted.map_err(ServeError::Accept)?,
+        };
+        let lifetime = tunnel::Lifetime {
+            open: open_tx.clone(),
+            force: force_rx.clone(),
         };
         connections.spawn(serve_connection(
             current_rx.clone(),
@@ -340,14 +363,38 @@ async fn run(
             stream,
             peer,
             stop_rx.clone(),
+            lifetime,
             permit,
         ));
         while connections.try_join_next().is_some() {}
     }
     // Ignoring the send result is fine: it only fails when no connection is listening.
     let _ = stop_tx.send(true);
-    while connections.join_next().await.is_some() {}
+    drop(open_tx);
+    match shutdown_timeout {
+        None => drain(&mut connections, &mut open_rx).await,
+        Some(limit) => {
+            let drained = tokio::time::timeout(limit, drain(&mut connections, &mut open_rx))
+                .await
+                .is_ok();
+            if !drained {
+                tracing::warn!(
+                    "worker_shutdown_timeout expired; closing the connections and tunnels still open"
+                );
+                connections.abort_all();
+                let _ = force_tx.send(true);
+                drain(&mut connections, &mut open_rx).await;
+            }
+        }
+    }
     Ok(())
+}
+
+/// Waits until every connection has finished and every tunnel has closed.
+async fn drain(connections: &mut JoinSet<()>, open: &mut mpsc::Receiver<()>) {
+    while connections.join_next().await.is_some() {}
+    // Nothing is ever sent, so this returns once every sender is dropped.
+    let _ = open.recv().await;
 }
 
 /// Waits for the next reload request. Without a reload source it never completes,
@@ -363,6 +410,7 @@ async fn next_reload(requests: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
 /// failure is logged and leaves the current state in place.
 fn reload(
     load: &dyn Fn() -> Result<Config, ConfigError>,
+    applied: &dyn Fn(&Config),
     startup: &Startup,
     current: &watch::Sender<Arc<AppState<Backend>>>,
 ) {
@@ -375,9 +423,10 @@ fn reload(
     };
     startup.report_changes(&config);
     let previous = current.borrow().clone();
-    match AppState::from_config(config, &previous.zones) {
+    match AppState::from_config(config.clone(), &previous.zones) {
         Ok(state) => {
             current.send_replace(Arc::new(state));
+            applied(&config);
             tracing::info!("configuration reloaded");
         }
         Err(error) => {
@@ -391,6 +440,8 @@ struct Connection {
     phase: Arc<PhaseCell>,
     /// Requests started on this connection.
     served: AtomicUsize,
+    /// Shutdown bookkeeping that a tunnel started by one of its requests holds.
+    lifetime: tunnel::Lifetime,
 }
 
 async fn serve_connection(
@@ -399,6 +450,7 @@ async fn serve_connection(
     stream: TcpStream,
     peer: SocketAddr,
     mut stop: watch::Receiver<bool>,
+    lifetime: tunnel::Lifetime,
     _permit: OwnedSemaphorePermit,
 ) {
     let started = Instant::now();
@@ -413,6 +465,7 @@ async fn serve_connection(
     let connection = Arc::new(Connection {
         phase,
         served: AtomicUsize::new(0),
+        lifetime,
     });
     let mut builder = http1::Builder::new();
     builder.keep_alive(settings.timers.keep_alive > Duration::ZERO);
@@ -471,6 +524,8 @@ struct Trace<'a> {
     limit_req: Mutex<Option<&'static str>>,
     /// `$limit_conn_status`, set once the limits have run.
     limit_conn: Mutex<Option<&'static str>>,
+    /// The connection's shutdown bookkeeping, given to a tunnel this request starts.
+    tunnels: tunnel::Lifetime,
 }
 
 /// Answers one request on a connection and records it.
@@ -506,6 +561,7 @@ async fn handle<B: DecisionBackend>(
         started,
         limit_req: Mutex::new(None),
         limit_conn: Mutex::new(None),
+        tunnels: connection.lifetime.clone(),
     };
     let mut held = Vec::new();
     let mut response = pipeline(state, &parts, body, &done, &trace, peer, &mut held).await;
@@ -716,6 +772,7 @@ async fn pipeline<B: DecisionBackend>(
     };
     let delivery = Delivery {
         proxy,
+        tunnels: &trace.tunnels,
         upstream: &site.upstream,
         headers: header_ops,
         block,
@@ -811,6 +868,8 @@ fn close(response: &mut Response<ResponseBody>) {
 struct Delivery<'a> {
     /// The upstream client of the site.
     proxy: &'a Proxy,
+    /// The shutdown bookkeeping of the connection, held by a tunnel that the request starts.
+    tunnels: &'a tunnel::Lifetime,
     /// The site's upstream URI.
     upstream: &'a http::Uri,
     /// The `proxy_set_header` operations of the level in effect.
@@ -892,6 +951,7 @@ async fn respond(
                             upstream,
                             delivery.proxy.read_timeout(),
                             std::mem::take(held),
+                            delivery.tunnels.clone(),
                         );
                     }
                     Outcome {

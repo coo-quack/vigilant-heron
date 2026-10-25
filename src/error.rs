@@ -47,6 +47,15 @@ pub enum ConfigError {
         /// What is wrong, naming the directive.
         message: String,
     },
+    /// The `error_log` file cannot be opened.
+    #[error("cannot open error log {destination}: {source}")]
+    ErrorLog {
+        /// The destination that could not be opened, as the file names it.
+        destination: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Errors that stop the server loop.

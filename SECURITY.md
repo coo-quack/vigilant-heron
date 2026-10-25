@@ -179,7 +179,18 @@ fails validation is rejected: the error is logged with its file and line, and
 the configuration that was running keeps serving. Requests in flight during a
 reload finish with the configuration they started with. The listen address and
 the connection-level settings do not change until a restart, and a reload that
-changes them logs a warning.
+changes them logs a warning. The error log follows the reloaded file: its level
+and destination apply at once. A destination that cannot be opened fails the
+reload, and the failure is logged to the destination still in use.
+
+## Shutdown
+
+`SIGINT` and `SIGTERM` stop the router. Requests in flight finish, and open
+WebSocket tunnels stay open until one side closes them or they go idle for
+`proxy_read_timeout`. Without `worker_shutdown_timeout`, a shutdown waits for
+them indefinitely, so one busy tunnel can keep the process from exiting. With
+`worker_shutdown_timeout`, every connection and tunnel still open is closed when
+the time expires.
 
 ## Failure behavior
 

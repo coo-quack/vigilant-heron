@@ -84,6 +84,7 @@ const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
 pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
     "listen",
     "worker_threads",
+    "worker_shutdown_timeout",
     "max_connections",
     "default_status",
     "request_id_header",
@@ -203,6 +204,9 @@ pub struct Config {
     pub worker_threads: Option<usize>,
     /// Most connections served at the same time.
     pub max_connections: usize,
+    /// How long a shutdown waits for open connections and WebSocket tunnels before
+    /// closing them. `None` waits for them indefinitely, as nginx does by default.
+    pub worker_shutdown_timeout: Option<Duration>,
     /// Header whose value is logged as `$request_id`. It is not sent to the decision backend.
     pub request_id_header: Option<HeaderName>,
     /// How the client address is chosen.
@@ -814,6 +818,7 @@ where
     let mut listen = None;
     let mut worker_threads = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
+    let mut worker_shutdown_timeout = None;
     let mut request_id_header = None;
     let mut trusted = Vec::new();
     let mut real_ip_header = HeaderName::from_static("x-real-ip");
@@ -892,6 +897,11 @@ where
                     return Err(invalid(directive, "\"max_connections\" must be at least 1"));
                 }
                 max_connections = count;
+            }
+            "worker_shutdown_timeout" => {
+                once(&mut seen, directive)?;
+                worker_shutdown_timeout =
+                    Some(parse_positive_time(directive, one_arg(directive)?)?);
             }
             "default_status" => {
                 once(&mut seen, directive)?;
@@ -1113,6 +1123,7 @@ where
         listen,
         worker_threads,
         max_connections,
+        worker_shutdown_timeout,
         request_id_header,
         realip: RealIp {
             trusted,
@@ -2306,6 +2317,24 @@ mod tests {
             message(parse(&text))
                 .contains("test.conf:1: \"real_ip_from\" is not an address or network")
         );
+    }
+
+    #[test]
+    fn worker_shutdown_timeout_is_a_positive_time_and_unset_by_default() -> Result<(), ConfigError>
+    {
+        let set = parse(&format!("worker_shutdown_timeout 5s;\n{BASE}"))?;
+        assert_eq!(set.worker_shutdown_timeout, Some(Duration::from_secs(5)));
+        let unset = parse(BASE)?;
+        assert_eq!(unset.worker_shutdown_timeout, None);
+        assert!(
+            message(parse(&format!("worker_shutdown_timeout 0;\n{BASE}")))
+                .contains("\"worker_shutdown_timeout\" must be greater than 0")
+        );
+        assert!(
+            message(parse(&format!("worker_shutdown_timeout soon;\n{BASE}")))
+                .contains("is not a time")
+        );
+        Ok(())
     }
 
     #[test]
