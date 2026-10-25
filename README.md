@@ -23,7 +23,16 @@ client ──► nginx / Cloudflare ──► vigilant-heron ──► your site
 docker pull ghcr.io/coo-quack/vigilant-heron:<version>
 ```
 
-Replace `<version>` with a release number, or use `latest`. The package is private while the repository is private, so log in to `ghcr.io` first.
+Replace `<version>` with a release number, or use `latest`. The package is private while the repository is private, so log in to `ghcr.io` first. The container runs as `nonroot`, so its configuration must set a writable pid file, for example `pid /tmp/vigilant-heron.pid;`, and listen on `0.0.0.0`:
+
+```bash
+docker run -d --name vigilant-heron -p 8080:8080 \
+  -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
+  -e TYPESAFE_API_KEY \
+  ghcr.io/coo-quack/vigilant-heron:<version>
+```
+
+See [Installation](docs/install.md) for Docker Compose, nginx and Cloudflare, and updates.
 
 **Build from source.** You need the Rust toolchain that `rust-toolchain.toml` names. `rustup` installs it on the first build:
 
@@ -119,7 +128,7 @@ cargo install --git https://github.com/coo-quack/vigilant-heron --locked
 | `-T` | Check the configuration and print it, with every `include` expanded. |
 | `-s reload\|reopen\|stop\|quit` | Signal the running router. `reload` re-reads the file, `reopen` reopens the log files, `stop` and `quit` shut down gracefully. |
 
-The router finds its configuration in this order: `-c`, then the `VIGILANT_HERON_CONFIG` environment variable, then `/etc/vigilant-heron/vigilant-heron.conf`. `-s` finds the running router through the `pid` directive. See [Command line](docs/cli.md) for the details.
+The router finds its configuration in this order: `-c`, then the `VIGILANT_HERON_CONFIG` environment variable, then `/etc/vigilant-heron/vigilant-heron.conf`. `-s` finds the running router through the `pid` directive. See [Command line](docs/cli.md) for the details. In Docker, run it with `docker exec vigilant-heron /usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf`.
 
 ## What happens to each request
 
@@ -137,8 +146,10 @@ In shadow mode, steps 1 to 6 still run and are logged, but every request is forw
 
 The full reference is in [`docs/`](docs/).
 
-- [Getting started](docs/getting-started.md): install, a minimal configuration, nginx setup, shadow mode
+- [Getting started](docs/getting-started.md): a minimal configuration, a test attack, shadow mode, enforce mode
+- [Installation](docs/install.md): Docker, building from source, nginx or Cloudflare in front, updates
 - [Command line](docs/cli.md): every option, `-T`, and `-s` signals
+- [Troubleshooting](docs/troubleshooting.md): common symptoms and their fixes
 - [Configuration](docs/configuration.md): every directive, with its default and context
 - [How it works](docs/how-it-works.md): the request path in detail, shadow mode, failure behavior
 - [Decision backends](docs/decision-backends.md): Jev, Clef, and the JSON protocol for your own model

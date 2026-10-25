@@ -28,7 +28,9 @@ Shadow mode records what it would have done without blocking.
 
 ```
 src/
-  main.rs        # CLI: --config, -t (check only), runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen
+  main.rs        # Entry point: runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen, SIGTERM/SIGINT/SIGQUIT graceful stop
+  cli.rs         # Options (-h -v -c -t -T -s), usage text, -s signals through rustix via the pid file
+  pidfile.rs     # PID file: written after bind (atomic rename), removed on drop
   lib.rs         # Public API: Config, ConfigError, serve, install_error_log
   conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)
   config.rs      # Directive tree -> validated Config; every error names file:line

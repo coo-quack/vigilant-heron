@@ -107,20 +107,22 @@ Each of these exits 1.
 
 ### Docker
 
-The image runs as `nonroot`, which cannot write to `/run`. Set a `pid` in a path
-the user can write, in the configuration mounted into the container:
+The image runs as `nonroot` on distroless, which cannot write to `/run`. Put a
+`pid` in a path the user can write, in the configuration mounted into the
+container:
 
 ```nginx
 pid /tmp/vigilant-heron.pid;
 ```
 
-Then the signal words work inside the container too:
+The binary is `/usr/local/bin/vigilant-heron` in the image. Run the signal words
+with `docker exec`:
 
 ```bash
-docker exec <container> vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf
+docker exec <container> /usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf
 ```
 
-If the router cannot write the pid file at startup, it logs a warning and runs
+If the pid file cannot be written at startup, the router logs a warning and runs
 anyway, so `-s` reports the missing file instead of the router refusing to start.
 
 ## Run from source
