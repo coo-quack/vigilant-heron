@@ -36,7 +36,9 @@ src/
   accesslog.rs   # log_format compiler, variables, escaping, built-in json and main formats
   logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog, error log
   router.rs      # Host normalization and site lookup
-  prefilter.rs   # Path normalization, deny rules, static skip
+  access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
+  rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
+  prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   sanitize.rs    # Backend event: header drop, body redaction, truncation
   decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
@@ -53,6 +55,7 @@ tests/
   failures.rs    # Failure settings, rule-first guarantee, queued requests with one slot
   limits.rs      # Timers, header limits, body limit and upstream timeouts, with short timers
   logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off
+  rules.rs       # Access list and rule decisions in-process: order, shadow mode, logging, backend failures
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
@@ -60,12 +63,16 @@ e2e/
   vigilant-heron.conf # Router for the http backend, with four sites (one for uploads)
   config-clef.conf    # Second router that uses backend clef against the stub
   config-jev.conf     # Third router that uses backend jev against the stub
+  rules.d/       # Rule file included by vigilant-heron.conf (e2e only)
   compose.yaml   # nginx edge, three routers, stub decider, upstream
 eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
+  rules.py       # Built-in rules on dev and holdout, and the combined pipeline (stdlib only)
+  reports/       # Written reports of each measurement
 examples/
   vigilant-heron.conf # Fully commented sample configuration
+  rules.d/local.conf  # Commented sample rules, for an include
 ```
 
 ## Key Constraints
@@ -74,10 +81,13 @@ examples/
   non-test code may not unwrap, expect, panic, index or slice by position.
   Never weaken `[workspace.lints]`; silence a lint only with
   `#[expect(lint, reason = "...")]`.
-- Matching (`deny_path`, `fail_closed_path`, static skip) uses the
-  normalized path; forwarding uses the raw path unchanged.
+- Matching (`deny_path`, `fail_closed_path`, static skip, rules) uses the
+  normalized request described in the README; forwarding uses the raw request
+  unchanged.
 - A model verdict can only add blocks: rule blocks are decided before the
   backend is called, and nothing turns a rule block into an allow.
+- The access list runs first, before the body is read. A skip rule never
+  lets through a request that a block rule matches. Built-in rules are rules.
 - Every deterministic rule runs before the decision backend and is unaffected
   by `on_rate_limit` and `on_decision_error`. New rule types must follow this
   rule, and shadow mode still forwards everything, rules included.

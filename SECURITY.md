@@ -69,6 +69,52 @@ nginx's, and the table in the README lists them all.
 The header limits check the bytes of each request as they are read. A request
 pipelined behind another on the same connection is not checked by them.
 
+## Access list and rules
+
+The access list, the `deny_path` entries and the rules are decided before the
+decision model, in the order the README gives. They never send data anywhere.
+
+- A model answer cannot turn an access-list refusal, a `deny_path` match or a
+  block rule into an allow. A skip rule cannot let through a request that a block
+  rule matches, because every block rule is checked first.
+- The access list uses the client address chosen by the realip settings. That
+  address is believed only from a peer listed in `real_ip_from`, so a client
+  that is not a trusted proxy cannot pick its own address with a header.
+- Rules match the normalized request: the path is percent-decoded once, the
+  query and bodies are decoded at most twice, and NUL bytes are removed. A third
+  level of encoding is not decoded, so an input encoded three times is not seen
+  as the attack it encodes. The request is forwarded unchanged.
+- A body rule sees only the first `inspect_body` bytes. Anything later in the
+  body is not matched, and a multipart body is not parsed.
+- Regexes use the `regex` crate, which matches in time linear in the input and
+  never backtracks, so a pattern cannot be made to take exponential time by a
+  crafted request. Each regex is limited to 512 bytes of source and 1 MiB of
+  compiled program, and a configuration holds at most 1000 rules.
+
+The built-in rules are signatures, and they are intentionally narrow. They do
+not cover:
+
+- SQL injection in form bodies or JSON, except tautologies with a comment
+  terminator, stacked destructive statements and time-based functions, which
+  are matched anywhere in the inspected input. `UNION SELECT` is matched in
+  query strings only.
+- SQL keywords split by comments or inserted characters (`UN/**/ION`), other
+  SQL dialects, and stored or second-order injection, which no single request
+  shows.
+- XSS in bodies, headers and paths, and the script or `javascript:` forms in
+  bodies. Only query strings carry `<script>`, `javascript:` and inline event
+  handlers, because those forms also occur in code pastes and posts about HTML.
+  DOM-based XSS never reaches the server.
+- Deserialization gadgets, template injection beyond the probes listed, and
+  command injection that has no shell separator in a query string.
+- Payloads with any encoding beyond two levels, or in another transport
+  encoding such as base64 inside a parameter.
+- Credential stuffing, bursts and anything that only shows across requests.
+
+Each rule is an opinion about attack syntax, not a proof. Use a rule-based WAF
+in front of the router as well, and disable a built-in rule with `disable_rule`
+when it blocks traffic you need.
+
 ## Limits of the decision model
 
 The model judges text written by the attacker. Payloads can try to steer it,
@@ -76,8 +122,8 @@ and it can miss attacks or flag legitimate requests. The router limits what a
 steered model can do:
 
 - Attacker-controlled data is sent under a separate `untrusted` field.
-- Rule blocks (`deny_paths`) are decided before the model is called, so a
-  model answer can never turn a rule block into an allow.
+- Rule blocks (`deny_path` and block rules) are decided before the model is
+  called, so a model answer can never turn a rule block into an allow.
 - Requests whose content addresses an AI model are a block signal of their own
   (`instruction_threshold`).
 
@@ -101,10 +147,10 @@ failure and on the site settings:
   `action`.
 - `fail_closed_paths` always blocks a failure on a matching path, whatever the
   group or setting.
-- Deterministic rules (`deny_paths`) are decided before the backend is called.
-  The failure settings do not affect them, so a rule block stays a block when the
-  backend rate-limits, errors, is unreachable or is saturated. Shadow mode still
-  forwards every request, rules included.
+- Deterministic rules (the access list, `deny_path` and block rules) are decided
+  before the backend is called. The failure settings do not affect them, so a
+  rule block stays a block when the backend rate-limits, errors, is unreachable or
+  is saturated. Shadow mode still forwards every request, rules included.
 
 The defaults allow requests when the backend fails. A site that depends on the
 backend to block attacks should set `on_decision_error = "block"` and, for
