@@ -143,6 +143,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "deny_path",
     "fail_closed_path",
     "static_extensions",
+    "static_location",
     "debug_headers",
     "access_log",
     "allow",
@@ -380,6 +381,8 @@ pub struct SiteConfig {
     pub on_decision_error: FailureAction,
     /// File extensions that may skip the backend, lowercased.
     pub static_extensions: Vec<String>,
+    /// Path prefixes under which a static skip may apply, lowercased. Empty means anywhere.
+    pub static_locations: Vec<String>,
     /// Whether responses carry the `x-vigilant-heron` header.
     pub debug_headers: bool,
     /// The site's own access logs. `None` inherits the top-level ones; `Some(empty)` is `access_log off`.
@@ -1690,6 +1693,7 @@ fn parse_site(
     let mut on_rate_limit = FailureAction::Block;
     let mut on_decision_error = FailureAction::Block;
     let mut static_extensions: Option<Vec<String>> = None;
+    let mut static_locations: Vec<String> = Vec::new();
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
@@ -1801,6 +1805,23 @@ fn parse_site(
             "static_extensions" => {
                 let list = static_extensions.get_or_insert_with(Vec::new);
                 list.extend(child.args.iter().map(|e| e.to_ascii_lowercase()));
+            }
+            "static_location" => {
+                if child.args.is_empty() {
+                    return Err(invalid(
+                        child,
+                        "\"static_location\" needs at least one path prefix",
+                    ));
+                }
+                for prefix in &child.args {
+                    if !prefix.starts_with('/') {
+                        return Err(invalid(
+                            child,
+                            format!("\"static_location\" prefix must start with /: {prefix}"),
+                        ));
+                    }
+                }
+                static_locations.extend(child.args.iter().map(|p| p.to_ascii_lowercase()));
             }
             "debug_headers" => {
                 once(&mut seen, child)?;
@@ -1936,6 +1957,7 @@ fn parse_site(
                 .map(|e| (*e).to_owned())
                 .collect()
         }),
+        static_locations,
         debug_headers,
         access_logs,
         timeouts,
@@ -2487,6 +2509,27 @@ mod tests {
         assert_eq!(
             config.decision.redact_fields,
             ["ticket_ref", "internal-note", "trace"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn static_location_prefixes_are_read_lowercased_and_must_start_with_a_slash()
+    -> Result<(), ConfigError> {
+        let config = parse(&with_site(
+            "    static_location /Static/ /wp-content/Uploads/;\n",
+        ))?;
+        assert_eq!(
+            first_site(&config)?.static_locations,
+            ["/static/", "/wp-content/uploads/"]
+        );
+        assert!(
+            message(parse(&with_site("    static_location static/;\n")))
+                .contains("\"static_location\" prefix must start with /: static/")
+        );
+        assert!(
+            message(parse(&with_site("    static_location;\n")))
+                .contains("\"static_location\" needs at least one path prefix")
         );
         Ok(())
     }

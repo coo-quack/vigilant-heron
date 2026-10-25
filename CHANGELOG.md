@@ -174,3 +174,14 @@
   `Host` that is not a hostname, an IPv4 address or a bracketed IPv6 literal with
   an optional port now gets 400 with reason `invalid_host`, before the access
   list. A request with no `Host` header is routed as before.
+- Security (F1, F4, F5, F9): the security checks read the request path in six
+  ways (decoded; with `;` parameters cut per segment; with `\` as `/`; both; and
+  the raw path with `%2F` and `%5C` kept inside their segments, plain and with
+  the first two). `deny_path`, `fail_closed_path` and a block rule's `path`
+  condition match when any reading matches. A skip rule's `path` condition matches
+  only when every reading does. Limits apply to every `location` any reading
+  selects. A static skip needs every reading to end in a static extension with no
+  earlier script extension, the raw path free of `;`, `\`, `%2F`, `%5C` and `%3B`,
+  and no `fail_closed_path` match. The request is still forwarded unchanged.
+  New directive `static_location <prefix> ...;` in a `site` restricts the static
+  skip to some prefixes.

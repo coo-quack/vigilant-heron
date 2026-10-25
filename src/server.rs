@@ -608,11 +608,18 @@ async fn pipeline<B: DecisionBackend>(
     let index = state.router.lookup(parts.headers.get(HOST));
     let matched = index.and_then(|index| state.sites.get(index));
     let decoded = prefilter::decoded_path(parts.uri.path());
+    let views = prefilter::path_views(parts.uri.path());
+    // The location of the decoded path sets the block response, the headers and the tunnel.
     let location = matched.and_then(|site| limits::select_location(&site.locations, &decoded));
-    let limit_set = location
-        .map(|location| &location.limits)
-        .or_else(|| matched.map(|site| &site.limits))
-        .unwrap_or(&state.top_limits);
+    // Every location that any reading of the path selects is limited.
+    let selected = matched.map_or_else(Vec::new, |site| {
+        limits::select_locations(&site.locations, &views)
+    });
+    let limit_sets: Vec<&LimitSet> = if selected.is_empty() {
+        vec![matched.map_or(&state.top_limits, |site| &site.limits)]
+    } else {
+        selected.iter().map(|location| &location.limits).collect()
+    };
     let host = host_name(parts);
     let key_vars = KeyVars {
         client_ip: trace.client_ip,
@@ -627,7 +634,7 @@ async fn pipeline<B: DecisionBackend>(
     let site_block = matched.map(|site| &site.block);
     let block = location.map(|location| &location.block).or(site_block);
     let shadow = matched.is_some_and(|site| site.mode == Mode::Shadow);
-    let screened = limits::screen(&state.zones, limit_set, shadow, &key_vars, held).await;
+    let screened = limits::screen(&state.zones, &limit_sets, shadow, &key_vars, held).await;
     *lock(&trace.limit_req) = screened.req_status.map(ReqStatus::name);
     *lock(&trace.limit_conn) = screened.conn_status.map(ConnStatus::name);
     if let Some(refusal) = screened.refusal {
@@ -739,7 +746,6 @@ async fn pipeline<B: DecisionBackend>(
     };
 
     let raw_path = parts.uri.path();
-    let path = prefilter::normalized_path(raw_path);
     let (assessment, rule_id) = if access_denied {
         (Assessment::AccessDenied, None)
     } else {
@@ -768,7 +774,8 @@ async fn pipeline<B: DecisionBackend>(
         .await;
         (assessment, rule_id)
     };
-    let mut decision = policy::decide(site, &path, &assessment);
+    let lowered: Vec<String> = views.iter().map(|view| view.to_lowercase()).collect();
+    let mut decision = policy::decide(site, &lowered, &assessment);
     if decision.would_have.is_none() {
         decision.would_have = screened.would_have.map(Action::Reject);
     }

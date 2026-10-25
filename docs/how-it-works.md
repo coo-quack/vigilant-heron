@@ -29,6 +29,10 @@ decides the request ends the evaluation.
    forwards the request without calling the backend (reason `skip_rule`).
 6. **Static assets.** A plain GET or HEAD for a path with a static extension and
    no query and no body is forwarded without calling the backend (reason `skip`).
+   It is skipped only when every [path reading](#path-readings) ends in a static
+   extension with no earlier script extension, the raw path has no `;`, `\`, `%2F`,
+   `%5C` or `%3B`, and no `fail_closed_path` matches. A `static_location` restricts
+   it to some prefixes.
 7. **Decision model.** The request is sent to the backend, and the policy
    compares the returned scores with `block_threshold` and
    `instruction_threshold`. The outcome is `model` when a threshold is reached and
@@ -43,6 +47,29 @@ skip rule never lets through a request that a block rule matches.
 The normalized request is used for matching only. What reaches the upstream is
 the request as the client sent it, apart from the headers changed by
 `proxy_set_header`.
+
+### Path readings
+
+The request path is read in six ways, because upstreams resolve the same bytes
+differently. Each reading is percent-decoded once, or resolved on the raw path, as
+described below, and dot segments are resolved on `/`:
+
+1. The decoded path.
+2. As 1, with each segment cut at its first `;`. Tomcat, Jetty and Spring drop
+   these path parameters.
+3. As 1, with `\` read as `/`. IIS and ASP.NET do this.
+4. As 2 and 3 together.
+5. The raw path, with `%2F` and `%5C` kept inside their segments, then
+   percent-decoded once. Express matches the raw path this way.
+6. As 5, with `;` parameters cut and `\` read as `/`.
+
+NUL bytes are removed from each reading. A reading that equals another is counted
+once. The forwarded request is never changed.
+
+A block rule, `deny_path`, `fail_closed_path` and a block rule's `path` condition
+match when any reading matches. A skip rule's `path` condition must match every
+reading. Limits apply to every `location` that any reading selects. The block
+response and the location headers come from the location of the decoded path.
 
 ## Block, redirect or forward
 

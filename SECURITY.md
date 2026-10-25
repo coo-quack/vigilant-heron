@@ -95,10 +95,14 @@ decision model, in the order the README gives. They never send data anywhere.
 - The access list uses the client address chosen by the realip settings. That
   address is believed only from a peer listed in `real_ip_from`, so a client
   that is not a trusted proxy cannot pick its own address with a header.
-- Rules match the normalized request: the path is percent-decoded once, the
-  query and bodies are decoded at most twice, and NUL bytes are removed. A third
-  level of encoding is not decoded, so an input encoded three times is not seen
-  as the attack it encodes. The request is forwarded unchanged.
+- Rules match the normalized request: the path is read in six ways (decoded,
+  with `;` parameters cut, with `\` as `/`, and the raw path with encoded
+  separators kept), the query and bodies are decoded at most twice, and NUL bytes
+  are removed. A third level of encoding is not decoded, so an input encoded three
+  times is not seen as the attack it encodes. The request is forwarded unchanged.
+  A block matches when any reading matches, so the reading an upstream uses cannot
+  escape a `deny_path`. A static skip needs every reading to be static, so a
+  path such as `/index.php/x.css` or `/x;.css` is always inspected.
 - A body rule sees only the first `inspect_body` bytes. Anything later in the
   body is not matched, and a multipart body is not parsed.
 - Regexes use the `regex` crate, which matches in time linear in the input and

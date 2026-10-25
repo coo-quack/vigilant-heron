@@ -577,7 +577,7 @@ What happens when the backend fails in any other way: a timeout, a connection er
 - **Default:** none.
 - **Context:** site.
 
-Path prefixes that are always blocked without calling the backend. They match the normalized path, lowercased, so `/wp-config.php` also covers `/wp-config.php.bak`. Repeatable.
+Path prefixes that are always blocked without calling the backend. A prefix matches when it starts any [reading of the path](/how-it-works#path-readings), lowercased, so `/wp-config.php` also covers `/wp-config.php.bak`, and `/manager` also covers `/;/manager/html` and `/x/..;/manager/html`. Repeatable.
 
 ### `fail_closed_path`
 
@@ -585,7 +585,7 @@ Path prefixes that are always blocked without calling the backend. They match th
 - **Default:** none.
 - **Context:** site.
 
-Path prefixes that are blocked whenever the decision fails, whatever `on_rate_limit` and `on_decision_error` say.
+Path prefixes that are blocked whenever the decision fails, whatever `on_rate_limit` and `on_decision_error` say. They match the path readings in the same way as `deny_path`, and a matching path is never a static skip.
 
 ### `static_extensions`
 
@@ -593,7 +593,15 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query and no body that skip the backend. When given, the list replaces the defaults. Repeatable.
+File extensions of plain GET or HEAD requests with no query and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+
+### `static_location`
+
+- **Syntax:** `static_location <prefix> ...;`
+- **Default:** none. The static skip applies under any path.
+- **Context:** site.
+
+Path prefixes under which the static skip (`static_extensions`) may apply. Every path reading must start with one of them, so `/static/..;/img/a.css` is inspected. Compared lowercased. Repeatable; each prefix must start with `/`. Set it when the static files live in known directories, so that a static extension elsewhere is always inspected.
 
 ### `debug_headers`
 

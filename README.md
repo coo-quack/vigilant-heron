@@ -106,8 +106,8 @@ a prefix, `~` is a case-sensitive regex and `~*` is a case-insensitive one.
 
 Matching uses the normalized request and never changes what is forwarded:
 
-- Path: one percent-decode, dot segments resolved, NUL bytes removed. The case
-  is kept, so `path` and `path ~` are case-sensitive, as in nginx.
+- Path: six readings of the path, see "Path readings" below. The case is kept,
+  so `path` and `path ~` are case-sensitive, as in nginx.
 - Query and form body: `+` becomes a space, the percent-decoding is applied at
   most twice (so a double-encoded escape is undone), and NUL bytes are removed.
 - Header values: the same decoding as the query, except that `+` is literal.
@@ -166,7 +166,12 @@ For each request, in this order:
    in the order of the file, then the site's block rules. The first match blocks.
 5. Skip rules: the top-level skip rules, then the site's. The first match
    forwards the request without calling the backend (`reason skip_rule`).
-6. The static asset skip (`static_extensions`), which also forwards.
+6. The static asset skip (`static_extensions`), which also forwards. It applies
+   only to a plain GET or HEAD with no query and no body, whose raw path has no
+   `;`, `\`, `%2F`, `%5C` or `%3B`, whose every reading ends in a static
+   extension with no earlier script extension, and which no `fail_closed_path`
+   matches. With `static_location`, every reading must also lie under one of its
+   prefixes.
 7. The decision model. The thresholds and failure settings apply here only.
 
 Limits (see [Limits](#limits)) run before all of these, at step 0. A request
@@ -176,6 +181,29 @@ site a limited request is forwarded and recorded with `would_have=reject`.
 Block rules are always checked before skip rules, so a skip rule never lets
 through a request that a block rule matches. No failure setting changes steps 1
 to 5: a rule decision holds when the backend rate-limits, errors or is slow.
+
+### Path readings
+
+The request path is read in six ways, because upstreams resolve the same bytes
+differently. Each reading is percent-decoded once, or resolved on the raw path, as
+described below, and dot segments are resolved on `/`:
+
+1. The decoded path.
+2. As 1, with each segment cut at its first `;`. Tomcat, Jetty and Spring drop
+   these path parameters.
+3. As 1, with `\` read as `/`. IIS and ASP.NET do this.
+4. As 2 and 3 together.
+5. The raw path, with `%2F` and `%5C` kept inside their segments, then
+   percent-decoded once. Express matches the raw path this way.
+6. As 5, with `;` parameters cut and `\` read as `/`.
+
+NUL bytes are removed from each reading. A reading that equals another is counted
+once. The forwarded request is never changed.
+
+A block rule, `deny_path`, `fail_closed_path` and a block rule's `path` condition
+match when any reading matches. A skip rule's `path` condition must match every
+reading. Limits apply to every `location` that any reading selects. The block
+response and the location headers come from the location of the decoded path.
 
 ### Logs
 
@@ -271,7 +299,9 @@ is the normalized request path. Plain paths are compared lowercased, as
 `deny_path` is, and must start with `/`. A regex with `~` matches the decoded
 path with case kept, and `~*` ignores case. Regexes use the `regex` crate, so
 they are linear-time and have no backreferences or lookaround, which differs from
-nginx's PCRE. A repeated plain location is an error, as in nginx.
+nginx's PCRE. A repeated plain location is an error, as in nginx. The request is
+limited by every location that any [path reading](#path-readings) selects, and the
+block response comes from the location of the decoded path.
 
 Only the eight limit directives may appear inside a `location`. Any other
 directive is an error at its line.

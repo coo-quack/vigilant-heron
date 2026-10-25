@@ -108,16 +108,31 @@ pub(crate) fn header_value(raw: &str) -> String {
     decode_twice(raw)
 }
 
+/// How the path views of a request are combined by a path condition.
+///
+/// A block rule matches when its path condition holds for any view, so no reading of
+/// the path escapes it. A skip rule matches only when the condition holds for every
+/// view, so a skip never relies on one reading alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathScope {
+    /// The condition holds for at least one view.
+    Any,
+    /// The condition holds for every view.
+    All,
+}
+
 /// The inputs a rule can look at, normalized on first use.
 ///
-/// The path keeps its case, so `path ~` is case-sensitive and `path ~*` is not.
-/// The body is the inspected prefix only: a match cannot see bytes past
-/// `inspect_body`.
+/// The path is read in each way of [`crate::prefilter::path_views`], and the views
+/// keep their case, so `path ~` is case-sensitive and `path ~*` is not. The body is
+/// the inspected prefix only: a match cannot see bytes past `inspect_body`.
 pub(crate) struct RuleInput<'a> {
     /// The request method.
     pub(crate) method: &'a Method,
-    /// The path after one percent-decode, dot-segment removal and NUL removal. Case is kept.
-    pub(crate) path: String,
+    /// The path as received, which the static skip inspects.
+    pub(crate) raw_path: &'a str,
+    /// The path in each reading of [`crate::prefilter::path_views`]. Case is kept.
+    pub(crate) paths: Vec<String>,
     /// The raw query string, if the request has one.
     query: Option<&'a str>,
     /// The request headers.
@@ -138,7 +153,7 @@ impl<'a> RuleInput<'a> {
     /// Collects the inputs of one request. `raw_path` is the path as received.
     pub(crate) fn new(
         method: &'a Method,
-        raw_path: &str,
+        raw_path: &'a str,
         query: Option<&'a str>,
         headers: &'a HeaderMap,
         body: &'a [u8],
@@ -146,7 +161,8 @@ impl<'a> RuleInput<'a> {
     ) -> Self {
         Self {
             method,
-            path: crate::prefilter::decoded_path(raw_path).replace('\0', ""),
+            raw_path,
+            paths: crate::prefilter::path_views(raw_path),
             query,
             headers,
             body,
@@ -195,9 +211,17 @@ impl<'a> RuleInput<'a> {
             .map(|(_, text)| text.as_str())
     }
 
+    /// Whether `path` holds for the path views, combined with `scope`.
+    fn path_holds(&self, scope: PathScope, path: impl Fn(&str) -> bool) -> bool {
+        match scope {
+            PathScope::Any => self.paths.iter().any(|view| path(view)),
+            PathScope::All => self.paths.iter().all(|view| path(view)),
+        }
+    }
+
     /// Whether `pattern` matches the path, the query, any header value or the body prefix.
-    fn any_matches(&self, pattern: &Pattern) -> bool {
-        pattern.is_match(&self.path)
+    fn any_matches(&self, pattern: &Pattern, scope: PathScope) -> bool {
+        self.path_holds(scope, |view| pattern.is_match(view))
             || pattern.is_match(self.query_text())
             || self
                 .headers_text()
@@ -210,9 +234,10 @@ impl<'a> RuleInput<'a> {
 impl Rule {
     /// Returns true when every condition of the rule matches the request.
     ///
-    /// A condition that names an input the request does not have (for example
-    /// a header that is absent) does not match.
-    pub(crate) fn matches(&self, input: &RuleInput<'_>) -> bool {
+    /// The path conditions are combined with `scope`. A condition that names an
+    /// input the request does not have (for example a header that is absent) does
+    /// not match.
+    pub(crate) fn matches(&self, input: &RuleInput<'_>, scope: PathScope) -> bool {
         self.methods
             .as_ref()
             .is_none_or(|methods| methods.contains(input.method))
@@ -223,7 +248,7 @@ impl Rule {
             && self
                 .path
                 .as_ref()
-                .is_none_or(|path| path.matches(&input.path))
+                .is_none_or(|path| input.path_holds(scope, |view| path.matches(view)))
             && self
                 .query
                 .iter()
@@ -236,16 +261,31 @@ impl Rule {
                 .headers
                 .iter()
                 .all(|(name, pattern)| input.header_texts(name).any(|text| pattern.is_match(text)))
-            && self.any.iter().all(|pattern| input.any_matches(pattern))
+            && self
+                .any
+                .iter()
+                .all(|pattern| input.any_matches(pattern, scope))
     }
 }
 
-/// Returns the first rule in `rules` that matches the request.
+/// Returns the first block rule in `rules` that matches the request, reading the path with [`PathScope::Any`].
 pub(crate) fn first_match<'r>(
     rules: &'r [std::sync::Arc<Rule>],
     input: &RuleInput<'_>,
 ) -> Option<&'r std::sync::Arc<Rule>> {
-    rules.iter().find(|rule| rule.matches(input))
+    rules
+        .iter()
+        .find(|rule| rule.matches(input, PathScope::Any))
+}
+
+/// Returns the first skip rule in `rules` that matches the request, reading the path with [`PathScope::All`].
+pub(crate) fn first_skip_match<'r>(
+    rules: &'r [std::sync::Arc<Rule>],
+    input: &RuleInput<'_>,
+) -> Option<&'r std::sync::Arc<Rule>> {
+    rules
+        .iter()
+        .find(|rule| rule.matches(input, PathScope::All))
 }
 
 #[cfg(test)]
