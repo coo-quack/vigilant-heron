@@ -7,6 +7,14 @@
 
 Please do **not** open public GitHub issues for security vulnerabilities.
 
+## Security advisories
+
+The router ships a few opt-in virtual patches for known flaws in products that run
+behind it, such as `vh-cve-2026-9103`. They are off by default, and an operator
+enables them with `enable_rule` on the sites that run the affected product. How the
+rules are chosen, rolled out and removed, and what rules cannot cover, is described in
+[From CVE advisories to rules](docs/cve-rules.md).
+
 ## Data Disclosure
 
 For every request that is not skipped or blocked by a rule, the router sends

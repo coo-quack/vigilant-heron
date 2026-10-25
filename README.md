@@ -130,6 +130,8 @@ The router finds its configuration in this order: `-c`, then the `VIGILANT_HERON
 3. **Access list.** A denied client address gets 403.
 4. **Fixed rules.** Built-in and user rules block known attack patterns without asking the model. Skip rules let known-safe requests through. A fixed rule decides the request, and the model cannot change that decision.
 5. **Static files.** Plain requests for images, CSS and JavaScript go straight to the site. The router does not ask the model about them.
+
+Built-in virtual patches for specific CVEs are off by default. Turn one on for a site with `enable_rule`. See [Built-in rules](docs/builtin-rules.md) and [From CVE advisories to rules](docs/cve-rules.md).
 6. **Model.** The router sends a redacted copy of the request to the model. Cookies and authorization headers are removed, and the body is cut to its first 8 KiB by default. The model returns two scores. A score at or above its threshold blocks the request with 403, or redirects it.
 7. **Model failure.** If the model does not answer in time, or answers badly, `on_decision_error` decides. The default is to let the request through. You can set it to block instead.
 8. **Forward.** The request goes to the upstream, and the router writes one access line.

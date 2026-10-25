@@ -34,6 +34,7 @@ export default defineConfig({
           { text: "Configuration", link: "/configuration" },
           { text: "Rules", link: "/rules" },
           { text: "Built-in rules", link: "/builtin-rules" },
+          { text: "From CVE advisories to rules", link: "/cve-rules" },
           { text: "Limits", link: "/limits" },
           { text: "Logging", link: "/logging" },
           { text: "Timeouts and limits", link: "/timeouts" },
