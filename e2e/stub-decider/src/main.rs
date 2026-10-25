@@ -125,7 +125,9 @@ async fn clef(payload: &Value) -> Response<Full<Bytes>> {
     reply(
         StatusCode::OK,
         &json!({
-            "result": {"model": "clef-flash", "answers": answers, "usage": {}},
+            // Estimated as one token per four bytes of request, which is enough for offline budget tests.
+            "result": {"model": "clef-flash", "answers": answers,
+                       "usage": {"input_tokens": payload.to_string().len() / 4, "output_tokens": 0}},
             "success": true,
             "errors": [],
             "messages": [],

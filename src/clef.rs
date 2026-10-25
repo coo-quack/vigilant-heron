@@ -200,6 +200,15 @@ fn yes_no_question(instructions: &str, when_true: &str, when_false: &str) -> Val
 ///
 /// Accepts the Workers AI envelope (`{"result": {...}, "success": true}`) and a
 /// bare result object.
+/// Reads `usage.input_tokens`. Missing or malformed usage yields `None`, so it never
+/// fails the verdict.
+fn input_tokens(result: &Value) -> Option<u64> {
+    result
+        .get("usage")
+        .and_then(|usage| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+}
+
 pub(crate) fn parse_response(body: &[u8]) -> Result<Verdict, DecisionError> {
     let root: Value = serde_json::from_slice(body)?;
     if root.get("success").and_then(Value::as_bool) == Some(false) {
@@ -215,6 +224,7 @@ pub(crate) fn parse_response(body: &[u8]) -> Result<Verdict, DecisionError> {
         attack: Probability::new(attack)?,
         ai_instruction: Probability::new(ai_instruction)?,
         category: category_answer(answers),
+        input_tokens: input_tokens(result),
     })
 }
 
@@ -409,6 +419,37 @@ mod tests {
         let verdict = parse_response(body.as_bytes())?;
         assert_eq!(verdict.ai_instruction.value(), 0.2);
         assert_eq!(verdict.category.as_deref(), Some("none"));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::present(json!({"input_tokens": 1234, "output_tokens": 5}), Some(1234))]
+    #[case::zero(json!({"input_tokens": 0}), Some(0))]
+    #[case::missing_key(json!({"output_tokens": 5}), None)]
+    #[case::string_value(json!({"input_tokens": "many"}), None)]
+    #[case::negative_value(json!({"input_tokens": -5}), None)]
+    #[case::fractional_value(json!({"input_tokens": 12.5}), None)]
+    #[case::null_usage(Value::Null, None)]
+    fn usage_input_tokens_is_read_only_when_it_is_a_whole_number(
+        #[case] usage: Value,
+        #[case] expected: Option<u64>,
+    ) -> Result<(), DecisionError> {
+        let body = json!({
+            "result": {"answers": good_answers(0.1, 0.1, "none"), "usage": usage},
+            "success": true,
+        })
+        .to_string();
+        let verdict = parse_response(body.as_bytes())?;
+        assert_eq!(verdict.input_tokens, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn absent_usage_leaves_input_tokens_empty_without_failing() -> Result<(), DecisionError> {
+        let body = json!({"result": {"answers": good_answers(0.9, 0.1, "xss")}}).to_string();
+        let verdict = parse_response(body.as_bytes())?;
+        assert_eq!(verdict.input_tokens, None);
+        assert_eq!(verdict.category.as_deref(), Some("xss"));
         Ok(())
     }
 

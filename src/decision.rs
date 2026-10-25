@@ -56,6 +56,8 @@ pub(crate) struct Verdict {
     pub(crate) ai_instruction: Probability,
     /// Kind of attack, when the backend names one. Logged only.
     pub(crate) category: Option<String>,
+    /// Input tokens the backend billed for the request, when it reports them. Logged only.
+    pub(crate) input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +177,7 @@ impl DecisionBackend for HttpDecisionBackend {
             attack: Probability::new(raw.attack)?,
             ai_instruction: Probability::new(raw.ai_instruction)?,
             category: raw.category,
+            input_tokens: None,
         })
     }
 }
@@ -202,6 +205,7 @@ pub(crate) fn verdict(attack: f64, ai_instruction: f64) -> Verdict {
         attack: Probability(attack),
         ai_instruction: Probability(ai_instruction),
         category: None,
+        input_tokens: None,
     }
 }
 
