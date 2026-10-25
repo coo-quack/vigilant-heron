@@ -9,9 +9,9 @@ use std::time::Duration;
 use http::{HeaderName, HeaderValue, StatusCode, Uri};
 use serde::Deserialize;
 
-use crate::clef::{ApiToken, ClefModel};
 use crate::error::ConfigError;
 use crate::router::normalize_host;
+use crate::system_one::{ApiToken, ClefModel};
 
 /// Validated configuration for the whole proxy.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,10 +52,17 @@ pub struct DecisionConfig {
 pub enum BackendConfig {
     /// The JSON protocol described in the README.
     Http,
-    /// Cloudflare Clef, or a server that speaks its protocol.
+    /// Cloudflare Clef on Workers AI, or a server that speaks its protocol.
     Clef {
         /// Model that answers the questions.
         model: ClefModel,
+        /// Bearer token, read from the environment variable named in the config.
+        token: ApiToken,
+    },
+    /// `TypeSafe` Jev, or a server that speaks the same System One protocol.
+    Jev {
+        /// Model identifier sent in the request, such as `jev-latest`.
+        model: String,
         /// Bearer token, read from the environment variable named in the config.
         token: ApiToken,
     },
@@ -180,7 +187,7 @@ struct RawDecision {
     url: String,
     #[serde(default)]
     backend: RawBackend,
-    model: Option<ClefModel>,
+    model: Option<String>,
     api_token_env: Option<String>,
     timeout_ms: u64,
     inspect_body_bytes: usize,
@@ -195,6 +202,7 @@ enum RawBackend {
     #[default]
     Http,
     Clef,
+    Jev,
 }
 
 #[derive(Deserialize)]
@@ -320,41 +328,83 @@ impl RawDecision {
         match self.backend {
             RawBackend::Http => {
                 if self.model.is_some() {
-                    return Err(ConfigError::UnexpectedClefField { field: "model" });
+                    return Err(ConfigError::UnexpectedBackendField {
+                        backend: "http",
+                        field: "model",
+                    });
                 }
                 if self.api_token_env.is_some() {
-                    return Err(ConfigError::UnexpectedClefField {
+                    return Err(ConfigError::UnexpectedBackendField {
+                        backend: "http",
                         field: "api_token_env",
                     });
                 }
                 Ok(BackendConfig::Http)
             }
             RawBackend::Clef => {
-                let model = self
-                    .model
-                    .ok_or(ConfigError::MissingClefField { field: "model" })?;
-                let name = self
-                    .api_token_env
-                    .as_deref()
-                    .ok_or(ConfigError::MissingClefField {
-                        field: "api_token_env",
+                let value = self.required_model("clef")?;
+                let model =
+                    ClefModel::from_name(value).ok_or_else(|| ConfigError::InvalidClefModel {
+                        value: value.to_owned(),
                     })?;
-                let value = lookup(name).ok_or_else(|| ConfigError::MissingApiToken {
-                    name: name.to_owned(),
-                })?;
-                let token = value.trim();
-                if token.is_empty() {
-                    return Err(ConfigError::EmptyApiToken {
-                        name: name.to_owned(),
+                let token = self.api_token("clef", lookup)?;
+                Ok(BackendConfig::Clef { model, token })
+            }
+            RawBackend::Jev => {
+                let value = self.required_model("jev")?;
+                if !is_valid_model_id(value) {
+                    return Err(ConfigError::InvalidModelId {
+                        value: value.to_owned(),
                     });
                 }
-                Ok(BackendConfig::Clef {
-                    model,
-                    token: ApiToken::new(token.to_owned()),
+                let token = self.api_token("jev", lookup)?;
+                Ok(BackendConfig::Jev {
+                    model: value.to_owned(),
+                    token,
                 })
             }
         }
     }
+
+    fn required_model(&self, backend: &'static str) -> Result<&str, ConfigError> {
+        self.model
+            .as_deref()
+            .ok_or(ConfigError::MissingBackendField {
+                backend,
+                field: "model",
+            })
+    }
+
+    fn api_token<F>(&self, backend: &'static str, lookup: &F) -> Result<ApiToken, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let name = self
+            .api_token_env
+            .as_deref()
+            .ok_or(ConfigError::MissingBackendField {
+                backend,
+                field: "api_token_env",
+            })?;
+        let value = lookup(name).ok_or_else(|| ConfigError::MissingApiToken {
+            name: name.to_owned(),
+        })?;
+        let token = value.trim();
+        if token.is_empty() {
+            return Err(ConfigError::EmptyApiToken {
+                name: name.to_owned(),
+            });
+        }
+        Ok(ApiToken::new(token.to_owned()))
+    }
+}
+
+/// Returns true for a model identifier of 1 to 100 characters from `[A-Za-z0-9._-]`.
+fn is_valid_model_id(value: &str) -> bool {
+    (1..=100).contains(&value.len())
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 impl RawSite {
@@ -791,7 +841,7 @@ status = 421
                 assert_eq!(*model, ClefModel::Flash);
                 assert_eq!(token.expose(), "tok-123-secret");
             }
-            BackendConfig::Http => return Err(ConfigError::NoSites),
+            BackendConfig::Http | BackendConfig::Jev { .. } => return Err(ConfigError::NoSites),
         }
         Ok(())
     }
@@ -822,7 +872,10 @@ status = 421
         let input = clef_toml("backend = \"clef\"\napi_token_env = \"CLEF_TOKEN\"");
         assert!(matches!(
             Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::MissingClefField { field: "model" })
+            Err(ConfigError::MissingBackendField {
+                backend: "clef",
+                field: "model"
+            })
         ));
     }
 
@@ -831,7 +884,8 @@ status = 421
         let input = clef_toml("backend = \"clef\"\nmodel = \"clef-flash\"");
         assert!(matches!(
             Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::MissingClefField {
+            Err(ConfigError::MissingBackendField {
+                backend: "clef",
                 field: "api_token_env"
             })
         ));
@@ -863,7 +917,10 @@ status = 421
         let input = clef_toml("model = \"clef\"");
         assert!(matches!(
             Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::UnexpectedClefField { field: "model" })
+            Err(ConfigError::UnexpectedBackendField {
+                backend: "http",
+                field: "model"
+            })
         ));
     }
 
@@ -872,7 +929,8 @@ status = 421
         let input = clef_toml("api_token_env = \"CLEF_TOKEN\"");
         assert!(matches!(
             Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::UnexpectedClefField {
+            Err(ConfigError::UnexpectedBackendField {
+                backend: "http",
                 field: "api_token_env"
             })
         ));
@@ -888,12 +946,87 @@ status = 421
     }
 
     #[test]
-    fn unknown_clef_model_is_a_parse_error() {
+    fn unknown_clef_model_is_rejected_by_name() {
         let input =
             clef_toml("backend = \"clef\"\nmodel = \"clef-mini\"\napi_token_env = \"CLEF_TOKEN\"");
         assert!(matches!(
             Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::Parse(_))
+            Err(ConfigError::InvalidClefModel { value }) if value == "clef-mini"
+        ));
+    }
+
+    #[test]
+    fn clef_backend_rejects_a_jev_model_name() {
+        let input =
+            clef_toml("backend = \"clef\"\nmodel = \"jev-latest\"\napi_token_env = \"CLEF_TOKEN\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::InvalidClefModel { .. })
+        ));
+    }
+
+    #[test]
+    fn jev_backend_reads_the_model_id_and_token() -> Result<(), ConfigError> {
+        let input =
+            clef_toml("backend = \"jev\"\nmodel = \"jev-latest\"\napi_token_env = \"CLEF_TOKEN\"");
+        let config = Config::from_toml_str_with_lookup(&input, lookup)?;
+        assert!(matches!(
+            &config.decision.backend,
+            BackendConfig::Jev { model, .. } if model == "jev-latest"
+        ));
+        if let BackendConfig::Jev { token, .. } = &config.decision.backend {
+            assert_eq!(token.expose(), "tok-123-secret");
+        }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::plain("jev-latest")]
+    #[case::dots_and_dashes("jev.v2-rc_1")]
+    #[case::longest(&"a".repeat(100))]
+    fn jev_accepts_model_ids_of_the_allowed_shape(#[case] model: &str) {
+        let input = clef_toml(&format!(
+            "backend = \"jev\"\nmodel = \"{model}\"\napi_token_env = \"CLEF_TOKEN\""
+        ));
+        assert!(Config::from_toml_str_with_lookup(&input, lookup).is_ok());
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::space("jev latest")]
+    #[case::slash("jev/latest")]
+    #[case::too_long(&"a".repeat(101))]
+    fn jev_rejects_model_ids_outside_the_allowed_shape(#[case] model: &str) {
+        let input = clef_toml(&format!(
+            "backend = \"jev\"\nmodel = \"{model}\"\napi_token_env = \"CLEF_TOKEN\""
+        ));
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::InvalidModelId { .. })
+        ));
+    }
+
+    #[test]
+    fn jev_without_a_model_is_rejected() {
+        let input = clef_toml("backend = \"jev\"\napi_token_env = \"CLEF_TOKEN\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::MissingBackendField {
+                backend: "jev",
+                field: "model"
+            })
+        ));
+    }
+
+    #[test]
+    fn jev_without_a_token_variable_name_is_rejected() {
+        let input = clef_toml("backend = \"jev\"\nmodel = \"jev-latest\"");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, lookup),
+            Err(ConfigError::MissingBackendField {
+                backend: "jev",
+                field: "api_token_env"
+            })
         ));
     }
 

@@ -21,7 +21,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::clef::ClefBackend;
 use crate::config::{BackendConfig, Config, DecisionConfig, SiteConfig};
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, decision_client};
 use crate::error::ServeError;
@@ -30,6 +29,7 @@ use crate::prefilter::{self, Screening};
 use crate::proxy::Proxy;
 use crate::router::{Router, normalize_host};
 use crate::sanitize::{self, EventInput};
+use crate::system_one::SystemOneBackend;
 
 /// Upper bound on connections served at the same time.
 const MAX_CONNECTIONS: usize = 1024;
@@ -56,10 +56,17 @@ impl AppState<Backend> {
         let timeout = config.decision.timeout;
         let backend = match &config.decision.backend {
             BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, timeout)),
-            BackendConfig::Clef { model, token } => Backend::Clef(ClefBackend::new(
+            BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
                 client,
                 url,
-                *model,
+                model.as_str().to_owned(),
+                token.clone(),
+                timeout,
+            )),
+            BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
+                client,
+                url,
+                model.clone(),
                 token.clone(),
                 timeout,
             )),
@@ -228,7 +235,7 @@ async fn handle<B: DecisionBackend>(
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
     }
-    let (attack, ai_instruction, category) = verdict_fields(&assessment);
+    let fields = verdict_fields(&assessment);
     emit(&LogRecord {
         site: site_name(site),
         method: &parts.method,
@@ -236,9 +243,10 @@ async fn handle<B: DecisionBackend>(
         action: decision.action.name(),
         reason: decision.reason.name(),
         would_have: decision.would_have.as_ref().map_or("none", Action::name),
-        attack,
-        ai_instruction,
-        category,
+        attack: fields.attack,
+        ai_instruction: fields.ai_instruction,
+        category: fields.category,
+        input_tokens: fields.input_tokens,
         client_ip: &client_ip,
         started,
     });
@@ -336,15 +344,29 @@ fn site_name(site: &SiteConfig) -> &str {
 }
 
 /// Returns the scores and category to log. They are empty when no backend answered.
-fn verdict_fields(assessment: &Assessment) -> (Option<f64>, Option<f64>, Option<&str>) {
+fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
     match assessment {
-        Assessment::Model(verdict) => (
-            Some(verdict.attack.value()),
-            Some(verdict.ai_instruction.value()),
-            verdict.category.as_deref(),
-        ),
-        _ => (None, None, None),
+        Assessment::Model(verdict) => VerdictFields {
+            attack: Some(verdict.attack.value()),
+            ai_instruction: Some(verdict.ai_instruction.value()),
+            category: verdict.category.as_deref(),
+            input_tokens: verdict.input_tokens,
+        },
+        _ => VerdictFields {
+            attack: None,
+            ai_instruction: None,
+            category: None,
+            input_tokens: None,
+        },
     }
+}
+
+/// The verdict fields written to the decision event. Each is empty when no backend answered.
+struct VerdictFields<'a> {
+    attack: Option<f64>,
+    ai_instruction: Option<f64>,
+    category: Option<&'a str>,
+    input_tokens: Option<u64>,
 }
 
 /// Answers a request that never reached a decision, and logs it as a rejection.
@@ -366,6 +388,7 @@ fn reject(
         attack: None,
         ai_instruction: None,
         category: None,
+        input_tokens: None,
         client_ip,
         started,
     });
@@ -395,6 +418,7 @@ struct LogRecord<'a> {
     attack: Option<f64>,
     ai_instruction: Option<f64>,
     category: Option<&'a str>,
+    input_tokens: Option<u64>,
     client_ip: &'a str,
     started: Instant,
 }
@@ -412,6 +436,7 @@ fn emit(record: &LogRecord<'_>) {
         attack = record.attack,
         ai_instruction = record.ai_instruction,
         category = record.category,
+        input_tokens = record.input_tokens,
         latency_ms,
         client_ip = record.client_ip,
     );

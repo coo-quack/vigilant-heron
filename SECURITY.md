@@ -25,6 +25,12 @@ bearer token is sent in the `Authorization` header to that endpoint only. Use
 an account whose Workers AI data handling you have accepted, and keep the token
 in the environment, not in the config file. The router never logs the token.
 
+With `backend = "jev"`, the same sanitized event is sent to TypeSafe
+(`api.typesafe.ai`), a third party, in the same System One request shape. The
+bearer token goes only to that endpoint, and the router never logs it. The
+router does not enable TypeSafe's long-context mode, so events are sent in the
+standard form.
+
 ## Limits of the decision model
 
 The model judges text written by the attacker. Payloads can try to steer it,

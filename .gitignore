@@ -35,3 +35,7 @@ e2e/*.local.toml
 
 # Cargo.lock and proptest-regressions/ are committed on purpose: the lock file
 # pins builds, and proptest records failing seeds there so they are replayed.
+
+# evaluation output (eval/run.py)
+eval/results/
+__pycache__/

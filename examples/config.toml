@@ -16,6 +16,7 @@ client_ip_header = "x-real-ip"
 # Protocol spoken to the decision backend:
 #   "http"  the JSON protocol described in the README (default)
 #   "clef"  Cloudflare Clef on Workers AI, or a server that speaks its protocol
+#   "jev"   TypeSafe Jev, or a server that speaks the same System One protocol
 backend = "http"
 
 # Absolute http:// or https:// URI of the decision backend. For "http" the proxy
@@ -24,12 +25,13 @@ backend = "http"
 # https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash
 url = "http://stub-decider:9000/decide"
 
-# Clef only, required with backend = "clef" and rejected otherwise: the Clef model.
-# "clef-flash" has a 24,576-token context, "clef" has 64K.
+# Required with backend = "clef" or "jev", rejected with "http". For "clef" it is
+# "clef-flash" (24,576-token context) or "clef" (64K). For "jev" it is a model
+# identifier such as "jev-latest": 1 to 100 characters from [A-Za-z0-9._-].
 # model = "clef-flash"
 
-# Clef only, required with backend = "clef" and rejected otherwise: the NAME of
-# an environment variable that holds the bearer token. The token itself is never
+# Required with backend = "clef" or "jev", rejected with "http": the NAME of an
+# environment variable that holds the bearer token. The token itself is never
 # written in this file. The process fails to start when the variable is unset or
 # blank. Logs and errors print the token as [REDACTED].
 # api_token_env = "CLOUDFLARE_AI_TOKEN"
