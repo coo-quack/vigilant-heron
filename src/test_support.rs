@@ -23,6 +23,7 @@ pub(crate) fn site(site_fields: &str) -> Result<SiteConfig, ConfigError> {
 listen = "127.0.0.1:8080"
 
 [decision]
+backend = "http"
 url = "http://stub-decider:9000/decide"
 timeout_ms = 150
 inspect_body_bytes = 8192

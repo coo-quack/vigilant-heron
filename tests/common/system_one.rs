@@ -127,7 +127,25 @@ async fn fake_endpoint(
     let content = percent_encoding::percent_decode_str(&content.replace('+', " "))
         .decode_utf8_lossy()
         .to_lowercase();
-    if field("path").contains("malformed-answers") {
+    let path = field("path");
+    if path.contains("ratelimited") {
+        let mut response = json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &json!({"success": false, "errors": [{"code": 429}], "messages": []}),
+        );
+        response.headers_mut().insert(
+            http::header::RETRY_AFTER,
+            http::HeaderValue::from_static("2"),
+        );
+        return response;
+    }
+    if path.contains("servererror") {
+        return json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"error": "boom"}));
+    }
+    if path.contains("slowanswer") {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+    if path.contains("malformed-answers") {
         return answers_response(
             spec,
             &json!({

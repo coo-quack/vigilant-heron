@@ -44,6 +44,8 @@ tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
   jev.rs         # In-process tests of the Jev backend against a fake endpoint
+  failures.rs    # Failure settings, rule-first guarantee, queued requests with one slot
+  logging.rs     # Decision log fields (request_id, decision_error, retry_after)
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
@@ -51,6 +53,9 @@ e2e/
   config-clef.toml # Second router that uses backend = "clef" against the stub
   config-jev.toml  # Third router that uses backend = "jev" against the stub
   compose.yaml   # nginx edge, three routers, stub decider, upstream
+eval/
+  run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
+  load.py        # Load test against the stub decider (offline only)
 ```
 
 ## Key Constraints
@@ -63,6 +68,9 @@ e2e/
   normalized path; forwarding uses the raw path unchanged.
 - A model verdict can only add blocks: rule blocks are decided before the
   backend is called, and nothing turns a rule block into an allow.
+- Every deterministic rule runs before the decision backend and is unaffected
+  by `on_rate_limit` and `on_decision_error`. New rule types must follow this
+  rule, and shadow mode still forwards everything, rules included.
 - Client data goes to the backend only under `event.untrusted`, after
   credential headers are dropped and sensitive fields are redacted.
 - Comments and documentation are in English.

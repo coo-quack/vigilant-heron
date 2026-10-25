@@ -306,3 +306,54 @@ async fn ai_instruction_judged_by_the_jev_backend_gets_403() -> TestResult {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn rate_limited_decision_on_a_deny_path_is_still_blocked() -> TestResult {
+    // The stub would answer 429 here, but the deny rule decides first and the
+    // backend is never asked. The site allows on rate limits.
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/.env/ratelimited",
+        "enforce.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn rate_limited_decision_on_a_site_that_allows_is_forwarded() -> TestResult {
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/ratelimited",
+        "enforce.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.text().contains("upstream ok"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn rate_limited_decision_on_a_site_that_blocks_gets_403() -> TestResult {
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/ratelimited",
+        "ratelimit.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}

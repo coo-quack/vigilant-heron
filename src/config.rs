@@ -22,6 +22,12 @@ pub struct Config {
     pub log_format: LogFormat,
     /// Header that carries the real client address behind a trusted proxy.
     pub client_ip_header: Option<HeaderName>,
+    /// Header whose value is logged as `request_id`. It is not sent to the decision backend.
+    pub request_id_header: Option<HeaderName>,
+    /// Most connections served at the same time.
+    pub max_connections: usize,
+    /// Runtime worker threads. `None` means one per CPU core (tokio's default).
+    pub worker_threads: Option<usize>,
     /// Settings for the decision backend.
     pub decision: DecisionConfig,
     /// Status returned for hosts that match no site.
@@ -43,6 +49,11 @@ pub struct DecisionConfig {
     pub inspect_body_bytes: usize,
     /// Largest request body the proxy reads at all.
     pub max_body_bytes: usize,
+    /// Most decision-backend calls in flight at the same time.
+    pub max_concurrency: usize,
+    /// Longest wait for a free slot. Not getting one in this window is always
+    /// `backend_busy`. Zero means no queueing.
+    pub queue_timeout: Duration,
     /// Extra header names to drop before sending, lowercased.
     pub redact_headers: Vec<String>,
 }
@@ -85,12 +96,28 @@ pub struct SiteConfig {
     pub instruction_threshold: f64,
     /// Path prefixes that are always blocked without calling the backend.
     pub deny_paths: Vec<String>,
-    /// Path prefixes that are blocked when the backend fails.
+    /// Path prefixes that are always blocked when the decision fails, whatever the
+    /// failure group or its setting.
     pub fail_closed_paths: Vec<String>,
+    /// What happens when the backend rate-limits the request or the local concurrency slot is full.
+    pub on_rate_limit: FailureAction,
+    /// What happens when the backend fails in any other way.
+    pub on_decision_error: FailureAction,
     /// File extensions that may skip the backend, lowercased.
     pub static_extensions: Vec<String>,
     /// Whether responses carry the `x-vigilant-heron` header.
     pub debug_headers: bool,
+}
+
+/// What a site does with a request whose decision could not be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum FailureAction {
+    /// Forward the request to the upstream.
+    #[default]
+    Allow,
+    /// Apply the site's `action`: block with 403, or redirect.
+    Block,
 }
 
 /// Whether a site enforces its verdicts.
@@ -167,6 +194,25 @@ impl Config {
     }
 }
 
+/// Default connection cap.
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+/// Default number of concurrent decision-backend calls.
+const DEFAULT_MAX_CONCURRENCY: usize = 64;
+/// Default decision timeout in milliseconds.
+const DEFAULT_TIMEOUT_MS: u64 = 300;
+/// Default block threshold for a site.
+const DEFAULT_BLOCK_THRESHOLD: f64 = 0.87;
+/// Default AI-instruction threshold for a site.
+const DEFAULT_INSTRUCTION_THRESHOLD: f64 = 0.8;
+/// The Jev endpoint used when `url` is omitted.
+const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
+/// The Jev model used when `model` is omitted.
+const JEV_MODEL: &str = "jev-latest";
+/// The variable read for the Jev token when `api_token_env` is omitted.
+const JEV_TOKEN_ENV: &str = "TYPESAFE_API_KEY";
+/// Longest request id that is logged; longer values are cut.
+pub(crate) const MAX_REQUEST_ID_BYTES: usize = 128;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -174,6 +220,10 @@ struct RawConfig {
     #[serde(default)]
     log_format: LogFormat,
     client_ip_header: Option<String>,
+    request_id_header: Option<String>,
+    #[serde(default = "default_max_connections")]
+    max_connections: usize,
+    worker_threads: Option<usize>,
     decision: RawDecision,
     #[serde(rename = "default")]
     default_section: RawDefault,
@@ -181,27 +231,45 @@ struct RawConfig {
     sites: Vec<RawSite>,
 }
 
+fn default_max_connections() -> usize {
+    DEFAULT_MAX_CONNECTIONS
+}
+
+fn default_max_concurrency() -> usize {
+    DEFAULT_MAX_CONCURRENCY
+}
+
+fn default_timeout_ms() -> u64 {
+    DEFAULT_TIMEOUT_MS
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDecision {
-    url: String,
+    url: Option<String>,
     #[serde(default)]
     backend: RawBackend,
     model: Option<String>,
     api_token_env: Option<String>,
+    #[serde(default = "default_timeout_ms")]
     timeout_ms: u64,
     inspect_body_bytes: usize,
     max_body_bytes: usize,
+    #[serde(default = "default_max_concurrency")]
+    max_concurrency: usize,
+    #[serde(default)]
+    queue_timeout_ms: u64,
     #[serde(default)]
     redact_headers: Vec<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 enum RawBackend {
-    #[default]
     Http,
     Clef,
+    /// Jev is the default backend.
+    #[default]
     Jev,
 }
 
@@ -226,16 +294,30 @@ struct RawSite {
     mode: Mode,
     action: RawAction,
     redirect_to: Option<String>,
+    #[serde(default = "default_block_threshold")]
     block_threshold: f64,
+    #[serde(default = "default_instruction_threshold")]
     instruction_threshold: f64,
     #[serde(default)]
     deny_paths: Vec<String>,
     #[serde(default)]
     fail_closed_paths: Vec<String>,
+    #[serde(default)]
+    on_rate_limit: FailureAction,
+    #[serde(default)]
+    on_decision_error: FailureAction,
     #[serde(default = "default_static_extensions")]
     static_extensions: Vec<String>,
     #[serde(default)]
     debug_headers: bool,
+}
+
+fn default_block_threshold() -> f64 {
+    DEFAULT_BLOCK_THRESHOLD
+}
+
+fn default_instruction_threshold() -> f64 {
+    DEFAULT_INSTRUCTION_THRESHOLD
 }
 
 fn default_static_extensions() -> Vec<String> {
@@ -258,11 +340,24 @@ impl RawConfig {
         }
         let decision = self.decision.validate(lookup)?;
         let default_status = validate_default_status(self.default_section.status)?;
+        if self.max_connections == 0 {
+            return Err(ConfigError::ZeroMaxConnections);
+        }
+        if self.worker_threads == Some(0) {
+            return Err(ConfigError::ZeroWorkerThreads);
+        }
         let client_ip_header = self
             .client_ip_header
             .map(|value| {
                 HeaderName::from_str(&value)
                     .map_err(|_| ConfigError::InvalidClientIpHeader { value })
+            })
+            .transpose()?;
+        let request_id_header = self
+            .request_id_header
+            .map(|value| {
+                HeaderName::from_str(&value)
+                    .map_err(|_| ConfigError::InvalidRequestIdHeader { value })
             })
             .transpose()?;
         let mut sites = Vec::with_capacity(self.sites.len());
@@ -280,6 +375,9 @@ impl RawConfig {
             listen: self.listen,
             log_format: self.log_format,
             client_ip_header,
+            request_id_header,
+            max_connections: self.max_connections,
+            worker_threads: self.worker_threads,
             decision,
             default_status,
             sites,
@@ -292,14 +390,30 @@ impl RawDecision {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let url = parse_absolute_uri(&self.url, &["http", "https"]).ok_or_else(|| {
-            ConfigError::InvalidDecisionUrl {
-                value: self.url.clone(),
+        let url_text = match (self.url.as_deref(), self.backend) {
+            (Some(url), _) => url.to_owned(),
+            (None, RawBackend::Jev) => JEV_URL.to_owned(),
+            (None, backend) => {
+                return Err(ConfigError::MissingBackendField {
+                    backend: backend.name(),
+                    field: "url",
+                });
             }
-        })?;
+        };
+        let url = parse_absolute_uri(&url_text, &["http", "https"])
+            .ok_or(ConfigError::InvalidDecisionUrl { value: url_text })?;
         let backend = self.backend_config(lookup)?;
         if self.timeout_ms == 0 {
             return Err(ConfigError::ZeroTimeout);
+        }
+        if self.max_concurrency == 0 {
+            return Err(ConfigError::ZeroMaxConcurrency);
+        }
+        if self.queue_timeout_ms > self.timeout_ms {
+            return Err(ConfigError::QueueTimeoutExceedsTimeout {
+                queue: self.queue_timeout_ms,
+                timeout: self.timeout_ms,
+            });
         }
         if self.inspect_body_bytes > self.max_body_bytes {
             return Err(ConfigError::InspectExceedsMax {
@@ -313,6 +427,8 @@ impl RawDecision {
             timeout: Duration::from_millis(self.timeout_ms),
             inspect_body_bytes: self.inspect_body_bytes,
             max_body_bytes: self.max_body_bytes,
+            max_concurrency: self.max_concurrency,
+            queue_timeout: Duration::from_millis(self.queue_timeout_ms),
             redact_headers: self
                 .redact_headers
                 .iter()
@@ -342,22 +458,36 @@ impl RawDecision {
                 Ok(BackendConfig::Http)
             }
             RawBackend::Clef => {
-                let value = self.required_model("clef")?;
+                let value = self
+                    .model
+                    .as_deref()
+                    .ok_or(ConfigError::MissingBackendField {
+                        backend: "clef",
+                        field: "model",
+                    })?;
                 let model =
                     ClefModel::from_name(value).ok_or_else(|| ConfigError::InvalidClefModel {
                         value: value.to_owned(),
                     })?;
-                let token = self.api_token("clef", lookup)?;
+                let name =
+                    self.api_token_env
+                        .as_deref()
+                        .ok_or(ConfigError::MissingBackendField {
+                            backend: "clef",
+                            field: "api_token_env",
+                        })?;
+                let token = read_token(name, lookup)?;
                 Ok(BackendConfig::Clef { model, token })
             }
             RawBackend::Jev => {
-                let value = self.required_model("jev")?;
+                let value = self.model.as_deref().unwrap_or(JEV_MODEL);
                 if !is_valid_model_id(value) {
                     return Err(ConfigError::InvalidModelId {
                         value: value.to_owned(),
                     });
                 }
-                let token = self.api_token("jev", lookup)?;
+                let name = self.api_token_env.as_deref().unwrap_or(JEV_TOKEN_ENV);
+                let token = read_token(name, lookup)?;
                 Ok(BackendConfig::Jev {
                     model: value.to_owned(),
                     token,
@@ -365,38 +495,33 @@ impl RawDecision {
             }
         }
     }
+}
 
-    fn required_model(&self, backend: &'static str) -> Result<&str, ConfigError> {
-        self.model
-            .as_deref()
-            .ok_or(ConfigError::MissingBackendField {
-                backend,
-                field: "model",
-            })
-    }
-
-    fn api_token<F>(&self, backend: &'static str, lookup: &F) -> Result<ApiToken, ConfigError>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
-        let name = self
-            .api_token_env
-            .as_deref()
-            .ok_or(ConfigError::MissingBackendField {
-                backend,
-                field: "api_token_env",
-            })?;
-        let value = lookup(name).ok_or_else(|| ConfigError::MissingApiToken {
-            name: name.to_owned(),
-        })?;
-        let token = value.trim();
-        if token.is_empty() {
-            return Err(ConfigError::EmptyApiToken {
-                name: name.to_owned(),
-            });
+impl RawBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Clef => "clef",
+            Self::Jev => "jev",
         }
-        Ok(ApiToken::new(token.to_owned()))
     }
+}
+
+/// Reads and trims the token from the variable `name`.
+fn read_token<F>(name: &str, lookup: &F) -> Result<ApiToken, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let value = lookup(name).ok_or_else(|| ConfigError::MissingApiToken {
+        name: name.to_owned(),
+    })?;
+    let token = value.trim();
+    if token.is_empty() {
+        return Err(ConfigError::EmptyApiToken {
+            name: name.to_owned(),
+        });
+    }
+    Ok(ApiToken::new(token.to_owned()))
 }
 
 /// Returns true for a model identifier of 1 to 100 characters from `[A-Za-z0-9._-]`.
@@ -453,6 +578,8 @@ impl RawSite {
             instruction_threshold: self.instruction_threshold,
             deny_paths: self.deny_paths,
             fail_closed_paths: self.fail_closed_paths,
+            on_rate_limit: self.on_rate_limit,
+            on_decision_error: self.on_decision_error,
             static_extensions: self
                 .static_extensions
                 .iter()
@@ -497,6 +624,7 @@ mod tests {
 listen = "127.0.0.1:8080"
 
 [decision]
+backend = "http"
 url = "http://stub-decider:9000/decide"
 timeout_ms = 150
 inspect_body_bytes = 8192
@@ -527,6 +655,7 @@ listen = "127.0.0.1:8080"
 client_ip_header = "X-Real-IP"
 
 [decision]
+backend = "http"
 url = "http://stub-decider:9000/decide"
 timeout_ms = 150
 inspect_body_bytes = 8192
@@ -799,11 +928,17 @@ instruction_threshold = 0.5
         "https://api.cloudflare.com/client/v4/accounts/acc/ai/run/@cf/cloudflare/clef-flash";
 
     fn clef_toml(backend_lines: &str) -> String {
+        let default_backend = if backend_lines.contains("backend") {
+            ""
+        } else {
+            "backend = \"http\""
+        };
         format!(
             r#"
 listen = "127.0.0.1:8080"
 
 [decision]
+{default_backend}
 url = "{CLEF_URL}"
 timeout_ms = 300
 inspect_body_bytes = 8192
@@ -825,10 +960,41 @@ status = 421
     }
 
     #[test]
-    fn default_backend_is_http_and_needs_no_token() -> Result<(), ConfigError> {
-        let config = Config::from_toml_str_with_lookup(&config_with(""), |_| None)?;
-        assert_eq!(config.decision.backend, BackendConfig::Http);
+    fn default_backend_is_jev_and_reads_the_default_variable() -> Result<(), ConfigError> {
+        // No backend, url, model or token variable: all of them come from the defaults.
+        let input = r#"
+listen = "127.0.0.1:8080"
+
+[decision]
+inspect_body_bytes = 8192
+max_body_bytes = 10485760
+
+[default]
+status = 421
+"#;
+        let input = format!("{input}{SITE}");
+        let config = Config::from_toml_str_with_lookup(&input, |name| {
+            (name == "TYPESAFE_API_KEY").then(|| "jev-token".to_owned())
+        })?;
+        assert!(matches!(
+            &config.decision.backend,
+            BackendConfig::Jev { model, .. } if model == "jev-latest"
+        ));
+        assert_eq!(
+            config.decision.url.to_string(),
+            "https://api.typesafe.ai/v1/systemone"
+        );
+        assert_eq!(config.decision.timeout, Duration::from_millis(300));
         Ok(())
+    }
+
+    #[test]
+    fn default_backend_without_a_token_is_a_config_error() {
+        let input = config_with("").replace("backend = \"http\"\n", "");
+        assert!(matches!(
+            Config::from_toml_str_with_lookup(&input, |_| None),
+            Err(ConfigError::MissingApiToken { name }) if name == "TYPESAFE_API_KEY"
+        ));
     }
 
     #[test]
@@ -1007,26 +1173,22 @@ status = 421
     }
 
     #[test]
-    fn jev_without_a_model_is_rejected() {
+    fn jev_without_a_model_uses_the_default_model() -> Result<(), ConfigError> {
         let input = clef_toml("backend = \"jev\"\napi_token_env = \"CLEF_TOKEN\"");
+        let config = Config::from_toml_str_with_lookup(&input, lookup)?;
         assert!(matches!(
-            Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::MissingBackendField {
-                backend: "jev",
-                field: "model"
-            })
+            &config.decision.backend,
+            BackendConfig::Jev { model, .. } if model == "jev-latest"
         ));
+        Ok(())
     }
 
     #[test]
-    fn jev_without_a_token_variable_name_is_rejected() {
+    fn jev_without_a_token_variable_name_uses_the_default_name() {
         let input = clef_toml("backend = \"jev\"\nmodel = \"jev-latest\"");
         assert!(matches!(
             Config::from_toml_str_with_lookup(&input, lookup),
-            Err(ConfigError::MissingBackendField {
-                backend: "jev",
-                field: "api_token_env"
-            })
+            Err(ConfigError::MissingApiToken { name }) if name == "TYPESAFE_API_KEY"
         ));
     }
 
@@ -1039,6 +1201,148 @@ status = 421
             Config::from_toml_str(&format!("{input}{SITE}")),
             Err(ConfigError::InvalidDecisionUrl { .. })
         ));
+    }
+
+    #[test]
+    fn concurrency_and_connection_defaults_apply_when_keys_are_absent() -> Result<(), ConfigError> {
+        let input = r#"
+listen = "127.0.0.1:8080"
+
+[decision]
+backend = "http"
+url = "http://stub-decider:9000/decide"
+inspect_body_bytes = 8192
+max_body_bytes = 10485760
+
+[default]
+status = 421
+
+[[sites]]
+hosts = ["example.com"]
+upstream = "http://upstream:80"
+mode = "enforce"
+action = "block"
+"#;
+        let config = Config::from_toml_str_with_lookup(input, |_| None)?;
+        assert_eq!(config.max_connections, 1024);
+        assert_eq!(config.decision.max_concurrency, 64);
+        assert_eq!(config.decision.timeout, Duration::from_millis(300));
+        let site = config.sites.first().ok_or(ConfigError::NoSites)?;
+        assert_eq!(site.block_threshold, 0.87);
+        assert_eq!(site.instruction_threshold, 0.8);
+        assert_eq!(site.on_rate_limit, FailureAction::Allow);
+        assert_eq!(site.on_decision_error, FailureAction::Allow);
+        Ok(())
+    }
+
+    #[test]
+    fn failure_actions_accept_allow_and_block() -> Result<(), ConfigError> {
+        let input = config_with("on_rate_limit = \"block\"\non_decision_error = \"block\"");
+        let config = Config::from_toml_str(&input)?;
+        let site = config.sites.first().ok_or(ConfigError::NoSites)?;
+        assert_eq!(site.on_rate_limit, FailureAction::Block);
+        assert_eq!(site.on_decision_error, FailureAction::Block);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::rate_limit("on_rate_limit = \"deny\"")]
+    #[case::decision_error("on_decision_error = \"warn\"")]
+    fn unknown_failure_action_is_a_parse_error(#[case] line: &str) {
+        let input = config_with(line);
+        assert!(matches!(
+            Config::from_toml_str(&input),
+            Err(ConfigError::Parse(_))
+        ));
+    }
+
+    #[test]
+    fn queue_timeout_defaults_to_no_queueing() -> Result<(), ConfigError> {
+        let config = Config::from_toml_str(&config_with(""))?;
+        assert_eq!(config.decision.queue_timeout, Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn queue_timeout_longer_than_the_timeout_is_rejected() {
+        let input = DECISION.replace(
+            "timeout_ms = 150",
+            "timeout_ms = 150\nqueue_timeout_ms = 151",
+        );
+        assert!(matches!(
+            Config::from_toml_str(&format!("{input}{SITE}")),
+            Err(ConfigError::QueueTimeoutExceedsTimeout {
+                queue: 151,
+                timeout: 150
+            })
+        ));
+    }
+
+    #[test]
+    fn queue_timeout_equal_to_the_timeout_is_accepted() -> Result<(), ConfigError> {
+        let input = DECISION.replace(
+            "timeout_ms = 150",
+            "timeout_ms = 150\nqueue_timeout_ms = 150",
+        );
+        let config = Config::from_toml_str(&format!("{input}{SITE}"))?;
+        assert_eq!(config.decision.queue_timeout, Duration::from_millis(150));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_worker_threads_is_rejected() {
+        let input = format!("worker_threads = 0\n{}", config_with(""));
+        assert!(matches!(
+            Config::from_toml_str(&input),
+            Err(ConfigError::ZeroWorkerThreads)
+        ));
+    }
+
+    #[test]
+    fn worker_threads_is_optional_and_accepts_a_positive_count() -> Result<(), ConfigError> {
+        let absent = Config::from_toml_str(&config_with(""))?;
+        assert_eq!(absent.worker_threads, None);
+        let set = Config::from_toml_str(&format!("worker_threads = 4\n{}", config_with("")))?;
+        assert_eq!(set.worker_threads, Some(4));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_max_connections_is_rejected() {
+        let input = format!("max_connections = 0\n{}", config_with(""));
+        assert!(matches!(
+            Config::from_toml_str(&input),
+            Err(ConfigError::ZeroMaxConnections)
+        ));
+    }
+
+    #[test]
+    fn zero_max_concurrency_is_rejected() {
+        let input = DECISION.replace("timeout_ms = 150", "timeout_ms = 150\nmax_concurrency = 0");
+        assert!(matches!(
+            Config::from_toml_str(&format!("{input}{SITE}")),
+            Err(ConfigError::ZeroMaxConcurrency)
+        ));
+    }
+
+    #[test]
+    fn invalid_request_id_header_is_rejected() {
+        let input = format!("request_id_header = \"bad header\"\n{}", config_with(""));
+        assert!(matches!(
+            Config::from_toml_str(&input),
+            Err(ConfigError::InvalidRequestIdHeader { .. })
+        ));
+    }
+
+    #[test]
+    fn request_id_header_is_parsed_as_a_header_name() -> Result<(), ConfigError> {
+        let input = format!("request_id_header = \"X-Request-Id\"\n{}", config_with(""));
+        let config = Config::from_toml_str(&input)?;
+        assert_eq!(
+            config.request_id_header,
+            Some(HeaderName::from_static("x-request-id"))
+        );
+        Ok(())
     }
 
     #[test]

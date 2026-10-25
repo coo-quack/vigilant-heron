@@ -10,13 +10,30 @@ use vigilant_heron::{Config, LogFormat, serve};
 const DEFAULT_CONFIG_PATH: &str = "/etc/vigilant-heron/config.toml";
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let config_path = config_path(&args, std::env::var_os(CONFIG_ENV).map(PathBuf::from))?;
+    // The configuration is loaded before the runtime exists, because `worker_threads` sizes the runtime.
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     init_tracing(config.log_format);
+    let runtime = build_runtime(config.worker_threads)?;
+    runtime.block_on(run(config))
+}
+
+/// Builds the multi-thread runtime. Without `worker_threads`, tokio uses one worker per CPU core.
+fn build_runtime(worker_threads: Option<usize>) -> anyhow::Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    if let Some(threads) = worker_threads {
+        builder.worker_threads(threads);
+    }
+    builder
+        .enable_all()
+        .build()
+        .context("starting the async runtime")
+}
+
+async fn run(config: Config) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;

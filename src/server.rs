@@ -1,4 +1,8 @@
 //! The accept loop and the per-request pipeline.
+//!
+//! The order is fixed: site lookup, body limit, deterministic rules, backend
+//! call, policy. Rules are decided before the backend is called, so no failure
+//! setting can turn a rule block into an allow.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -21,18 +25,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::config::{BackendConfig, Config, DecisionConfig, SiteConfig};
-use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, decision_client};
-use crate::error::ServeError;
+use crate::config::{BackendConfig, Config, DecisionConfig, MAX_REQUEST_ID_BYTES, SiteConfig};
+use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
+use crate::error::{DecisionError, ServeError};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
 use crate::proxy::Proxy;
 use crate::router::{Router, normalize_host};
-use crate::sanitize::{self, EventInput};
+use crate::sanitize::{self, EventInput, truncate_utf8};
 use crate::system_one::SystemOneBackend;
-
-/// Upper bound on connections served at the same time.
-const MAX_CONNECTIONS: usize = 1024;
 
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
 
@@ -43,49 +44,64 @@ pub(crate) struct AppState<B> {
     router: Router,
     sites: Vec<SiteConfig>,
     decision: DecisionConfig,
+    /// Header names dropped before the event is sent to the backend.
+    backend_redact: Vec<String>,
     backend: B,
     proxy: Proxy,
     default_status: StatusCode,
     client_ip_header: Option<HeaderName>,
+    request_id_header: Option<HeaderName>,
 }
 
 impl AppState<Backend> {
     fn from_config(config: Config) -> Result<Self, ServeError> {
         let client = decision_client()?;
         let url = config.decision.url.clone();
-        let timeout = config.decision.timeout;
+        let limits = Limits {
+            timeout: config.decision.timeout,
+            queue_timeout: config.decision.queue_timeout,
+            slots: Arc::new(Semaphore::new(config.decision.max_concurrency)),
+        };
         let backend = match &config.decision.backend {
-            BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, timeout)),
+            BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, limits)),
             BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
                 client,
                 url,
                 model.as_str().to_owned(),
                 token.clone(),
-                timeout,
+                limits,
             )),
             BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
                 client,
                 url,
                 model.clone(),
                 token.clone(),
-                timeout,
+                limits,
             )),
         };
+        // The request-id header identifies the request to the proxy's log only.
+        let mut backend_redact = config.decision.redact_headers.clone();
+        if let Some(name) = &config.request_id_header {
+            backend_redact.push(name.as_str().to_owned());
+        }
         Ok(Self {
             router: Router::new(&config.sites),
             sites: config.sites,
             decision: config.decision,
+            backend_redact,
             backend,
             proxy: Proxy::new(),
             default_status: config.default_status,
             client_ip_header: config.client_ip_header,
+            request_id_header: config.request_id_header,
         })
     }
 }
 
 /// Serves requests on `listener` until `shutdown` completes.
 ///
-/// Requests in flight when `shutdown` completes are finished before this returns.
+/// At most `max_connections` connections are open at once. Requests in flight
+/// when `shutdown` completes are finished before this returns.
 ///
 /// # Errors
 ///
@@ -95,16 +111,7 @@ pub async fn serve(
     config: Config,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ServeError> {
-    serve_with_limit(listener, config, shutdown, MAX_CONNECTIONS).await
-}
-
-/// Runs [`serve`] with at most `max_connections` connections open at once.
-pub(crate) async fn serve_with_limit(
-    listener: TcpListener,
-    config: Config,
-    shutdown: impl Future<Output = ()>,
-    max_connections: usize,
-) -> Result<(), ServeError> {
+    let max_connections = config.max_connections;
     let state = Arc::new(AppState::from_config(config)?);
     let (stop_tx, stop_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
@@ -165,6 +172,13 @@ async fn serve_connection<B: DecisionBackend>(
     }
 }
 
+/// What the log records about the request before a decision is made.
+struct Trace<'a> {
+    client_ip: &'a str,
+    request_id: Option<&'a str>,
+    started: Instant,
+}
+
 async fn handle<B: DecisionBackend>(
     state: &AppState<B>,
     peer: SocketAddr,
@@ -172,7 +186,13 @@ async fn handle<B: DecisionBackend>(
 ) -> Response<ResponseBody> {
     let started = Instant::now();
     let client_ip = client_ip(state, request.headers(), peer);
+    let request_id = request_id(state, request.headers());
     let (parts, body) = request.into_parts();
+    let trace = Trace {
+        client_ip: &client_ip,
+        request_id: request_id.as_deref(),
+        started,
+    };
     let Some(site) = state
         .router
         .lookup(parts.headers.get(HOST))
@@ -184,14 +204,7 @@ async fn handle<B: DecisionBackend>(
             .and_then(|value| value.to_str().ok())
             .map(normalize_host)
             .unwrap_or_default();
-        return reject(
-            &parts,
-            &client_ip,
-            &host,
-            state.default_status,
-            "unknown_host",
-            started,
-        );
+        return reject(&parts, &trace, &host, state.default_status, "unknown_host");
     };
     let body = match Limited::new(body, state.decision.max_body_bytes)
         .collect()
@@ -201,21 +214,19 @@ async fn handle<B: DecisionBackend>(
         Err(error) if error.is::<LengthLimitError>() => {
             return reject(
                 &parts,
-                &client_ip,
+                &trace,
                 site_name(site),
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body_too_large",
-                started,
             );
         }
         Err(_) => {
             return reject(
                 &parts,
-                &client_ip,
+                &trace,
                 site_name(site),
                 StatusCode::BAD_REQUEST,
                 "unreadable_body",
-                started,
             );
         }
     };
@@ -235,7 +246,6 @@ async fn handle<B: DecisionBackend>(
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
     }
-    let fields = verdict_fields(&assessment);
     emit(&LogRecord {
         site: site_name(site),
         method: &parts.method,
@@ -243,12 +253,8 @@ async fn handle<B: DecisionBackend>(
         action: decision.action.name(),
         reason: decision.reason.name(),
         would_have: decision.would_have.as_ref().map_or("none", Action::name),
-        attack: fields.attack,
-        ai_instruction: fields.ai_instruction,
-        category: fields.category,
-        input_tokens: fields.input_tokens,
-        client_ip: &client_ip,
-        started,
+        verdict: verdict_fields(&assessment),
+        trace,
     });
     response
 }
@@ -317,12 +323,22 @@ async fn assess<B: DecisionBackend>(
                 body,
                 host,
                 client_ip,
-                redact_headers: &state.decision.redact_headers,
+                redact_headers: &state.backend_redact,
                 inspect_body_bytes: state.decision.inspect_body_bytes,
             });
             match state.backend.decide(&event).await {
                 Ok(verdict) => Assessment::Model(verdict),
-                Err(_) => Assessment::ModelFailed,
+                Err(DecisionError::Busy) => Assessment::RateLimited {
+                    cause: "backend_busy",
+                    retry_after: None,
+                },
+                Err(DecisionError::RateLimited { retry_after }) => Assessment::RateLimited {
+                    cause: "rate_limited",
+                    retry_after,
+                },
+                Err(error) => Assessment::DecisionFailed {
+                    cause: error.cause(),
+                },
             }
         }
     }
@@ -339,26 +355,16 @@ fn client_ip<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> S
         .map_or_else(|| peer.ip().to_string(), str::to_owned)
 }
 
-fn site_name(site: &SiteConfig) -> &str {
-    site.hosts.first().map_or("", String::as_str)
+/// Reads the configured request-id header, lossily decoded and cut to 128 bytes.
+fn request_id<B>(state: &AppState<B>, headers: &HeaderMap) -> Option<String> {
+    let name = state.request_id_header.as_ref()?;
+    let value = String::from_utf8_lossy(headers.get(name)?.as_bytes()).into_owned();
+    let (value, _cut) = truncate_utf8(value, MAX_REQUEST_ID_BYTES);
+    (!value.is_empty()).then_some(value)
 }
 
-/// Returns the scores and category to log. They are empty when no backend answered.
-fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
-    match assessment {
-        Assessment::Model(verdict) => VerdictFields {
-            attack: Some(verdict.attack.value()),
-            ai_instruction: Some(verdict.ai_instruction.value()),
-            category: verdict.category.as_deref(),
-            input_tokens: verdict.input_tokens,
-        },
-        _ => VerdictFields {
-            attack: None,
-            ai_instruction: None,
-            category: None,
-            input_tokens: None,
-        },
-    }
+fn site_name(site: &SiteConfig) -> &str {
+    site.hosts.first().map_or("", String::as_str)
 }
 
 /// The verdict fields written to the decision event. Each is empty when no backend answered.
@@ -367,16 +373,43 @@ struct VerdictFields<'a> {
     ai_instruction: Option<f64>,
     category: Option<&'a str>,
     input_tokens: Option<u64>,
+    decision_error: Option<&'a str>,
+    retry_after: Option<&'a str>,
+}
+
+fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
+    let mut fields = VerdictFields {
+        attack: None,
+        ai_instruction: None,
+        category: None,
+        input_tokens: None,
+        decision_error: None,
+        retry_after: None,
+    };
+    match assessment {
+        Assessment::Model(verdict) => {
+            fields.attack = Some(verdict.attack.value());
+            fields.ai_instruction = Some(verdict.ai_instruction.value());
+            fields.category = verdict.category.as_deref();
+            fields.input_tokens = verdict.input_tokens;
+        }
+        Assessment::RateLimited { cause, retry_after } => {
+            fields.decision_error = Some(cause);
+            fields.retry_after = retry_after.as_deref();
+        }
+        Assessment::DecisionFailed { cause } => fields.decision_error = Some(cause),
+        Assessment::Rule | Assessment::Skip => {}
+    }
+    fields
 }
 
 /// Answers a request that never reached a decision, and logs it as a rejection.
 fn reject(
     parts: &Parts,
-    client_ip: &str,
+    trace: &Trace<'_>,
     site: &str,
     status: StatusCode,
     reason: &str,
-    started: Instant,
 ) -> Response<ResponseBody> {
     emit(&LogRecord {
         site,
@@ -385,12 +418,19 @@ fn reject(
         action: "reject",
         reason,
         would_have: "none",
-        attack: None,
-        ai_instruction: None,
-        category: None,
-        input_tokens: None,
-        client_ip,
-        started,
+        verdict: VerdictFields {
+            attack: None,
+            ai_instruction: None,
+            category: None,
+            input_tokens: None,
+            decision_error: None,
+            retry_after: None,
+        },
+        trace: Trace {
+            client_ip: trace.client_ip,
+            request_id: trace.request_id,
+            started: trace.started,
+        },
     });
     status_response(status, "")
 }
@@ -415,16 +455,13 @@ struct LogRecord<'a> {
     action: &'a str,
     reason: &'a str,
     would_have: &'a str,
-    attack: Option<f64>,
-    ai_instruction: Option<f64>,
-    category: Option<&'a str>,
-    input_tokens: Option<u64>,
-    client_ip: &'a str,
-    started: Instant,
+    verdict: VerdictFields<'a>,
+    trace: Trace<'a>,
 }
 
 fn emit(record: &LogRecord<'_>) {
-    let latency_ms = u64::try_from(record.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let latency_ms = u64::try_from(record.trace.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let verdict = &record.verdict;
     tracing::info!(
         target: "vigilant_heron::decision",
         site = record.site,
@@ -433,12 +470,15 @@ fn emit(record: &LogRecord<'_>) {
         action = record.action,
         reason = record.reason,
         would_have = record.would_have,
-        attack = record.attack,
-        ai_instruction = record.ai_instruction,
-        category = record.category,
-        input_tokens = record.input_tokens,
+        attack = verdict.attack,
+        ai_instruction = verdict.ai_instruction,
+        category = verdict.category,
+        input_tokens = verdict.input_tokens,
+        decision_error = verdict.decision_error,
+        retry_after = verdict.retry_after,
+        request_id = record.trace.request_id,
         latency_ms,
-        client_ip = record.client_ip,
+        client_ip = record.trace.client_ip,
     );
 }
 
@@ -464,8 +504,10 @@ mod tests {
 
     const CONFIG: &str = r#"
 listen = "127.0.0.1:0"
+max_connections = 1
 
 [decision]
+backend = "http"
 url = "http://127.0.0.1:9/decide"
 timeout_ms = 150
 inspect_body_bytes = 512
@@ -492,14 +534,9 @@ instruction_threshold = 0.5
         // An idle connection takes the only slot and never sends a request.
         let _idle = TcpStream::connect(addr).await?;
         let (stop, stop_rx) = oneshot::channel::<()>();
-        let task = tokio::spawn(serve_with_limit(
-            listener,
-            config,
-            async {
-                let _ = stop_rx.await;
-            },
-            1,
-        ));
+        let task = tokio::spawn(serve(listener, config, async {
+            let _ = stop_rx.await;
+        }));
         tokio::time::sleep(Duration::from_millis(100)).await;
         let _ = stop.send(());
         let joined = tokio::time::timeout(Duration::from_secs(5), task).await?;

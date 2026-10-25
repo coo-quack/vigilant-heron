@@ -1,8 +1,11 @@
 //! The pure decision table that turns screening and verdicts into an action.
+//!
+//! Deterministic rules are decided before the backend is called, so the
+//! `Rule` assessment never depends on how a backend failure is configured.
 
 use http::HeaderValue;
 
-use crate::config::{Mode, SiteAction, SiteConfig};
+use crate::config::{FailureAction, Mode, SiteAction, SiteConfig};
 use crate::decision::Verdict;
 
 /// What the proxy does with a request.
@@ -30,18 +33,24 @@ impl Action {
 /// Why the action was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
-    /// A deny rule matched.
+    /// A deny rule matched; the backend was not called.
     Rule,
     /// The verdict reached a threshold.
     Model,
-    /// The backend failed on a path that must fail closed.
-    FailClosed,
-    /// The backend failed on an ordinary path.
-    FailOpen,
     /// A static asset skipped the backend.
     Skip,
     /// The verdict stayed below both thresholds.
     BelowThreshold,
+    /// The decision failed on a `fail_closed_paths` entry, whatever the failure.
+    FailClosedPath,
+    /// The backend rate-limited the request and the site allows it.
+    RateLimitedAllowed,
+    /// The backend rate-limited the request and the site blocks it.
+    RateLimitedBlocked,
+    /// The decision failed for another reason and the site allows it.
+    DecisionErrorAllowed,
+    /// The decision failed for another reason and the site blocks it.
+    DecisionErrorBlocked,
 }
 
 impl Reason {
@@ -50,10 +59,13 @@ impl Reason {
         match self {
             Self::Rule => "rule",
             Self::Model => "model",
-            Self::FailClosed => "fail_closed",
-            Self::FailOpen => "fail_open",
             Self::Skip => "skip",
             Self::BelowThreshold => "below_threshold",
+            Self::FailClosedPath => "fail_closed_path",
+            Self::RateLimitedAllowed => "rate_limited_allowed",
+            Self::RateLimitedBlocked => "rate_limited_blocked",
+            Self::DecisionErrorAllowed => "decision_error_allowed",
+            Self::DecisionErrorBlocked => "decision_error_blocked",
         }
     }
 }
@@ -67,8 +79,18 @@ pub(crate) enum Assessment {
     Skip,
     /// The backend returned a verdict.
     Model(Verdict),
-    /// The backend failed or timed out.
-    ModelFailed,
+    /// The backend rate-limited the request, or no local slot was free in time.
+    RateLimited {
+        /// Specific cause for the log, such as `rate_limited` or `backend_busy`.
+        cause: &'static str,
+        /// Raw `Retry-After` value, for the log only.
+        retry_after: Option<String>,
+    },
+    /// The backend failed for any other reason.
+    DecisionFailed {
+        /// Specific cause for the log, such as `timeout` or `http_status`.
+        cause: &'static str,
+    },
 }
 
 /// The result of applying the decision table.
@@ -93,10 +115,9 @@ pub(crate) fn decide(site: &SiteConfig, path: &str, assessment: &Assessment) -> 
             (site_action(site), Reason::Model)
         }
         Assessment::Model(_) => (Action::Allow, Reason::BelowThreshold),
-        Assessment::ModelFailed if fails_closed(site, path) => {
-            (site_action(site), Reason::FailClosed)
+        Assessment::RateLimited { .. } | Assessment::DecisionFailed { .. } => {
+            failure_outcome(site, path, assessment)
         }
-        Assessment::ModelFailed => (Action::Allow, Reason::FailOpen),
     };
     match site.mode {
         Mode::Enforce => Decision {
@@ -112,6 +133,26 @@ pub(crate) fn decide(site: &SiteConfig, path: &str, assessment: &Assessment) -> 
                 would_have,
             }
         }
+    }
+}
+
+/// Decides a request whose backend failed: `fail_closed_paths` always blocks, and
+/// otherwise the setting for the failure group decides.
+fn failure_outcome(site: &SiteConfig, path: &str, assessment: &Assessment) -> (Action, Reason) {
+    let rate_limited = matches!(assessment, Assessment::RateLimited { .. });
+    if fails_closed(site, path) {
+        return (site_action(site), Reason::FailClosedPath);
+    }
+    let setting = if rate_limited {
+        site.on_rate_limit
+    } else {
+        site.on_decision_error
+    };
+    match (rate_limited, setting) {
+        (true, FailureAction::Allow) => (Action::Allow, Reason::RateLimitedAllowed),
+        (true, FailureAction::Block) => (site_action(site), Reason::RateLimitedBlocked),
+        (false, FailureAction::Allow) => (Action::Allow, Reason::DecisionErrorAllowed),
+        (false, FailureAction::Block) => (site_action(site), Reason::DecisionErrorBlocked),
     }
 }
 
@@ -151,6 +192,17 @@ mod tests {
         parts.join("\n")
     }
 
+    fn rate_limited() -> Assessment {
+        Assessment::RateLimited {
+            cause: "rate_limited",
+            retry_after: None,
+        }
+    }
+
+    fn decision_failed() -> Assessment {
+        Assessment::DecisionFailed { cause: "timeout" }
+    }
+
     #[rstest]
     #[case::rule_blocks(fields(&[]), Assessment::Rule, "/x", "block", Reason::Rule, None)]
     #[case::rule_redirects(fields(&[REDIRECT]), Assessment::Rule, "/x", "redirect", Reason::Rule, None)]
@@ -165,13 +217,7 @@ mod tests {
     #[case::attack_in_shadow_records_block(fields(&[SHADOW]), Assessment::Model(verdict(0.95, 0.0)), "/x", "allow", Reason::Model, Some("block"))]
     #[case::attack_in_shadow_records_redirect(fields(&[SHADOW, REDIRECT]), Assessment::Model(verdict(0.95, 0.0)), "/x", "allow", Reason::Model, Some("redirect"))]
     #[case::low_scores_in_shadow_record_nothing(fields(&[SHADOW]), Assessment::Model(verdict(0.1, 0.1)), "/x", "allow", Reason::BelowThreshold, None)]
-    #[case::failure_on_fail_closed_path_blocks(fields(&[FAIL_CLOSED]), Assessment::ModelFailed, "/wp-login.php/slow", "block", Reason::FailClosed, None)]
-    #[case::failure_on_fail_closed_path_is_case_insensitive(fields(&[FAIL_CLOSED]), Assessment::ModelFailed, "/wp-login.php", "block", Reason::FailClosed, None)]
-    #[case::failure_on_fail_closed_path_redirects(fields(&[FAIL_CLOSED, REDIRECT]), Assessment::ModelFailed, "/wp-login.php", "redirect", Reason::FailClosed, None)]
-    #[case::failure_on_ordinary_path_allows(fields(&[FAIL_CLOSED]), Assessment::ModelFailed, "/index.php", "allow", Reason::FailOpen, None)]
-    #[case::failure_on_fail_closed_path_in_shadow(fields(&[FAIL_CLOSED, SHADOW]), Assessment::ModelFailed, "/wp-login.php", "allow", Reason::FailClosed, Some("block"))]
-    #[case::failure_on_ordinary_path_in_shadow(fields(&[FAIL_CLOSED, SHADOW]), Assessment::ModelFailed, "/index.php", "allow", Reason::FailOpen, None)]
-    fn decision_table(
+    fn verdict_and_rule_table(
         #[case] site_fields: String,
         #[case] assessment: Assessment,
         #[case] path: &str,
@@ -190,16 +236,203 @@ mod tests {
         Ok(())
     }
 
+    /// Every combination of failure group, setting, fail-closed match and mode.
     #[rstest]
-    #[case::double_slash("//wp-login.php")]
-    #[case::dot_segment("/./wp-login.php/slow")]
-    #[case::parent_segment("/x/../wp-login.php")]
-    #[case::encoded_dot_segment("/%2e/wp-login.php")]
-    fn fail_closed_applies_after_path_normalization(#[case] raw: &str) -> Result<(), ConfigError> {
-        let config = site(&fields(&[FAIL_CLOSED]))?;
-        let decision = decide(&config, &normalized_path(raw), &Assessment::ModelFailed);
-        assert_eq!(decision.reason, Reason::FailClosed);
-        assert_eq!(decision.action, Action::Block);
+    // group, setting, fail_closed path matched, mode, expected action, reason, would_have
+    #[case::rate_allow_open_enforce(
+        "rate",
+        "allow",
+        false,
+        "enforce",
+        "allow",
+        Reason::RateLimitedAllowed,
+        None
+    )]
+    #[case::rate_allow_closed_enforce(
+        "rate",
+        "allow",
+        true,
+        "enforce",
+        "block",
+        Reason::FailClosedPath,
+        None
+    )]
+    #[case::rate_block_open_enforce(
+        "rate",
+        "block",
+        false,
+        "enforce",
+        "block",
+        Reason::RateLimitedBlocked,
+        None
+    )]
+    #[case::rate_block_closed_enforce(
+        "rate",
+        "block",
+        true,
+        "enforce",
+        "block",
+        Reason::FailClosedPath,
+        None
+    )]
+    #[case::rate_allow_open_shadow(
+        "rate",
+        "allow",
+        false,
+        "shadow",
+        "allow",
+        Reason::RateLimitedAllowed,
+        None
+    )]
+    #[case::rate_allow_closed_shadow(
+        "rate",
+        "allow",
+        true,
+        "shadow",
+        "allow",
+        Reason::FailClosedPath,
+        Some("block")
+    )]
+    #[case::rate_block_open_shadow(
+        "rate",
+        "block",
+        false,
+        "shadow",
+        "allow",
+        Reason::RateLimitedBlocked,
+        Some("block")
+    )]
+    #[case::rate_block_closed_shadow(
+        "rate",
+        "block",
+        true,
+        "shadow",
+        "allow",
+        Reason::FailClosedPath,
+        Some("block")
+    )]
+    #[case::error_allow_open_enforce(
+        "error",
+        "allow",
+        false,
+        "enforce",
+        "allow",
+        Reason::DecisionErrorAllowed,
+        None
+    )]
+    #[case::error_allow_closed_enforce(
+        "error",
+        "allow",
+        true,
+        "enforce",
+        "block",
+        Reason::FailClosedPath,
+        None
+    )]
+    #[case::error_block_open_enforce(
+        "error",
+        "block",
+        false,
+        "enforce",
+        "block",
+        Reason::DecisionErrorBlocked,
+        None
+    )]
+    #[case::error_block_closed_enforce(
+        "error",
+        "block",
+        true,
+        "enforce",
+        "block",
+        Reason::FailClosedPath,
+        None
+    )]
+    #[case::error_allow_open_shadow(
+        "error",
+        "allow",
+        false,
+        "shadow",
+        "allow",
+        Reason::DecisionErrorAllowed,
+        None
+    )]
+    #[case::error_allow_closed_shadow(
+        "error",
+        "allow",
+        true,
+        "shadow",
+        "allow",
+        Reason::FailClosedPath,
+        Some("block")
+    )]
+    #[case::error_block_open_shadow(
+        "error",
+        "block",
+        false,
+        "shadow",
+        "allow",
+        Reason::DecisionErrorBlocked,
+        Some("block")
+    )]
+    #[case::error_block_closed_shadow(
+        "error",
+        "block",
+        true,
+        "shadow",
+        "allow",
+        Reason::FailClosedPath,
+        Some("block")
+    )]
+    fn failure_table(
+        #[case] group: &str,
+        #[case] setting: &str,
+        #[case] fail_closed: bool,
+        #[case] mode: &str,
+        #[case] expected_action: &str,
+        #[case] expected_reason: Reason,
+        #[case] expected_would_have: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        let key = if group == "rate" {
+            "on_rate_limit"
+        } else {
+            "on_decision_error"
+        };
+        let setting_line = format!("{key} = \"{setting}\"");
+        let mode_line = format!("mode = \"{mode}\"");
+        let config_fields = [FAIL_CLOSED.to_owned(), setting_line, mode_line];
+        let config = site(&config_fields.join("\n"))?;
+        let path = if fail_closed {
+            "/wp-login.php"
+        } else {
+            "/index.php"
+        };
+        let assessment = if group == "rate" {
+            rate_limited()
+        } else {
+            decision_failed()
+        };
+        let decision = decide(&config, path, &assessment);
+        assert_eq!(decision.action.name(), expected_action);
+        assert_eq!(decision.reason, expected_reason);
+        assert_eq!(
+            decision.would_have.as_ref().map(Action::name),
+            expected_would_have
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rule_is_decided_regardless_of_failure_settings() -> Result<(), ConfigError> {
+        for setting in ["allow", "block"] {
+            let config = site(&fields(&[
+                "deny_paths = [\"/.env\"]",
+                &format!("on_rate_limit = \"{setting}\""),
+                &format!("on_decision_error = \"{setting}\""),
+            ]))?;
+            let decision = decide(&config, &normalized_path("/.env"), &Assessment::Rule);
+            assert_eq!(decision.action, Action::Block);
+            assert_eq!(decision.reason, Reason::Rule);
+        }
         Ok(())
     }
 
@@ -222,11 +455,24 @@ mod tests {
         for assessment in [
             Assessment::Rule,
             Assessment::Model(verdict(1.0, 1.0)),
-            Assessment::ModelFailed,
+            decision_failed(),
         ] {
             let decision = decide(&config, "/wp-login.php", &assessment);
             assert_eq!(decision.action, Action::Allow);
         }
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::double_slash("//wp-login.php")]
+    #[case::dot_segment("/./wp-login.php/slow")]
+    #[case::parent_segment("/x/../wp-login.php")]
+    #[case::encoded_dot_segment("/%2e/wp-login.php")]
+    fn fail_closed_applies_after_path_normalization(#[case] raw: &str) -> Result<(), ConfigError> {
+        let config = site(&fields(&[FAIL_CLOSED]))?;
+        let decision = decide(&config, &normalized_path(raw), &decision_failed());
+        assert_eq!(decision.reason, Reason::FailClosedPath);
+        assert_eq!(decision.action, Action::Block);
         Ok(())
     }
 }

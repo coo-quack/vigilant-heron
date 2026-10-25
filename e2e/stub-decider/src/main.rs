@@ -9,12 +9,13 @@
 //! held for one second before the answer.
 
 use std::convert::Infallible;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -33,10 +34,20 @@ const INSTRUCTION_MARKERS: [&str; 2] = ["ignore previous", "answer benign"];
 const HIGH: f64 = 0.99;
 const LOW: f64 = 0.01;
 const SLOW_MARKER: &str = "/slow";
+/// A request whose path contains this is answered with HTTP 429 and `Retry-After`.
+const RATE_LIMIT_MARKER: &str = "/ratelimited";
 const SLOW_DELAY: Duration = Duration::from_secs(1);
+
+/// Extra delay added to every decision, from `STUB_DELAY_MS` (used by the load test).
+static DELAY: OnceLock<Duration> = OnceLock::new();
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
+    let delay_ms = std::env::var("STUB_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let _ = DELAY.set(Duration::from_millis(delay_ms));
     let listener = TcpListener::bind(LISTEN).await?;
     loop {
         let (stream, _peer) = listener.accept().await?;
@@ -78,16 +89,19 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
             &json!({"error": "invalid JSON"}),
         ));
     };
-    if path == DECIDE_PATH {
-        return Ok(decide(&payload).await);
-    }
-    if (path == CLEF_PATH || path == JEV_PATH) && !authorized {
+    if path != DECIDE_PATH && !authorized {
         return Ok(reply(
             StatusCode::UNAUTHORIZED,
             &json!({"result": null, "success": false,
                     "errors": [{"code": 10000, "message": "Authentication error"}],
                     "messages": []}),
         ));
+    }
+    if untrusted_path(&payload, &path).is_some_and(|text| text.contains(RATE_LIMIT_MARKER)) {
+        return Ok(rate_limited());
+    }
+    if path == DECIDE_PATH {
+        return Ok(decide(&payload).await);
     }
     if path == JEV_PATH {
         return Ok(jev(&payload).await);
@@ -171,6 +185,9 @@ async fn score(untrusted: &Value) -> Verdict {
     if path.contains(SLOW_MARKER) {
         tokio::time::sleep(SLOW_DELAY).await;
     }
+    if let Some(delay) = DELAY.get().filter(|delay| !delay.is_zero()) {
+        tokio::time::sleep(*delay).await;
+    }
     let content = decode_for_scan(&scan_text(untrusted));
     let attack = contains_any(&content, &ATTACK_MARKERS);
     let category = if !attack {
@@ -218,6 +235,29 @@ fn decode_for_scan(text: &str) -> String {
 
 fn contains_any(content: &str, markers: &[&str]) -> bool {
     markers.iter().any(|marker| content.contains(marker))
+}
+
+/// The path field of the attacker-controlled part of a request, for either protocol.
+fn untrusted_path<'a>(payload: &'a Value, route: &str) -> Option<&'a str> {
+    let untrusted = if route == DECIDE_PATH {
+        payload.pointer("/event/untrusted")
+    } else {
+        payload.pointer("/state/untrusted_http_request")
+    };
+    untrusted
+        .and_then(|value| value.get("path"))
+        .and_then(Value::as_str)
+}
+
+fn rate_limited() -> Response<Full<Bytes>> {
+    let mut response = reply(
+        StatusCode::TOO_MANY_REQUESTS,
+        &json!({"error": "rate limited", "success": false}),
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("2"));
+    response
 }
 
 fn reply(status: StatusCode, body: &Value) -> Response<Full<Bytes>> {

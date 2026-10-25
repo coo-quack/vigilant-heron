@@ -329,6 +329,7 @@ pub(crate) fn config_text(decide_url: &str, upstream_url: &str, timeout_ms: u64)
 listen = "127.0.0.1:0"
 
 [decision]
+backend = "http"
 url = "{decide_url}"
 timeout_ms = {timeout_ms}
 inspect_body_bytes = 512

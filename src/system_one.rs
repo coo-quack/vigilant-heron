@@ -7,12 +7,11 @@
 //! `state.untrusted_http_request` and nowhere else in the request.
 
 use std::fmt;
-use std::time::Duration;
 
 use http::Uri;
 use serde_json::{Map, Value, json};
 
-use crate::decision::{DecisionBackend, DecisionClient, Probability, Verdict, post_json};
+use crate::decision::{DecisionBackend, DecisionClient, Limits, Probability, Verdict, post_json};
 use crate::error::DecisionError;
 use crate::sanitize::DecisionEvent;
 
@@ -272,7 +271,7 @@ pub(crate) struct SystemOneBackend {
     url: Uri,
     model: String,
     token: ApiToken,
-    timeout: Duration,
+    limits: Limits,
 }
 
 impl SystemOneBackend {
@@ -282,14 +281,14 @@ impl SystemOneBackend {
         url: Uri,
         model: String,
         token: ApiToken,
-        timeout: Duration,
+        limits: Limits,
     ) -> Self {
         Self {
             client,
             url,
             model,
             token,
-            timeout,
+            limits,
         }
     }
 }
@@ -302,7 +301,7 @@ impl DecisionBackend for SystemOneBackend {
             &self.url,
             Some(self.token.expose()),
             payload,
-            self.timeout,
+            &self.limits,
         )
         .await?;
         parse_response(&body)
