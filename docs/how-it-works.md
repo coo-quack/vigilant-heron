@@ -1,0 +1,146 @@
+# How it works
+
+For each request, vigilant-heron selects a site by its `Host`, checks the request
+against limits, an access list and rules, asks the decision backend only when
+none of those decide, and then applies the site's policy. A request that a
+deterministic check blocks never reaches the backend, and no backend answer can
+turn a block into an allow.
+
+## Evaluation order
+
+Each request goes through these steps, in this order. The first step that
+decides the request ends the evaluation.
+
+0. **Limits.** `limit_req` and `limit_conn` run first, before the access list and
+   before the body is read. A request over a limit gets the limit's status
+   (503 by default) and is never forwarded. In a shadow site it is forwarded and
+   recorded with `would_have=reject`.
+1. **Access list.** The `allow` and `deny` entries are checked in order by the
+   client address. A denied client gets 403 with reason `access_denied`. The
+   site's `action` does not apply.
+2. **`deny_path`.** A path prefix of the site that matches the normalized request
+   is a block (reason `rule`, no rule id).
+3. **Block rules.** The built-in rules that are on, then the top-level block
+   rules in file order, then the site's block rules. The first match blocks.
+4. **Skip rules.** The top-level skip rules, then the site's. The first match
+   forwards the request without calling the backend (reason `skip_rule`).
+5. **Static assets.** A plain GET or HEAD for a path with a static extension and
+   no query and no body is forwarded without calling the backend (reason `skip`).
+6. **Decision model.** The request is sent to the backend, and the policy
+   compares the returned scores with `block_threshold` and
+   `instruction_threshold`. The outcome is `model` when a threshold is reached and
+   `below_threshold` otherwise.
+
+Steps 2 to 5 are the deterministic checks. Every one of them runs before the
+backend is called, so the backend's health, its rate limits and the failure
+settings have no effect on them. A rule block stays a block when the backend is
+down, slow or saturated. Block rules are always checked before skip rules, so a
+skip rule never lets through a request that a block rule matches.
+
+The normalized request is used for matching only. What reaches the upstream is
+the request as the client sent it, apart from the headers changed by
+`proxy_set_header`.
+
+## Block, redirect or forward
+
+A blocked request gets the site's `action`: `block` (the `block_status`, 403 by
+default, with the `block_page` if one is set) or `redirect <url>` (302 to the
+given location). An allowed request is forwarded to the upstream. The upstream
+receives the whole body; the router reads only the first `inspect_body` bytes
+for the decision and streams the rest as the upstream reads it.
+
+## Failure behavior
+
+A decision can fail in two ways, and each has its own site setting. Both default
+to `allow`.
+
+- **`on_rate_limit`** covers the backend's HTTP 429 and a request that finds no
+  free concurrency slot within `queue_timeout` (`backend_busy`).
+- **`on_decision_error`** covers timeouts, connection errors, other non-2xx
+  statuses, and answers that cannot be parsed or are out of range.
+
+Set each to `allow` or `block`. A saturated backend is always in the rate-limit
+group, so `on_decision_error` never applies to it.
+
+Two more rules apply to failures:
+
+- A failure on a `fail_closed_path` prefix is always blocked, whatever the two
+  settings say.
+- A rule decision is not affected by any of these settings.
+
+The decision log records the outcome in `reason`, one of `rate_limited_allowed`,
+`rate_limited_blocked`, `decision_error_allowed`, `decision_error_blocked` or
+`fail_closed_path`. The cause is in `decision_error`: `rate_limited`,
+`backend_busy`, `timeout`, `http_status` or `parse`.
+
+```nginx
+site example.com {
+    upstream http://app:8080;
+    on_rate_limit allow;
+    on_decision_error block;
+    fail_closed_path /wp-login.php /wp-admin;
+}
+```
+
+With these settings, a rate-limited decision is allowed, except on the login
+paths, which are blocked whatever the failure. Any other decision error blocks
+the request.
+
+## Shadow mode
+
+`mode shadow;` turns every enforcement into a record. The request is forwarded,
+whatever the verdict, and the access log and the optional debug header show what
+would have happened:
+
+- `would_have` is `block` or `redirect` for a decision by the rules, the access
+  list or the model, and `reject` for a limit. It is empty when the request would
+  have been forwarded anyway.
+- `action` and `reason` show the decision that was made.
+
+Rules, the access list and the limits are included. In shadow mode a limit is a
+dry run and a denial is recorded, not enforced. Use shadow mode to measure what a
+rule or a threshold would do on real traffic before you enforce it.
+
+`debug_headers on;` adds an `x-vigilant-heron` response header with `action`,
+`reason` and `would_have`. Turn it off on a public site, because it tells a
+client which rule or threshold blocked it.
+
+## What the backend receives
+
+Only a sanitized copy of the request goes to the decision backend. Before it is
+sent:
+
+- Credential headers are removed. `cookie`, `authorization`,
+  `proxy-authorization`, `x-api-key` and `x-auth-token` are always dropped, and
+  each name in `redact_header` is dropped too.
+- Form and JSON bodies are scanned for sensitive fields. A field whose name
+  contains `password`, `passwd`, `pwd`, `secret`, `token`, `api_key`, `apikey`,
+  `card`, `cvv` or `ssn` has its value replaced by `[REDACTED]`. Text that is
+  neither form data nor valid JSON is scanned for `key=value` pairs and
+  `"key": value` pairs with the same names.
+- Only the first `inspect_body` bytes of the body are sent, cut on a UTF-8 boundary.
+  `body_truncated` is set when the body was longer.
+
+All of the client's data sits under `untrusted`, so the backend is told to read
+it as data and not as instructions. The event has this shape:
+
+```json
+{"event": {
+  "untrusted": {"method": "POST", "path": "/login", "query": null,
+                "headers": [["user-agent", "…"]], "body": "user=alice&password=[REDACTED]"},
+  "meta": {"host": "example.com", "client_ip": "203.0.113.7", "body_truncated": false}
+}}
+```
+
+The `path` and `query` are the raw values. Normalization applies to matching only.
+The `meta` fields are set by the router, not by the client.
+
+Redaction is a best effort on names. A secret stored under a name without one of
+the listed words is sent as it is. Read [Security](/security) for what this means
+in practice, and for what the decision model can and cannot see.
+
+## Where to go next
+
+- [Rules](/rules) describes the rule syntax and the access list.
+- [Limits](/limits) describes the request-rate and connection limits.
+- [Decision backends](/decision-backends) describes the thresholds and the protocols.

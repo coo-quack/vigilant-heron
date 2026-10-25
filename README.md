@@ -1,9 +1,13 @@
+<img src="docs/public/logo.svg" width="120" alt="vigilant-heron">
+
 # vigilant-heron
 
 A reverse-proxy router that checks each web request with a typed decision
 model and blocks it, redirects it, or forwards it to the site's upstream.
 
 > Status: early development. Run new sites in `shadow` mode first.
+
+The full reference (configuration, rules, limits, logging and timeouts) is in [`docs/`](docs/).
 
 ## How it works
 

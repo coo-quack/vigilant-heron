@@ -46,3 +46,9 @@ pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
 pub use server::{serve, serve_reloadable};
 pub use system_one::{ApiToken, ClefModel};
+
+/// The directive names the parser accepts, read by the documentation drift check in `tests/docs.rs`.
+#[doc(hidden)]
+pub mod directives {
+    pub use crate::config::{DECISION_DIRECTIVES, SITE_DIRECTIVES, TOP_LEVEL_DIRECTIVES};
+}
