@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue};
+use http::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue, UPGRADE};
 use http::{Request, Response, Uri};
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
@@ -96,6 +96,11 @@ impl Proxy {
             client: Client::builder(TokioExecutor::new()).build(connector),
             read_timeout: timeouts.proxy_read_timeout,
         }
+    }
+
+    /// The `proxy_read_timeout` of the site: the wait for a response head, and the idle limit of a tunnel.
+    pub(crate) fn read_timeout(&self) -> Duration {
+        self.read_timeout
     }
 
     /// Forwards a request with `method`, `path_and_query` and the given `headers` to `upstream`.
@@ -403,6 +408,24 @@ pub(crate) fn upstream_headers(
     headers
 }
 
+/// The `Upgrade` value of a request that asks to switch protocols: its `Connection`
+/// header lists `upgrade` and it has a non-empty `Upgrade` header.
+pub(crate) fn upgrade_request(headers: &HeaderMap) -> Option<HeaderValue> {
+    let asks = headers
+        .get_all(CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+    if !asks {
+        return None;
+    }
+    headers
+        .get(UPGRADE)
+        .filter(|value| !value.is_empty())
+        .cloned()
+}
+
 /// Copies request headers for the upstream and appends the peer to `x-forwarded-for`.
 pub(crate) fn forwarded_headers(original: &HeaderMap, peer: IpAddr) -> HeaderMap {
     let mut headers = original.clone();
@@ -592,5 +615,26 @@ mod header_tests {
             Some(&b"203.0.113.7"[..])
         );
         Ok(())
+    }
+
+    #[rstest]
+    #[case::upgrade_listed("upgrade", "websocket", true)]
+    #[case::listed_among_others("keep-alive, Upgrade", "websocket", true)]
+    #[case::no_connection_upgrade("keep-alive", "websocket", false)]
+    #[case::upgrade_without_header("upgrade", "", false)]
+    fn upgrade_requests_need_both_headers(
+        #[case] connection: &str,
+        #[case] upgrade: &str,
+        #[case] expected: bool,
+    ) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONNECTION,
+            HeaderValue::from_str(connection).unwrap_or_else(|_| HeaderValue::from_static("")),
+        );
+        if !upgrade.is_empty() {
+            headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        }
+        assert_eq!(upgrade_request(&headers).is_some(), expected);
     }
 }

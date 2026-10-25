@@ -35,7 +35,8 @@ src/
   realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
   accesslog.rs   # log_format compiler, variables, escaping, built-in json and main formats
   logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog, error log
-  router.rs      # Host normalization and site lookup
+  router.rs      # Host normalization and site lookup: exact, leading and trailing wildcards, ~regex, default_server
+  block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
   limits.rs      # limit_req / limit_conn zones, leaky bucket, connection counts, location selection; runs first
   rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
@@ -44,7 +45,8 @@ src/
   decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
-  proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers
+  proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers, proxy_set_header
+  tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits
   transport.rs   # Client socket: header, keep-alive and send timers, header limits (414/400); upstream send timer
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
   server.rs      # Accept loop and per-request pipeline, access records
@@ -58,6 +60,10 @@ tests/
   logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off
   rules.rs       # Access list and rule decisions in-process: order, shadow mode, logging, backend failures
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
+  block.rs       # block_status and block_page responses, including 444 and location overrides
+  cli.rs         # The binary in -t mode: results, exit codes, no bind
+  headers.rs     # proxy_set_header: variables, removal, inheritance, location replacement
+  websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack

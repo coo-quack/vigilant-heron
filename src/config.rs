@@ -233,6 +233,8 @@ pub struct SiteConfig {
     pub block: BlockResponse,
     /// The `proxy_set_header` operations applied to forwarded requests, unless a location overrides them.
     pub(crate) proxy_headers: Vec<HeaderOp>,
+    /// Whether Upgrade requests are tunnelled (`proxy_websocket on`), unless a location overrides it.
+    pub websocket: bool,
     /// The parsed host names, in configuration order.
     pub(crate) host_patterns: Vec<HostPattern>,
     /// Absolute `http://` URI requests are forwarded to.
@@ -507,7 +509,7 @@ fn split_unit(text: &str) -> (&str, &str) {
     text.split_at(split)
 }
 
-fn parse_bool(directive: &Directive, text: &str) -> Result<bool, ConfigError> {
+pub(crate) fn parse_bool(directive: &Directive, text: &str) -> Result<bool, ConfigError> {
     match text {
         "on" => Ok(true),
         "off" => Ok(false),
@@ -1547,6 +1549,7 @@ fn parse_site(
     let mut pending_locations = Vec::new();
     let mut site_block = BlockOverrides::default();
     let mut site_headers: Option<Vec<HeaderOp>> = None;
+    let mut websocket = false;
 
     for child in block(directive)? {
         match child.name.as_str() {
@@ -1671,6 +1674,10 @@ fn parse_site(
                 site_limits.apply(child, top.zones, &mut seen)?;
             }
             name if BLOCK_NAMES.contains(&name) => site_block.apply(child, &mut seen)?,
+            "proxy_websocket" => {
+                once(&mut seen, child)?;
+                websocket = parse_bool(child, one_arg(child)?)?;
+            }
             "proxy_set_header" => site_headers
                 .get_or_insert_with(Vec::new)
                 .push(HeaderOp::parse(child)?),
@@ -1711,6 +1718,7 @@ fn parse_site(
             limits: pending.overrides.resolve(&site_limit_set),
             block: pending.block.resolve(&block_response),
             proxy_headers: pending.headers.unwrap_or_else(|| proxy_headers.clone()),
+            websocket: pending.websocket.unwrap_or(websocket),
         });
     }
 
@@ -1753,6 +1761,7 @@ fn parse_site(
         host_patterns,
         block: block_response,
         proxy_headers,
+        websocket,
         upstream,
         mode,
         action,
@@ -2494,6 +2503,38 @@ mod tests {
             "default.conf",
         );
         assert!(message(result.map(|_| ())).contains("takes no arguments"));
+    }
+
+    #[test]
+    fn proxy_websocket_takes_on_or_off_and_is_off_by_default() -> Result<(), ConfigError> {
+        let off = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n}\n"),
+            "ws.conf",
+        )?;
+        assert!(!off.sites.first().is_some_and(|site| site.websocket));
+        let on = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n    proxy_websocket on;\n}\n"),
+            "ws.conf",
+        )?;
+        assert!(on.sites.first().is_some_and(|site| site.websocket));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_websocket_rejects_other_values_and_top_level_use() {
+        let value = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n    proxy_websocket yes;\n}\n"),
+            "ws.conf",
+        );
+        assert!(value.is_err());
+        let top = Config::parse_str(
+            &format!(
+                "proxy_websocket on;\n{}",
+                with_sites("site a.test {\n    upstream http://u:80;\n}\n")
+            ),
+            "ws.conf",
+        );
+        assert!(message(top.map(|_| ())).contains("unknown directive \"proxy_websocket\""));
     }
 }
 

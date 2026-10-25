@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION,
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION, UPGRADE,
 };
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -27,6 +27,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -45,7 +46,7 @@ use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, 
 use crate::logsink::{Writer, spawn_writer};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
-use crate::proxy::{HeaderContext, HeaderOp, Proxy, upstream_headers};
+use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
 use crate::realip::RealIp;
 use crate::router::{Router, normalize_host};
 use crate::rules::RuleInput;
@@ -54,6 +55,7 @@ use crate::system_one::SystemOneBackend;
 use crate::transport::{
     ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Phase, PhaseCell, Rejection, RejectionSlot, lock,
 };
+use crate::tunnel;
 
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
 
@@ -268,7 +270,8 @@ async fn serve_connection<B: DecisionBackend>(
         let connection = Arc::clone(&connection);
         async move { handle(&state, &connection, peer, request).await }
     });
-    let connection_future = builder.serve_connection(io, service);
+    // `with_upgrades` keeps the connection driven until an upgraded tunnel takes it over.
+    let connection_future = builder.serve_connection(io, service).with_upgrades();
     let mut connection_future = pin!(connection_future);
     tokio::select! {
         result = connection_future.as_mut() => {
@@ -291,6 +294,8 @@ async fn serve_connection<B: DecisionBackend>(
 
 /// Facts about a request that are known before its decision.
 struct Trace<'a> {
+    /// The upgrade of the client connection, taken by a tunnel that the request starts.
+    upgrade: Mutex<Option<OnUpgrade>>,
     client_addr: IpAddr,
     client_ip: &'a str,
     remote_addr: &'a str,
@@ -310,7 +315,7 @@ async fn handle<B: DecisionBackend>(
     state: &AppState<B>,
     connection: &Connection,
     peer: SocketAddr,
-    request: Request<Incoming>,
+    mut request: Request<Incoming>,
 ) -> Result<Response<ResponseBody>, std::io::Error> {
     let started = Instant::now();
     connection.phase.set(Phase::Busy);
@@ -322,9 +327,11 @@ async fn handle<B: DecisionBackend>(
     let client = client_addr.to_string();
     let request_id = request_id(state, request.headers());
     let remote = peer.ip().to_string();
+    let client_upgrade = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
     let done = Arc::new(AtomicBool::new(body.is_end_stream()));
     let trace = Trace {
+        upgrade: Mutex::new(Some(client_upgrade)),
         client_addr,
         client_ip: &client,
         remote_addr: &remote,
@@ -546,8 +553,10 @@ async fn pipeline<B: DecisionBackend>(
         headers: header_ops,
         block,
         ctx,
+        websocket: location.map_or(site.websocket, |location| location.websocket),
+        client_upgrade: &trace.upgrade,
     };
-    let outcome = respond(&delivery, parts, body, peer, &decision).await;
+    let outcome = respond(&delivery, parts, body, peer, &decision, held).await;
     let mut response = outcome.response;
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
@@ -643,6 +652,10 @@ struct Delivery<'a> {
     block: &'a BlockResponse,
     /// The values `proxy_set_header` values may use.
     ctx: HeaderContext<'a>,
+    /// Whether an Upgrade request is tunnelled (`proxy_websocket on`).
+    websocket: bool,
+    /// The client connection's upgrade, which the tunnel takes when the upstream switches protocols.
+    client_upgrade: &'a Mutex<Option<OnUpgrade>>,
 }
 
 /// Forwards an allowed request, or answers a block or redirect.
@@ -656,6 +669,7 @@ async fn respond(
     body: ClientBody,
     peer: SocketAddr,
     decision: &Decision,
+    held: &mut Vec<ConnPermit>,
 ) -> Outcome {
     let complete = body.is_complete();
     let block = delivery.block;
@@ -665,8 +679,18 @@ async fn respond(
                 .uri
                 .path_and_query()
                 .map_or("/", |value| value.as_str());
-            let headers =
+            // An Upgrade request keeps its Upgrade and Connection headers only when the site tunnels them.
+            let upgrade = if delivery.websocket {
+                upgrade_request(&parts.headers)
+            } else {
+                None
+            };
+            let mut headers =
                 upstream_headers(&parts.headers, peer.ip(), delivery.headers, &delivery.ctx);
+            if let Some(protocol) = &upgrade {
+                headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+                headers.insert(UPGRADE, protocol.clone());
+            }
             match delivery
                 .proxy
                 .forward(
@@ -678,10 +702,31 @@ async fn respond(
                 )
                 .await
             {
-                Ok(upstream) => {
+                Ok(mut upstream) => {
                     let status = upstream.status().as_u16();
+                    // A 101 answer to an Upgrade request starts a tunnel; its headers are kept.
+                    let switching = upgrade.is_some() && status == 101;
+                    let client_upgrade = if switching {
+                        lock(delivery.client_upgrade).take()
+                    } else {
+                        None
+                    };
+                    let upstream_upgrade = client_upgrade
+                        .as_ref()
+                        .map(|_| hyper::upgrade::on(&mut upstream));
+                    let tunnel = upstream_upgrade.is_some();
                     let (mut upstream_parts, upstream_body) = upstream.into_parts();
-                    crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
+                    if !tunnel {
+                        crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
+                    }
+                    if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
+                        tunnel::spawn(
+                            client,
+                            upstream,
+                            delivery.proxy.read_timeout(),
+                            std::mem::take(held),
+                        );
+                    }
                     Outcome {
                         response: Response::from_parts(upstream_parts, upstream_body.boxed()),
                         upstream_status: Some(status),

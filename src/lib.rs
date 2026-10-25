@@ -32,6 +32,7 @@ mod system_one;
 #[cfg(test)]
 mod test_support;
 mod transport;
+mod tunnel;
 
 pub use accesslog::LogFormat;
 pub use block::{BlockResponse, BlockStatus};

@@ -515,6 +515,30 @@ proxy_set_header X-Forwarded-Proto "$http_x_forwarded_proto";
 upstream gets no `X-Forwarded-Proto`. The edge (nginx or Cloudflare) has to set
 it for it to arrive.
 
+### WebSocket
+
+`proxy_websocket on;` in a `site` or a `location` lets HTTP/1.1 `Upgrade`
+requests (WebSocket, mainly) reach the upstream. The default is `off`, and then
+an Upgrade request is screened and forwarded as an ordinary request, without
+the upgrade headers.
+
+With `on`, the handshake goes through the same screening as any request: the
+limits, the access list, the rules and the decision model. A blocked handshake
+gets the block response and no upgrade. An allowed one is forwarded with its
+`Upgrade` and `Connection` headers. When the upstream answers `101 Switching
+Protocols`, the two connections are joined and their bytes are copied both ways.
+
+- Only the handshake is judged. Frames are not inspected, so a payload that
+  attacks the upstream after the handshake is not seen.
+- The tunnel closes when either side closes, or when neither side has moved a
+  byte for `proxy_read_timeout` (60s by default).
+- While a tunnel is open it counts against `limit_conn`, like any connection.
+- Shutdown does not wait for open tunnels: they end on their own timeout or when
+  the connection closes.
+
+The edge must forward the upgrade too. With nginx in front, use
+`proxy_http_version 1.1;` and pass `Upgrade` and `Connection` (see `e2e/`).
+
 Times take `ms`, `s`, `m` or `h` (a bare number is seconds, as in nginx). Sizes
 take `k`, `m` or `g`. Every error names the file and line, for example
 `vigilant-heron.conf:12: "block_threshold" must be between 0 and 1`.

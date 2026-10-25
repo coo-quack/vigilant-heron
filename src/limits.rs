@@ -30,7 +30,7 @@ use tokio::time::Instant;
 use crate::accesslog::FORBIDDEN_HEADERS;
 use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::Directive;
-use crate::config::{block, invalid, once, one_arg, parse_size};
+use crate::config::{block, invalid, once, one_arg, parse_bool, parse_size};
 use crate::error::ConfigError;
 use crate::proxy::HeaderOp;
 use crate::transport::lock;
@@ -679,6 +679,8 @@ pub(crate) struct PendingLocation<'a> {
     pub(crate) block: BlockOverrides,
     /// The `proxy_set_header` operations of the block, which replace the site's when present.
     pub(crate) headers: Option<Vec<HeaderOp>>,
+    /// The `proxy_websocket` setting of the block, when it has one.
+    pub(crate) websocket: Option<bool>,
 }
 
 /// Parses `location [=|~|~*|^~] <path> { ... }`, with only limit directives inside.
@@ -738,11 +740,15 @@ pub(crate) fn parse_location<'a>(
     let mut overrides = LimitOverrides::default();
     let mut block_overrides = BlockOverrides::default();
     let mut headers: Option<Vec<HeaderOp>> = None;
+    let mut websocket: Option<bool> = None;
     let mut seen = HashSet::new();
     for child in block(directive)? {
         let name = child.name.as_str();
         if BLOCK_NAMES.contains(&name) {
             block_overrides.apply(child, &mut seen)?;
+        } else if name == "proxy_websocket" {
+            once(&mut seen, child)?;
+            websocket = Some(parse_bool(child, one_arg(child)?)?);
         } else if name == "proxy_set_header" {
             headers
                 .get_or_insert_with(Vec::new)
@@ -762,6 +768,7 @@ pub(crate) fn parse_location<'a>(
         overrides,
         block: block_overrides,
         headers,
+        websocket,
     })
 }
 
@@ -786,6 +793,8 @@ pub(crate) struct LocationConfig {
     pub(crate) block: BlockResponse,
     /// The `proxy_set_header` operations for requests this location selects.
     pub(crate) proxy_headers: Vec<HeaderOp>,
+    /// Whether this location tunnels Upgrade requests.
+    pub(crate) websocket: bool,
 }
 
 /// Chooses the location for a request path, with nginx's precedence.
