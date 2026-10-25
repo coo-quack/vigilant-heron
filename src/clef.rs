@@ -211,11 +211,10 @@ pub(crate) fn parse_response(body: &[u8]) -> Result<Verdict, DecisionError> {
         .ok_or(DecisionError::MissingAnswer { id: "answers" })?;
     let attack = noul_score(answers, ATTACK_ID)?;
     let ai_instruction = noul_score(answers, AI_INSTRUCTION_ID)?;
-    let category = choice_answer(answers, CATEGORY_ID)?;
     Ok(Verdict {
         attack: Probability::new(attack)?,
         ai_instruction: Probability::new(ai_instruction)?,
-        category: Some(category),
+        category: category_answer(answers),
     })
 }
 
@@ -234,19 +233,19 @@ fn noul_score(answers: &Value, id: &'static str) -> Result<f64, DecisionError> {
         .ok_or(DecisionError::AnswerType { id })
 }
 
-fn choice_answer(answers: &Value, id: &'static str) -> Result<String, DecisionError> {
-    let entry = answer(answers, id)?;
+// The category is only logged, so a missing or malformed answer yields `None`
+// instead of an error: failing the whole verdict would discard valid scores and
+// fall back to fail-open.
+fn category_answer(answers: &Value) -> Option<String> {
+    let entry = answers.get(CATEGORY_ID)?;
     if entry.get("type").and_then(Value::as_str) != Some("choice") {
-        return Err(DecisionError::AnswerType { id });
+        return None;
     }
-    let choice = entry
+    entry
         .get("choice")
         .and_then(Value::as_str)
-        .ok_or(DecisionError::AnswerType { id })?;
-    if !is_known_category(choice) {
-        return Err(DecisionError::UnknownChoice(choice.to_owned()));
-    }
-    Ok(choice.to_owned())
+        .filter(|choice| is_known_category(choice))
+        .map(str::to_owned)
 }
 
 /// Calls a Clef endpoint on Workers AI, or on a server that speaks the same protocol.
@@ -426,7 +425,6 @@ mod tests {
     #[case::no_answers(json!({"result": {}}), "answers")]
     #[case::missing_attack(json!({"result": {"answers": {"ai_instruction": {"type": "noul", "noul": 0.1}, "category": {"type": "choice", "choice": "none"}}}}), "attack")]
     #[case::missing_ai(json!({"result": {"answers": {"attack": {"type": "noul", "noul": 0.1}, "category": {"type": "choice", "choice": "none"}}}}), "ai_instruction")]
-    #[case::missing_category(json!({"result": {"answers": {"attack": {"type": "noul", "noul": 0.1}, "ai_instruction": {"type": "noul", "noul": 0.1}}}}), "category")]
     fn missing_answers_are_reported_by_question_id(#[case] body: Value, #[case] id: &str) {
         let error = parse_response(body.to_string().as_bytes());
         match error {
@@ -438,7 +436,6 @@ mod tests {
     #[rstest]
     #[case::attack_is_a_choice(json!({"attack": {"type": "choice", "choice": "xss"}, "ai_instruction": {"type": "noul", "noul": 0.1}, "category": {"type": "choice", "choice": "none"}}), "attack")]
     #[case::attack_has_no_number(json!({"attack": {"type": "noul", "noul": "high"}, "ai_instruction": {"type": "noul", "noul": 0.1}, "category": {"type": "choice", "choice": "none"}}), "attack")]
-    #[case::category_is_a_number(json!({"attack": {"type": "noul", "noul": 0.1}, "ai_instruction": {"type": "noul", "noul": 0.1}, "category": {"type": "choice", "choice": 3}}), "category")]
     fn wrong_answer_types_are_reported_by_question_id(#[case] answers: Value, #[case] id: &str) {
         let error = parse_response(envelope(&answers).as_slice());
         match error {
@@ -458,13 +455,32 @@ mod tests {
         ));
     }
 
+    #[rstest]
+    #[case::unknown_option(json!({"type": "choice", "choice": "made_up"}))]
+    #[case::number_instead_of_option(json!({"type": "choice", "choice": 3}))]
+    #[case::noul_instead_of_choice(json!({"type": "noul", "noul": 0.5}))]
+    fn malformed_category_keeps_the_scores(#[case] category: Value) -> Result<(), DecisionError> {
+        let answers = json!({
+            "attack": {"type": "noul", "noul": 0.95},
+            "ai_instruction": {"type": "noul", "noul": 0.05},
+            "category": category,
+        });
+        let verdict = parse_response(&envelope(&answers))?;
+        assert_eq!(verdict.attack.value(), 0.95);
+        assert_eq!(verdict.category, None);
+        Ok(())
+    }
+
     #[test]
-    fn unknown_category_is_rejected() {
-        let answers = good_answers(0.9, 0.1, "made_up");
-        assert!(matches!(
-            parse_response(&envelope(&answers)),
-            Err(DecisionError::UnknownChoice(value)) if value == "made_up"
-        ));
+    fn missing_category_keeps_the_scores() -> Result<(), DecisionError> {
+        let answers = json!({
+            "attack": {"type": "noul", "noul": 0.95},
+            "ai_instruction": {"type": "noul", "noul": 0.05},
+        });
+        let verdict = parse_response(&envelope(&answers))?;
+        assert_eq!(verdict.attack.value(), 0.95);
+        assert_eq!(verdict.category, None);
+        Ok(())
     }
 
     #[test]

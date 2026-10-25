@@ -193,9 +193,6 @@ pub(crate) enum DecisionError {
         /// Question id whose answer was malformed.
         id: &'static str,
     },
-    /// The category answer is not one of the known options.
-    #[error("decision backend returned an unknown category {0:?}")]
-    UnknownChoice(String),
 }
 
 /// Why an upstream request could not be sent.
