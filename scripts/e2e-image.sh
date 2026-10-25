@@ -17,6 +17,8 @@ NOPID_PORT="${VH_E2E_NOPID_PORT:-18090}"
 # Under target/: Docker mounts these directories into containers, and Colima shares only the repository and home.
 mkdir -p "$(pwd)/target"
 TMP="$(mktemp -d "$(pwd)/target/vh-e2e-image.XXXXXX")"
+# mktemp creates the directory as 0700; containers run as nonroot and must read what is mounted from it.
+chmod 755 "$TMP"
 
 cleanup() {
   local status=$?
@@ -88,8 +90,11 @@ mkdir -p "$TMP/broken"
 cp "$ROUTER_DIR/vigilant-heron.conf" "$TMP/broken/"
 cp -R "$ROUTER_DIR/rules.d" "$TMP/broken/rules.d"
 echo "unknown_directive 1;" >>"$TMP/broken/vigilant-heron.conf"
+chmod -R a+rX "$TMP/broken"
 expect_exit 1 docker run --rm -v "$TMP/broken:/etc/vigilant-heron:ro" "$IMAGE" -t
 require_contains "$TMP/last.err" "test failed"
+# The failure must come from the bad directive, not from a file the container cannot read.
+require_contains "$TMP/last.err" 'unknown directive "unknown_directive"'
 
 echo "e2e-image: reload and reopen through compose exec"
 ROUTER_ID="$("${COMPOSE[@]}" ps -q vigilant-heron)"
@@ -152,6 +157,7 @@ site enforce.test {
     mode enforce;
 }
 CONF
+chmod -R a+rX "$TMP/nopid"
 docker rm -f "$NOPID_NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NOPID_NAME" --network "$NET" -p "127.0.0.1:$NOPID_PORT:8080" \
   -v "$TMP/nopid:/etc/vigilant-heron:ro" "$IMAGE" >/dev/null

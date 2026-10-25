@@ -12,6 +12,8 @@ base="${VH_E2E_BASE:-http://127.0.0.1:18080}"
 # Under target/, not the system temp directory: Colima shares only the repository and home with its VM.
 mkdir -p "$(pwd)/target"
 ROUTER_DIR="$(mktemp -d "$(pwd)/target/vh-e2e-router.XXXXXX")"
+# mktemp creates the directory as 0700; the router container runs as nonroot and must read it.
+chmod 755 "$ROUTER_DIR"
 
 cleanup() {
   local status=$?
@@ -27,6 +29,7 @@ bash scripts/e2e-cli.sh
 # The router reads a writable copy of the e2e configuration, so the image phase can change it.
 cp e2e/vigilant-heron.conf "$ROUTER_DIR/"
 cp -R e2e/rules.d "$ROUTER_DIR/rules.d"
+chmod -R a+rX "$ROUTER_DIR"
 export VH_E2E_ROUTER_DIR="$ROUTER_DIR"
 
 "${compose[@]}" up -d --build
@@ -42,6 +45,8 @@ for _ in $(seq 1 60); do
 done
 if [ "$code" != "421" ]; then
   echo "e2e stack did not become ready within 60 seconds (last HTTP code: ${code:-none})" >&2
+  "${compose[@]}" ps -a >&2 || true
+  "${compose[@]}" logs --no-color --tail 40 >&2 || true
   exit 1
 fi
 
