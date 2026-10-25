@@ -44,5 +44,5 @@ pub use config::{
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
-pub use server::serve;
+pub use server::{serve, serve_reloadable};
 pub use system_one::{ApiToken, ClefModel};

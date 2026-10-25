@@ -30,7 +30,7 @@ use hyper::service::service_fn;
 use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::access::{self, AccessEntry};
@@ -38,9 +38,11 @@ use crate::accesslog::{AccessRecord, LogFormat};
 use crate::block::{BlockResponse, BlockStatus};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
 use crate::config::{
-    AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, Mode, SiteConfig,
+    AccessLogConfig, BackendConfig, Config, ConnectionConfig, ErrorLogConfig, MAX_REQUEST_ID_BYTES,
+    Mode, SiteConfig,
 };
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
+use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
 use crate::logsink::{Writer, spawn_writer};
@@ -81,10 +83,6 @@ pub(crate) struct AppState<B> {
     proxies: Vec<Proxy>,
     /// Bytes of the request body read for the decision.
     inspect_body_bytes: usize,
-    /// Connection timers and header limits.
-    timers: ClientTimers,
-    /// Requests per connection before it is closed.
-    keepalive_requests: usize,
     /// Header names dropped before the event is sent to the backend.
     backend_redact: Vec<String>,
     backend: B,
@@ -102,7 +100,9 @@ pub(crate) struct AppState<B> {
 }
 
 impl AppState<Backend> {
-    fn from_config(config: Config) -> Result<Self, ServeError> {
+    /// Builds the state of `config`. Zones named like a zone of `previous`, with the
+    /// same size, keep their counts.
+    fn from_config(config: Config, previous: &[Arc<ZoneStore>]) -> Result<Self, ServeError> {
         let client = decision_client()?;
         let url = config.decision.url.clone();
         let limits = Limits {
@@ -167,8 +167,6 @@ impl AppState<Backend> {
             sites: config.sites,
             proxies,
             inspect_body_bytes: config.decision.inspect_body_bytes,
-            timers: ClientTimers::from_config(&config.connection),
-            keepalive_requests: config.connection.keepalive_requests,
             backend_redact,
             backend,
             default_status: config.default_status,
@@ -179,12 +177,76 @@ impl AppState<Backend> {
             zones: config
                 .zones
                 .into_iter()
-                .map(|zone| Arc::new(ZoneStore::new(zone)))
+                .map(|zone| {
+                    let shared = previous.iter().find(|old| {
+                        old.name() == zone.name.as_str() && old.capacity() == zone.capacity
+                    });
+                    Arc::new(match shared {
+                        Some(old) => ZoneStore::sharing(zone, old),
+                        None => ZoneStore::new(zone),
+                    })
+                })
                 .collect(),
             top_limits: config.limits,
         })
     }
 }
+
+/// Connection settings that stay the same for the whole run: a reload does not change them.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionSettings {
+    /// Connection timers and header limits.
+    timers: ClientTimers,
+    /// Requests per connection before it is closed.
+    keepalive_requests: usize,
+}
+
+/// The settings that a reload cannot change. A reload that changes one logs a warning.
+struct Startup {
+    listen: String,
+    worker_threads: Option<usize>,
+    max_connections: usize,
+    connection: ConnectionConfig,
+    error_log: ErrorLogConfig,
+}
+
+impl Startup {
+    fn of(config: &Config) -> Self {
+        Self {
+            listen: config.listen.clone(),
+            worker_threads: config.worker_threads,
+            max_connections: config.max_connections,
+            connection: config.connection.clone(),
+            error_log: config.error_log.clone(),
+        }
+    }
+
+    /// Warns about each setting of `config` that differs from the startup value.
+    fn report_changes(&self, config: &Config) {
+        if config.listen != self.listen {
+            tracing::warn!(listen = %config.listen, "listen changed; a restart is needed for it to take effect");
+        }
+        if config.worker_threads != self.worker_threads {
+            tracing::warn!("worker_threads changed; a restart is needed for it to take effect");
+        }
+        if config.max_connections != self.max_connections {
+            tracing::warn!("max_connections changed; a restart is needed for it to take effect");
+        }
+        if config.connection != self.connection {
+            tracing::warn!(
+                "connection timers and header limits changed; a restart is needed for them to take effect"
+            );
+        }
+        if config.error_log.destination != self.error_log.destination
+            || config.error_log.level != self.error_log.level
+        {
+            tracing::warn!("error_log changed; a restart is needed for it to take effect");
+        }
+    }
+}
+
+/// Where a reload gets its configuration: a function that reads and validates it.
+type Loader = Box<dyn Fn() -> Result<Config, ConfigError> + Send>;
 
 /// Serves requests on `listener` until `shutdown` completes.
 ///
@@ -193,32 +255,88 @@ impl AppState<Backend> {
 ///
 /// # Errors
 ///
-/// Returns [`ServeError::Accept`] when the listener fails to accept a connection.
+/// Returns [`ServeError::Accept`] when the listener fails to accept a connection,
+/// and an error when the configuration cannot be put into service.
 pub async fn serve(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ServeError> {
+    run(listener, config, shutdown, None).await
+}
+
+/// Serves like [`serve`], and reloads the configuration each time `reloads` receives a message.
+///
+/// `load` reads and validates the configuration. A reload that fails is logged at
+/// error level, and the previous configuration keeps serving. A reload that
+/// succeeds applies to the requests that start after it; requests in flight finish
+/// with the configuration they started with. Zones keep their counts when a zone
+/// with the same name and size exists. The listen address, `worker_threads`,
+/// `max_connections` and the connection timers apply only at startup.
+///
+/// # Errors
+///
+/// Returns the same errors as [`serve`].
+pub async fn serve_reloadable(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+    reloads: mpsc::Receiver<()>,
+    load: impl Fn() -> Result<Config, ConfigError> + Send + 'static,
+) -> Result<(), ServeError> {
+    run(listener, config, shutdown, Some((reloads, Box::new(load)))).await
+}
+
+async fn run(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+    reloads: Option<(mpsc::Receiver<()>, Loader)>,
+) -> Result<(), ServeError> {
     let max_connections = config.max_connections;
-    let state = Arc::new(AppState::from_config(config)?);
+    let settings = ConnectionSettings {
+        timers: ClientTimers::from_config(&config.connection),
+        keepalive_requests: config.connection.keepalive_requests,
+    };
+    let startup = Startup::of(&config);
+    let initial = Arc::new(AppState::from_config(config, &[])?);
+    let (current_tx, current_rx) = watch::channel(initial);
     let (stop_tx, stop_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
     let mut shutdown = pin!(shutdown);
     let mut connections = JoinSet::new();
+    let (mut requests, load) = match reloads {
+        Some((requests, load)) => (Some(requests), Some(load)),
+        None => (None, None),
+    };
     loop {
         // Both waits race with shutdown, so a full connection limit cannot block the stop.
+        // A reload is applied while waiting too, and then the loop starts again.
         let permit = tokio::select! {
             () = &mut shutdown => break,
+            Some(()) = next_reload(&mut requests) => {
+                if let Some(load) = &load {
+                    reload(load.as_ref(), &startup, &current_tx);
+                }
+                continue;
+            }
             permit = Arc::clone(&slots).acquire_owned() => {
                 permit.map_err(|_| ServeError::Accept(std::io::Error::other("connection limiter closed")))?
             }
         };
         let (stream, peer) = tokio::select! {
             () = &mut shutdown => break,
+            Some(()) = next_reload(&mut requests) => {
+                if let Some(load) = &load {
+                    reload(load.as_ref(), &startup, &current_tx);
+                }
+                continue;
+            }
             accepted = listener.accept() => accepted.map_err(ServeError::Accept)?,
         };
         connections.spawn(serve_connection(
-            Arc::clone(&state),
+            current_rx.clone(),
+            settings,
             stream,
             peer,
             stop_rx.clone(),
@@ -232,6 +350,42 @@ pub async fn serve(
     Ok(())
 }
 
+/// Waits for the next reload request. Without a reload source it never completes,
+/// and a closed source ends the wait for good.
+async fn next_reload(requests: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match requests {
+        Some(requests) => requests.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Builds the state of a new configuration and publishes it to new requests. A
+/// failure is logged and leaves the current state in place.
+fn reload(
+    load: &dyn Fn() -> Result<Config, ConfigError>,
+    startup: &Startup,
+    current: &watch::Sender<Arc<AppState<Backend>>>,
+) {
+    let config = match load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "configuration reload failed; keeping the previous configuration");
+            return;
+        }
+    };
+    startup.report_changes(&config);
+    let previous = current.borrow().clone();
+    match AppState::from_config(config, &previous.zones) {
+        Ok(state) => {
+            current.send_replace(Arc::new(state));
+            tracing::info!("configuration reloaded");
+        }
+        Err(error) => {
+            tracing::error!(%error, "configuration reload failed; keeping the previous configuration");
+        }
+    }
+}
+
 /// State of one connection that its requests share.
 struct Connection {
     phase: Arc<PhaseCell>,
@@ -239,8 +393,9 @@ struct Connection {
     served: AtomicUsize,
 }
 
-async fn serve_connection<B: DecisionBackend>(
-    state: Arc<AppState<B>>,
+async fn serve_connection(
+    current: watch::Receiver<Arc<AppState<Backend>>>,
+    settings: ConnectionSettings,
     stream: TcpStream,
     peer: SocketAddr,
     mut stop: watch::Receiver<bool>,
@@ -252,7 +407,7 @@ async fn serve_connection<B: DecisionBackend>(
     let io = TokioIo::new(ClientIo::new(
         stream,
         Arc::clone(&phase),
-        state.timers,
+        settings.timers,
         Arc::clone(&rejection),
     ));
     let connection = Arc::new(Connection {
@@ -260,15 +415,25 @@ async fn serve_connection<B: DecisionBackend>(
         served: AtomicUsize::new(0),
     });
     let mut builder = http1::Builder::new();
-    builder.keep_alive(state.timers.keep_alive > Duration::ZERO);
-    if state.timers.head.total > HYPER_DEFAULT_BUFFER {
-        builder.max_buf_size(state.timers.head.total);
+    builder.keep_alive(settings.timers.keep_alive > Duration::ZERO);
+    if settings.timers.head.total > HYPER_DEFAULT_BUFFER {
+        builder.max_buf_size(settings.timers.head.total);
     }
-    let service_state = Arc::clone(&state);
+    let service_current = current.clone();
     let service = service_fn(move |request| {
-        let state = Arc::clone(&service_state);
+        // Each request takes the configuration that is current when it starts.
+        let state = service_current.borrow().clone();
         let connection = Arc::clone(&connection);
-        async move { handle(&state, &connection, peer, request).await }
+        async move {
+            handle(
+                &state,
+                &connection,
+                peer,
+                request,
+                settings.keepalive_requests,
+            )
+            .await
+        }
     });
     // `with_upgrades` keeps the connection driven until an upgraded tunnel takes it over.
     let connection_future = builder.serve_connection(io, service).with_upgrades();
@@ -288,6 +453,7 @@ async fn serve_connection<B: DecisionBackend>(
     }
     let rejected = lock(&rejection).take();
     if let Some(rejection) = rejected {
+        let state = current.borrow().clone();
         write_rejection(&state.global_sinks, rejection, peer, started);
     }
 }
@@ -316,6 +482,7 @@ async fn handle<B: DecisionBackend>(
     connection: &Connection,
     peer: SocketAddr,
     mut request: Request<Incoming>,
+    keepalive_requests: usize,
 ) -> Result<Response<ResponseBody>, std::io::Error> {
     let started = Instant::now();
     connection.phase.set(Phase::Busy);
@@ -351,7 +518,7 @@ async fn handle<B: DecisionBackend>(
             "blocked with block_status 444: closed without a response",
         ));
     }
-    if served >= state.keepalive_requests {
+    if served >= keepalive_requests {
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));

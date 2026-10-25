@@ -28,7 +28,7 @@ Shadow mode records what it would have done without blocking.
 
 ```
 src/
-  main.rs        # CLI: --config, runtime built from worker_threads, signal handling
+  main.rs        # CLI: --config, -t (check only), runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen
   lib.rs         # Public API: Config, ConfigError, serve, install_error_log
   conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)
   config.rs      # Directive tree -> validated Config; every error names file:line
@@ -49,7 +49,7 @@ src/
   tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits
   transport.rs   # Client socket: header, keep-alive and send timers, header limits (414/400); upstream send timer
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
-  server.rs      # Accept loop and per-request pipeline, access records
+  server.rs      # Accept loop, reload (watch channel of the state), per-request pipeline, access records
   error.rs       # Error types
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
@@ -64,6 +64,7 @@ tests/
   cli.rs         # The binary in -t mode: results, exit codes, no bind
   headers.rs     # proxy_set_header: variables, removal, inheritance, location replacement
   websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
+  reload.rs      # serve_reloadable: valid, broken, zone state kept or reset, in-flight requests finish
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack

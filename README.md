@@ -572,6 +572,29 @@ be set or the router refuses to start.
 The config path can also come from `VIGILANT_HERON_CONFIG`; the default is
 `/etc/vigilant-heron/vigilant-heron.conf`.
 
+### Reload and log reopen
+
+Two signals are handled, and they are documented together:
+
+- `SIGHUP` reloads the configuration, as `nginx -s reload` does. The whole file,
+  with its includes, is read and validated again. If it is valid, the new
+  configuration serves every request that starts after the reload. Requests in
+  flight finish with the configuration they started with. If it is not valid, the
+  error is logged at error level with its file and line, and the previous
+  configuration keeps serving. `SIGHUP` also reopens the error log file.
+  Zones keep their counts when a zone with the same name and size exists in the
+  new file, and otherwise start empty. Access logs are written to the destinations
+  of the new file.
+- `SIGUSR1` reopens the file destinations of the access logs and the error log,
+  so logrotate can move them away, without a reload.
+
+Some settings are read at startup only. A reload that changes one logs a warning,
+and the change takes effect at the next restart: `listen`, `worker_threads`,
+`max_connections`, the connection timers and header limits (the `client_*`,
+`keepalive_*`, `send_timeout`, `large_client_header_buffers` and `lingering_*`
+directives), and the `error_log` destination and level. The `error_log` file
+itself is reopened on each reload.
+
 `vigilant-heron -t [--config <path>]` checks the configuration the way
 `nginx -t` does. It reads the includes, rules, block pages and token variables,
 validates everything, and then exits. It never binds the listen address or

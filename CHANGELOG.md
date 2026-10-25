@@ -12,6 +12,13 @@
   `$client_ip`, `$remote_addr`, `$host`, `$site`, `$method`, `$path`,
   `$request_id` and `$http_<name>`. The default headers (Host kept,
   `X-Forwarded-For` appended) are unchanged. Hop-by-hop headers cannot be set.
+- `SIGHUP` reloads the configuration like `nginx -s reload`. A valid file is
+  applied to new requests, while requests in flight finish with the old one. A
+  broken file is logged at error level with its file and line, and the old
+  configuration keeps serving. Zones keep their counts when the name and size
+  match. Listen address, `worker_threads`, `max_connections`, connection timers
+  and the error log destination and level apply only at startup (a warning is
+  logged). `SIGUSR1` still reopens the log files.
 - `vigilant-heron -t [--config <path>]` checks the configuration like `nginx -t`:
   it validates the whole file (includes, rules, block pages, token variables),
   reports the result on stderr and exits 0 or 1. It never binds or serves.

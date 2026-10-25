@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, bail};
 use tokio::signal::unix::{SignalKind, signal};
-use vigilant_heron::{Config, ErrorLogHandle, install_error_log, serve};
+use vigilant_heron::{Config, ErrorLogHandle, install_error_log, serve_reloadable};
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/vigilant-heron/vigilant-heron.conf";
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
@@ -46,7 +46,7 @@ fn run_cli() -> anyhow::Result<ExitCode> {
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let error_log = install_error_log(&config.error_log);
     let runtime = build_runtime(config.worker_threads)?;
-    runtime.block_on(run(config, error_log))?;
+    runtime.block_on(run(config, error_log, config_path))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -112,7 +112,28 @@ fn build_runtime(worker_threads: Option<usize>) -> anyhow::Result<tokio::runtime
         .context("starting the async runtime")
 }
 
-async fn run(config: Config, error_log: ErrorLogHandle) -> anyhow::Result<()> {
+async fn run(
+    config: Config,
+    error_log: ErrorLogHandle,
+    config_path: PathBuf,
+) -> anyhow::Result<()> {
+    // SIGHUP reloads the configuration, as `nginx -s reload` does. The error log is reopened too.
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::channel::<()>(1);
+    match signal(SignalKind::hangup()) {
+        Ok(mut hangup) => {
+            let error_log = error_log.clone();
+            tokio::spawn(async move {
+                while hangup.recv().await.is_some() {
+                    error_log.reopen();
+                    // A reload already waiting covers this signal too.
+                    let _ = reload_tx.try_send(());
+                }
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%error, "cannot listen for SIGHUP; the configuration cannot be reloaded");
+        }
+    }
     // Reopen the error log on SIGUSR1, so logrotate can move the file away.
     match signal(SignalKind::user_defined1()) {
         Ok(mut usr1) => {
@@ -130,7 +151,10 @@ async fn run(config: Config, error_log: ErrorLogHandle) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     tracing::info!(listen = %config.listen, "vigilant-heron is listening");
-    serve(listener, config, shutdown_signal()).await?;
+    serve_reloadable(listener, config, shutdown_signal(), reload_rx, move || {
+        Config::load(&config_path)
+    })
+    .await?;
     tracing::info!("vigilant-heron stopped");
     Ok(())
 }

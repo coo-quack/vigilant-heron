@@ -929,22 +929,38 @@ pub(crate) struct ZoneStore {
     def: LimitZone,
     /// Drain time of one request, for `limit_req` zones.
     interval_ns: Option<u64>,
-    table: std::sync::Mutex<Table>,
+    /// The counted state. A reloaded configuration shares it with the zone it replaces.
+    table: Arc<std::sync::Mutex<Table>>,
 }
 
 impl ZoneStore {
     /// Creates the empty state of `def`.
     pub(crate) fn new(def: LimitZone) -> Self {
+        let table = Arc::new(std::sync::Mutex::new(Table::new(def.capacity)));
+        Self::with_table(def, table)
+    }
+
+    /// Creates the zone `def` on the state of `previous`, which a reload keeps when the
+    /// name and size are the same. The definition itself is the new one.
+    pub(crate) fn sharing(def: LimitZone, previous: &Self) -> Self {
+        Self::with_table(def, Arc::clone(&previous.table))
+    }
+
+    fn with_table(def: LimitZone, table: Arc<std::sync::Mutex<Table>>) -> Self {
         let interval_ns = match def.kind {
             ZoneKind::Req { interval_ns } => Some(interval_ns),
             ZoneKind::Conn => None,
         };
-        let table = std::sync::Mutex::new(Table::new(def.capacity));
         Self {
             def,
             interval_ns,
             table,
         }
+    }
+
+    /// The number of states the zone holds, which is its size.
+    pub(crate) fn capacity(&self) -> usize {
+        self.def.capacity
     }
 
     /// Accounts one request against a `limit_req` zone.
