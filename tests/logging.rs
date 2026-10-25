@@ -164,8 +164,14 @@ async fn rate_limit_is_logged_with_its_cause_and_retry_after() -> TestResult {
     let upstream = Upstream::start().await?;
     let path = log_path("rate-limit");
     let _ = std::fs::remove_file(&path);
-    let proxy =
-        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
+    let proxy = start_proxy_config(config_for(
+        "jev",
+        &fake.url,
+        &upstream.url(),
+        &path,
+        "on_rate_limit allow;",
+    )?)
+    .await?;
 
     let reply = get_with_id(&proxy.base(), "/articles/ratelimited", "log-rate-1").await?;
 
@@ -183,8 +189,14 @@ async fn backend_timeout_is_logged_as_timeout() -> TestResult {
     let upstream = Upstream::start().await?;
     let path = log_path("timeout");
     let _ = std::fs::remove_file(&path);
-    let proxy =
-        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
+    let proxy = start_proxy_config(config_for(
+        "jev",
+        &fake.url,
+        &upstream.url(),
+        &path,
+        "on_decision_error allow;",
+    )?)
+    .await?;
 
     let reply = get_with_id(&proxy.base(), "/articles/slowanswer", "log-timeout-1").await?;
 
@@ -201,8 +213,14 @@ async fn server_error_is_logged_as_http_status() -> TestResult {
     let upstream = Upstream::start().await?;
     let path = log_path("http-status");
     let _ = std::fs::remove_file(&path);
-    let proxy =
-        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
+    let proxy = start_proxy_config(config_for(
+        "jev",
+        &fake.url,
+        &upstream.url(),
+        &path,
+        "on_decision_error allow;",
+    )?)
+    .await?;
 
     let reply = get_with_id(&proxy.base(), "/articles/servererror", "log-500-1").await?;
 

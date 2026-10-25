@@ -1672,8 +1672,8 @@ fn parse_site(
     let mut instruction_threshold = DEFAULT_INSTRUCTION_THRESHOLD;
     let mut deny_paths = Vec::new();
     let mut fail_closed_paths = Vec::new();
-    let mut on_rate_limit = FailureAction::Allow;
-    let mut on_decision_error = FailureAction::Allow;
+    let mut on_rate_limit = FailureAction::Block;
+    let mut on_decision_error = FailureAction::Block;
     let mut static_extensions: Option<Vec<String>> = None;
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
@@ -2007,8 +2007,8 @@ mod tests {
         let site = first_site(&config)?;
         assert_eq!(site.block_threshold, 0.87);
         assert_eq!(site.instruction_threshold, 0.8);
-        assert_eq!(site.on_rate_limit, FailureAction::Allow);
-        assert_eq!(site.on_decision_error, FailureAction::Allow);
+        assert_eq!(site.on_rate_limit, FailureAction::Block);
+        assert_eq!(site.on_decision_error, FailureAction::Block);
         assert_eq!(site.mode, Mode::Enforce);
         assert_eq!(site.action, SiteAction::Block);
         assert!(site.static_extensions.contains(&"woff2".to_owned()));

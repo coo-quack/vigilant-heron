@@ -52,7 +52,7 @@ for the decision and streams the rest as the upstream reads it.
 ## Failure behavior
 
 A decision can fail in two ways, and each has its own site setting. Both default
-to `allow`.
+to `block` (fail closed).
 
 - **`on_rate_limit`** covers the backend's HTTP 429 and a request that finds no
   free concurrency slot within `queue_timeout` (`backend_busy`).
@@ -61,6 +61,13 @@ to `allow`.
 
 Set each to `allow` or `block`. A saturated backend is always in the rate-limit
 group, so `on_decision_error` never applies to it.
+
+Saturation can be caused on purpose: a client that keeps many requests in flight
+fills the concurrency slots, and every other request then fails in the rate-limit
+group. With the default `block`, those requests are blocked. Limit each client
+with `limit_req` and `limit_conn` so that one client cannot fill the slots. Set
+`allow` only on a site that must keep forwarding while the backend is saturated;
+on that site the attacker can avoid the model by saturating the backend.
 
 Two more rules apply to failures:
 

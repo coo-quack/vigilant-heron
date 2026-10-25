@@ -206,8 +206,8 @@ failure and on the site settings:
   after a slot was obtained), connection failures, other non-2xx statuses,
   `success: false`, and malformed or out-of-range answers.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
-  `"allow"` (the default) forwards the request, `"block"` applies the site's
-  `action`.
+  `"block"` (the default) applies the site's `action`, `"allow"` forwards the
+  request.
 - `fail_closed_paths` always blocks a failure on a matching path, whatever the
   group or setting.
 - Deterministic rules (the access list, `deny_path` and block rules) are decided
@@ -215,7 +215,16 @@ failure and on the site settings:
   rule block stays a block when the backend rate-limits, errors, is unreachable or
   is saturated. Shadow mode still forwards every request, rules included.
 
-The defaults allow requests when the backend fails. A site that depends on the
-backend to block attacks should set `on_decision_error = "block"` and, for
-paths that must never open, `fail_closed_paths`. Each setting is a trade-off:
-blocking on errors turns a provider outage into a block of legitimate traffic.
+The defaults block requests when the backend fails or is saturated. A failure
+therefore never opens the site to requests the model did not judge. The cost is
+that a provider outage, or a flood that fills the concurrency slots, blocks
+legitimate traffic too.
+
+Saturation is an attack the client can start on purpose: a client that keeps
+many requests in flight occupies the `max_concurrency` slots, and every other
+request then fails in the rate-limit group. Limit each client with `limit_req`
+and `limit_conn` so that one client cannot fill the slots. A site that puts
+availability first can set `on_rate_limit "allow"` and `on_decision_error
+"allow"` explicitly. On that site an attacker who saturates the backend gets
+requests past the model, so such a site should keep `fail_closed_paths` on its
+sensitive paths.

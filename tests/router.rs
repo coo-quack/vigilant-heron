@@ -233,6 +233,15 @@ async fn static_asset_is_forwarded_without_calling_the_backend() -> TestResult {
     proxy.stop().await
 }
 
+/// Adds `on_rate_limit allow` and `on_decision_error allow` to the first site of `config_text`.
+fn fail_open(text: &str) -> String {
+    text.replacen(
+        "    debug_headers on;\n",
+        "    debug_headers on;\n    on_rate_limit allow;\n    on_decision_error allow;\n",
+        1,
+    )
+}
+
 #[tokio::test]
 async fn backend_timeout_fails_open_on_an_ordinary_path() -> TestResult {
     let upstream = Upstream::start().await?;
@@ -241,11 +250,11 @@ async fn backend_timeout_fails_open_on_an_ordinary_path() -> TestResult {
         delay: Duration::from_millis(1_000),
         ..StubBehavior::default()
     });
-    let proxy = start_proxy(&config_text(
+    let proxy = start_proxy(&fail_open(&config_text(
         &stub.decide_url(),
         &upstream.url(),
         SLOW_TIMEOUT_MS,
-    ))
+    )))
     .await?;
 
     let reply = send(
@@ -301,11 +310,11 @@ async fn backend_server_error_fails_open() -> TestResult {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         ..StubBehavior::default()
     });
-    let proxy = start_proxy(&config_text(
+    let proxy = start_proxy(&fail_open(&config_text(
         &stub.decide_url(),
         &upstream.url(),
         GENEROUS_TIMEOUT_MS,
-    ))
+    )))
     .await?;
 
     let reply = send(

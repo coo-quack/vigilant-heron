@@ -29,6 +29,8 @@ struct Setup {
     max_concurrency: usize,
     queue_timeout_ms: u64,
     timeout_ms: u64,
+    /// When false, the configuration omits the two failure directives and uses their defaults.
+    explicit_failures: bool,
 }
 
 impl Setup {
@@ -42,6 +44,7 @@ impl Setup {
             max_concurrency: 64,
             queue_timeout_ms: 0,
             timeout_ms: 2000,
+            explicit_failures: true,
         }
     }
 
@@ -77,8 +80,7 @@ site example.com {{
     instruction_threshold 0.5;
     deny_path /.env;
     fail_closed_path /wp-login.php;
-    on_rate_limit {rate};
-    on_decision_error {error};
+    {failure_lines}
 }}
 "#,
             url = self.decide_url,
@@ -86,8 +88,14 @@ site example.com {{
             concurrency = self.max_concurrency,
             queue = self.queue_timeout_ms,
             upstream = self.upstream_url,
-            rate = self.on_rate_limit,
-            error = self.on_decision_error,
+            failure_lines = if self.explicit_failures {
+                format!(
+                    "on_rate_limit {};\n    on_decision_error {};",
+                    self.on_rate_limit, self.on_decision_error
+                )
+            } else {
+                String::new()
+            },
         );
         let token = GOOD_TOKEN;
         Ok(Config::parse_str_with_lookup(
@@ -300,6 +308,51 @@ async fn saturated_request_is_a_rate_limit_and_follows_on_rate_limit(
         holder.status.as_u16(),
         holder_expected,
         "the holder's timeout follows on_decision_error"
+    );
+    proxy.stop().await
+}
+
+/// With no failure directives, a saturated backend blocks an ordinary path.
+#[tokio::test]
+async fn saturated_backend_blocks_an_ordinary_path_by_default() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.explicit_failures = false;
+    setup.max_concurrency = 1;
+    setup.timeout_ms = 1000;
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move { get(&holder_base, "/articles/slowanswer").await });
+    wait_until_backend_busy(&fake).await?;
+    let queued = get(&base, "/articles/queued").await?;
+    holder.await??;
+
+    assert_eq!(
+        queued.status.as_u16(),
+        403,
+        "the default on_rate_limit is block"
+    );
+    proxy.stop().await
+}
+
+/// With no failure directives, an unreachable backend blocks an ordinary path.
+#[tokio::test]
+async fn unreachable_backend_blocks_an_ordinary_path_by_default() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decide_url = format!("{}{JEV_PATH}", closed_port_url().await?);
+    let mut setup = Setup::new(decide_url, upstream.url());
+    setup.explicit_failures = false;
+    let proxy = start_proxy_config(setup.config()?).await?;
+
+    let reply = get(&proxy.base(), "/articles/normal").await?;
+
+    assert_eq!(
+        reply.status.as_u16(),
+        403,
+        "the default on_decision_error is block"
     );
     proxy.stop().await
 }

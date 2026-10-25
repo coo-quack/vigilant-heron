@@ -309,7 +309,7 @@ counts.
 
 A decision fails when the backend answers HTTP 429, when no concurrency slot is
 free within `timeout`, or when it fails in any other way. The two groups have
-their own site settings, both `"allow"` by default:
+their own site settings, both `"block"` by default (fail closed):
 
 - `on_rate_limit`: the 429 and "no slot in time" group
 - `on_decision_error`: timeouts, connection errors, other non-2xx statuses,
@@ -319,6 +319,12 @@ their own site settings, both `"allow"` by default:
 Saturation is always in the rate-limit group: a request that gets no
 concurrency slot within `decision` `queue_timeout` is `backend_busy`, and that
 never falls under `on_decision_error`.
+
+Blocking by default means that a backend outage, or a flood that saturates the
+backend, blocks ordinary requests too. Attackers can cause saturation on purpose,
+so a site that opts into `"allow"` for availability gives up that protection
+while the backend is saturated. Limit each client with `limit_req` and
+`limit_conn` (see "Limits") so that one client cannot fill the concurrency slots.
 
 `fail_closed_paths` wins over both: a failure on such a path is always blocked.
 A blocked failure uses the site's `action`. The decision log records the
@@ -342,7 +348,7 @@ limit, and it follows `on_rate_limit`, never `on_decision_error`.
 
 The defaults are: `backend jev` (its URL, model and token variable
 are set by default too), `timeout 300ms`, `block_threshold 0.87`,
-`instruction_threshold 0.8`, and both failure settings `"allow"`. Configs that
+`instruction_threshold 0.8`, and both failure settings `"block"`. Configs that
 want the JSON protocol must set `backend http;`.
 
 ## Timeouts and limits

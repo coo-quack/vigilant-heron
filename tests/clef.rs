@@ -34,6 +34,15 @@ fn clef_config(
     upstream_url: &str,
     token: &'static str,
 ) -> Result<Config, BoxError> {
+    clef_config_with(fake_url, upstream_url, token, "")
+}
+
+fn clef_config_with(
+    fake_url: &str,
+    upstream_url: &str,
+    token: &'static str,
+    site_extra: &str,
+) -> Result<Config, BoxError> {
     let text = format!(
         r#"
 listen 127.0.0.1:0;
@@ -57,6 +66,7 @@ site example.com {{
     block_threshold 0.9;
     instruction_threshold 0.5;
     fail_closed_path /wp-login.php;
+    {site_extra}
 }}
 "#
     );
@@ -113,7 +123,13 @@ async fn ai_instruction_judged_by_clef_is_blocked() -> TestResult {
 async fn wrong_token_fails_open_on_an_ordinary_path() -> TestResult {
     let fake = start_clef_fake().await?;
     let upstream = Upstream::start().await?;
-    let proxy = start_proxy_config(clef_config(&fake.url, &upstream.url(), "wrong-token")?).await?;
+    let proxy = start_proxy_config(clef_config_with(
+        &fake.url,
+        &upstream.url(),
+        "wrong-token",
+        "on_decision_error allow;",
+    )?)
+    .await?;
 
     let reply = get(&proxy.base(), "/articles").await?;
 
@@ -146,7 +162,13 @@ async fn wrong_token_fails_closed_on_a_fail_closed_path() -> TestResult {
 async fn answers_missing_the_attack_score_fail_open() -> TestResult {
     let fake = start_clef_fake().await?;
     let upstream = Upstream::start().await?;
-    let proxy = start_proxy_config(clef_config(&fake.url, &upstream.url(), GOOD_TOKEN)?).await?;
+    let proxy = start_proxy_config(clef_config_with(
+        &fake.url,
+        &upstream.url(),
+        GOOD_TOKEN,
+        "on_decision_error allow;",
+    )?)
+    .await?;
 
     let reply = get(&proxy.base(), "/malformed-answers").await?;
 

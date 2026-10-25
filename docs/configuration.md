@@ -550,18 +550,18 @@ AI-instruction score, from 0 to 1, at or above which a request is blocked.
 ### `on_rate_limit`
 
 - **Syntax:** `on_rate_limit allow | block;`
-- **Default:** `allow`.
+- **Default:** `block`.
 - **Context:** site.
 
-What happens when the backend answers HTTP 429 or no slot is free within `queue_timeout`. Rules are not affected. See [How it works](/how-it-works#failure-behavior).
+What happens when the backend answers HTTP 429 or no slot is free within `queue_timeout`. Rules are not affected. Attackers can saturate the backend on purpose, so the default blocks; set `allow` only on a site that puts availability first, and limit each client with `limit_req` and `limit_conn`. See [How it works](/how-it-works#failure-behavior).
 
 ### `on_decision_error`
 
 - **Syntax:** `on_decision_error allow | block;`
-- **Default:** `allow`.
+- **Default:** `block`.
 - **Context:** site.
 
-What happens when the backend fails in any other way: a timeout, a connection error, a non-2xx status or an unusable answer.
+What happens when the backend fails in any other way: a timeout, a connection error, a non-2xx status or an unusable answer. The default blocks, so a site that wants to forward while the backend is down must set `allow`.
 
 ### `deny_path`
 

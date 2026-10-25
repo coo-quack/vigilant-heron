@@ -143,3 +143,10 @@
   line was read, so a trusted proxy that appended its own line (HAProxy's
   `option forwardfor`) could not stop a client from choosing its address. A
   malformed line makes the whole header ignored, as before.
+- Security (F6): `on_rate_limit` and `on_decision_error` now default to `block`
+  (fail closed). Saturation of the decision backend can be caused on purpose, so
+  with the old `allow` default an attacker who filled the concurrency slots got
+  requests past the model. **Breaking for sites that relied on the default:**
+  set `on_rate_limit allow;` and `on_decision_error allow;` to keep forwarding
+  while the backend fails or is saturated, and limit each client with `limit_req`
+  and `limit_conn`. Shadow sites still forward everything.
