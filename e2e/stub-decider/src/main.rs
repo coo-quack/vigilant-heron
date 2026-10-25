@@ -60,7 +60,9 @@ async fn main() -> std::io::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
     let _ = DELAY.set(Duration::from_millis(delay_ms));
-    let listener = TcpListener::bind(LISTEN).await?;
+    // The address can be changed for a local run, where port 9000 may be taken.
+    let listen = std::env::var("STUB_LISTEN").unwrap_or_else(|_| LISTEN.to_owned());
+    let listener = TcpListener::bind(listen).await?;
     loop {
         let (stream, _peer) = listener.accept().await?;
         tokio::spawn(async move {
