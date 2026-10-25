@@ -1,135 +1,88 @@
-//! Integration tests for the decision log fields: `request_id`, `decision_error`,
-//! and `retry_after`. A global subscriber captures the JSON log lines of this
-//! test process.
+//! Integration tests for the access log: the fields of each line, the request id,
+//! the truncation of a long id, the formats, and `access_log off`.
 
 mod common;
 
-use std::io;
-use std::sync::{Arc, Mutex, Once, PoisonError};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
-use common::{BoxError, StubDecider, TestResult, Upstream, send, start_proxy_config};
-use http::Method;
+use common::{BoxError, Reply, StubDecider, TestResult, Upstream, send, start_proxy_config};
+use http::{Method, StatusCode};
 use serde_json::Value;
-use std::time::Duration;
-use tracing_subscriber::fmt::MakeWriter;
 use vigilant_heron::Config;
 
 const JEV_PATH: &str = "/v1/systemone";
 const TOKEN_ENV: &str = "TEST_JEV_TOKEN";
 const GOOD_TOKEN: &str = "test-token";
 
-/// Collects everything the subscriber writes.
-#[derive(Clone, Default)]
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-/// Buffers one event and appends it to the sink in a single step, so events from
-/// different threads never interleave inside a line.
-struct EventWriter {
-    buffer: Vec<u8>,
-    sink: Arc<Mutex<Vec<u8>>>,
+/// A unique file path under the temp directory.
+fn log_path(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("vh-logging-{}-{name}.log", std::process::id()))
 }
 
-impl io::Write for EventWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for EventWriter {
-    fn drop(&mut self) {
-        self.sink
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend_from_slice(&self.buffer);
-    }
-}
-
-impl<'a> MakeWriter<'a> for Capture {
-    type Writer = EventWriter;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        EventWriter {
-            buffer: Vec::new(),
-            sink: Arc::clone(&self.0),
+/// Waits until a line with `request_id` appears in the file, and returns that line.
+async fn wait_for_line(path: &Path, request_id: &str) -> Result<Value, BoxError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        for line in text.lines() {
+            if let Ok(value) = serde_json::from_str::<Value>(line)
+                && value.get("request_id").and_then(Value::as_str) == Some(request_id)
+            {
+                return Ok(value);
+            }
         }
+        if Instant::now() > deadline {
+            return Err(format!("no access log line for {request_id}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
-static CAPTURE: std::sync::OnceLock<Capture> = std::sync::OnceLock::new();
-static INSTALL: Once = Once::new();
-
-fn capture() -> &'static Capture {
-    INSTALL.call_once(|| {
-        let capture = CAPTURE.get_or_init(Capture::default).clone();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_max_level(tracing::Level::INFO)
-            .with_writer(capture)
-            .finish();
-        // Only this test binary installs a subscriber, so the call cannot conflict.
-        let _ = tracing::subscriber::set_global_default(subscriber);
-    });
-    CAPTURE.get_or_init(Capture::default)
-}
-
-/// Returns the `fields` of the decision event for `request_id`, once it is logged.
-fn decision_fields(request_id: &str) -> Option<Value> {
-    let bytes = capture()
-        .0
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .clone();
-    String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|entry| entry["target"] == "vigilant_heron::decision")
-        .map(|entry| entry.get("fields").cloned().unwrap_or(Value::Null))
-        .find(|fields| fields["request_id"] == request_id)
-}
-
-fn decision_config(url: &str, backend: &str, upstream: &str) -> Result<Config, BoxError> {
-    // Install the capture before any request, so no decision event is missed.
-    capture();
-    let model = if backend == "jev" {
-        "model = \"jev-latest\"\napi_token_env = \"TEST_JEV_TOKEN\""
+/// A configuration whose only site logs JSON lines to `path`.
+fn config_for(
+    backend: &str,
+    decide_url: &str,
+    upstream: &str,
+    path: &Path,
+    site_extra: &str,
+) -> Result<Config, BoxError> {
+    let backend_lines = if backend == "jev" {
+        format!("backend jev;\n        api_token_env {TOKEN_ENV};\n        url {decide_url};")
     } else {
-        ""
+        format!("backend http;\n        url {decide_url};")
     };
     let text = format!(
-        r#"
-listen = "127.0.0.1:0"
-request_id_header = "x-request-id"
+        r"
+listen 127.0.0.1:0;
+request_id_header x-request-id;
+access_log {log} json;
 
-[decision]
-backend = "{backend}"
-{model}
-url = "{url}"
-timeout_ms = 300
-inspect_body_bytes = 512
-max_body_bytes = 1024
+decision {{
+        {backend_lines}
+        timeout 300ms;
+        inspect_body 512;
+        max_body 1024;
+}}
 
-[default]
-status = 421
-
-[[sites]]
-hosts = ["example.com"]
-upstream = "{upstream}"
-mode = "enforce"
-action = "block"
-block_threshold = 0.9
-instruction_threshold = 0.5
-"#
+site example.com {{
+    upstream {upstream};
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    {site_extra}
+}}
+",
+        log = path.display(),
     );
-    Ok(Config::from_toml_str_with_lookup(&text, |name| {
-        (name == TOKEN_ENV).then(|| GOOD_TOKEN.to_owned())
-    })?)
+    Ok(Config::parse_str_with_lookup(
+        &text,
+        "logging.conf",
+        |name| (name == TOKEN_ENV).then(|| GOOD_TOKEN.to_owned()),
+    )?)
 }
 
 async fn start_jev_fake() -> Result<FakeSystemOne, BoxError> {
@@ -142,34 +95,57 @@ async fn start_jev_fake() -> Result<FakeSystemOne, BoxError> {
     .await
 }
 
-#[tokio::test]
-async fn request_id_is_logged_truncated_and_not_sent_to_the_backend() -> TestResult {
-    let decider = StubDecider::start().await?;
-    let upstream = Upstream::start().await?;
-    let proxy = start_proxy_config(decision_config(
-        &decider.decide_url(),
-        "http",
-        &upstream.url(),
-    )?)
-    .await?;
-    let long_id = format!("rid-truncation-{}", "x".repeat(200));
-    let sent_id = long_id.clone();
-
-    let reply = send(
-        &proxy.base(),
+async fn get_with_id(base: &str, path: &str, id: &str) -> Result<Reply, BoxError> {
+    send(
+        base,
         Method::GET,
-        "/articles",
+        path,
         "example.com",
-        &[("x-request-id", sent_id.as_str())],
+        &[("x-request-id", id)],
         Bytes::new(),
     )
-    .await?;
+    .await
+}
 
-    assert_eq!(reply.status, http::StatusCode::OK);
-    let expected_id = long_id.get(..128).unwrap_or(&long_id);
-    let logged = decision_fields(expected_id).ok_or("no decision event with the request id")?;
-    let logged_id = logged["request_id"].as_str().unwrap_or_default();
-    assert_eq!(logged_id.len(), 128, "request_id must be cut to 128 bytes");
+#[tokio::test]
+async fn access_line_has_the_request_fields_and_the_decision() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("fields");
+    let _ = std::fs::remove_file(&path);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/articles", "fields-1").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "fields-1").await?;
+    assert_eq!(line["method"], "GET");
+    assert_eq!(line["path"], "/articles");
+    assert_eq!(line["site"], "example.com");
+    assert_eq!(line["status"], "200");
+    assert_eq!(line["action"], "allow");
+    assert_eq!(line["reason"], "below_threshold");
+    assert_eq!(line["input_tokens"], "");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn long_request_id_is_cut_to_128_bytes_and_not_sent_to_the_backend() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("truncation");
+    let _ = std::fs::remove_file(&path);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+    let long_id = format!("rid-truncation-{}", "x".repeat(200));
+
+    let reply = get_with_id(&proxy.base(), "/articles", &long_id).await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let expected = long_id.get(..128).unwrap_or(&long_id);
+    let line = wait_for_line(&path, expected).await?;
+    assert_eq!(line["request_id"].as_str().map(str::len), Some(128));
     let event = decider.last_event().unwrap_or_default();
     let names: Vec<&str> = event["event"]["untrusted"]["headers"]
         .as_array()
@@ -186,46 +162,36 @@ async fn request_id_is_logged_truncated_and_not_sent_to_the_backend() -> TestRes
 async fn rate_limit_is_logged_with_its_cause_and_retry_after() -> TestResult {
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
-    let proxy = start_proxy_config(decision_config(&fake.url, "jev", &upstream.url())?).await?;
+    let path = log_path("rate-limit");
+    let _ = std::fs::remove_file(&path);
+    let proxy =
+        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
 
-    let reply = send(
-        &proxy.base(),
-        Method::GET,
-        "/articles/ratelimited",
-        "example.com",
-        &[("x-request-id", "log-rate-limit-1")],
-        Bytes::new(),
-    )
-    .await?;
+    let reply = get_with_id(&proxy.base(), "/articles/ratelimited", "log-rate-1").await?;
 
-    assert_eq!(reply.status, http::StatusCode::OK);
-    let fields = decision_fields("log-rate-limit-1").ok_or("no decision event")?;
-    assert_eq!(fields["decision_error"], "rate_limited");
-    assert_eq!(fields["retry_after"], "2");
-    assert_eq!(fields["reason"], "rate_limited_allowed");
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "log-rate-1").await?;
+    assert_eq!(line["decision_error"], "rate_limited");
+    assert_eq!(line["retry_after"], "2");
+    assert_eq!(line["reason"], "rate_limited_allowed");
     proxy.stop().await
 }
 
 #[tokio::test]
-async fn backend_timeout_is_logged_as_timeout_not_as_busy() -> TestResult {
+async fn backend_timeout_is_logged_as_timeout() -> TestResult {
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
-    let proxy = start_proxy_config(decision_config(&fake.url, "jev", &upstream.url())?).await?;
+    let path = log_path("timeout");
+    let _ = std::fs::remove_file(&path);
+    let proxy =
+        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
 
-    let reply = send(
-        &proxy.base(),
-        Method::GET,
-        "/articles/slowanswer",
-        "example.com",
-        &[("x-request-id", "log-timeout-1")],
-        Bytes::new(),
-    )
-    .await?;
+    let reply = get_with_id(&proxy.base(), "/articles/slowanswer", "log-timeout-1").await?;
 
-    assert_eq!(reply.status, http::StatusCode::OK);
-    let fields = decision_fields("log-timeout-1").ok_or("no decision event")?;
-    assert_eq!(fields["decision_error"], "timeout");
-    assert_eq!(fields["reason"], "decision_error_allowed");
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "log-timeout-1").await?;
+    assert_eq!(line["decision_error"], "timeout");
+    assert_eq!(line["reason"], "decision_error_allowed");
     proxy.stop().await
 }
 
@@ -233,21 +199,16 @@ async fn backend_timeout_is_logged_as_timeout_not_as_busy() -> TestResult {
 async fn server_error_is_logged_as_http_status() -> TestResult {
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
-    let proxy = start_proxy_config(decision_config(&fake.url, "jev", &upstream.url())?).await?;
+    let path = log_path("http-status");
+    let _ = std::fs::remove_file(&path);
+    let proxy =
+        start_proxy_config(config_for("jev", &fake.url, &upstream.url(), &path, "")?).await?;
 
-    let reply = send(
-        &proxy.base(),
-        Method::GET,
-        "/articles/servererror",
-        "example.com",
-        &[("x-request-id", "log-500-1")],
-        Bytes::new(),
-    )
-    .await?;
+    let reply = get_with_id(&proxy.base(), "/articles/servererror", "log-500-1").await?;
 
-    assert_eq!(reply.status, http::StatusCode::OK);
-    let fields = decision_fields("log-500-1").ok_or("no decision event")?;
-    assert_eq!(fields["decision_error"], "http_status");
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "log-500-1").await?;
+    assert_eq!(line["decision_error"], "http_status");
     proxy.stop().await
 }
 
@@ -255,38 +216,38 @@ async fn server_error_is_logged_as_http_status() -> TestResult {
 async fn saturated_request_is_logged_as_backend_busy() -> TestResult {
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
-    capture();
+    let path = log_path("busy");
+    let _ = std::fs::remove_file(&path);
     let text = format!(
-        r#"
-listen = "127.0.0.1:0"
-request_id_header = "x-request-id"
+        r"
+listen 127.0.0.1:0;
+request_id_header x-request-id;
+access_log {log} json;
 
-[decision]
-backend = "jev"
-model = "jev-latest"
-api_token_env = "TEST_JEV_TOKEN"
-url = "{url}"
-timeout_ms = 300
-max_concurrency = 1
-inspect_body_bytes = 512
-max_body_bytes = 1024
+decision {{
+        backend jev;
+        api_token_env {TOKEN_ENV};
+        url {url};
+        timeout 300ms;
+        max_concurrency 1;
+        inspect_body 512;
+        max_body 1024;
+}}
 
-[default]
-status = 421
-
-[[sites]]
-hosts = ["example.com"]
-upstream = "{upstream}"
-mode = "enforce"
-action = "block"
-block_threshold = 0.9
-instruction_threshold = 0.5
-on_rate_limit = "block"
-"#,
+site example.com {{
+    upstream {upstream};
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    on_rate_limit block;
+}}
+",
+        log = path.display(),
         url = fake.url,
-        upstream = upstream.url()
+        upstream = upstream.url(),
     );
-    let config = Config::from_toml_str_with_lookup(&text, |name| {
+    let config = Config::parse_str_with_lookup(&text, "busy.conf", |name| {
         (name == TOKEN_ENV).then(|| GOOD_TOKEN.to_owned())
     })?;
     let proxy = start_proxy_config(config).await?;
@@ -303,32 +264,80 @@ on_rate_limit = "block"
         )
         .await
     });
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while fake.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        if std::time::Instant::now() > deadline {
+        if Instant::now() > deadline {
             return Err("the holding request never reached the backend".into());
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let reply = send(
-        &base,
-        Method::GET,
-        "/articles/queued",
-        "example.com",
-        &[("x-request-id", "log-busy-1")],
-        Bytes::new(),
-    )
-    .await?;
+    let reply = get_with_id(&base, "/articles/queued", "log-busy-1").await?;
     holder.await??;
 
     assert_eq!(
         reply.status,
-        http::StatusCode::FORBIDDEN,
+        StatusCode::FORBIDDEN,
         "on_rate_limit = block applies"
     );
-    let fields = decision_fields("log-busy-1").ok_or("no decision event")?;
-    assert_eq!(fields["decision_error"], "backend_busy");
-    assert_eq!(fields["reason"], "rate_limited_blocked");
+    let line = wait_for_line(&path, "log-busy-1").await?;
+    assert_eq!(line["decision_error"], "backend_busy");
+    assert_eq!(line["reason"], "rate_limited_blocked");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn unknown_host_is_logged_as_a_rejection_with_status_421() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("reject");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "unknown.example",
+        &[("x-request-id", "log-reject-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST);
+    let line = wait_for_line(&path, "log-reject-1").await?;
+    assert_eq!(line["action"], "reject");
+    assert_eq!(line["reason"], "unknown_host");
+    assert_eq!(line["status"], "421");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn access_log_off_writes_nothing_for_the_site() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("off");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "access_log off;",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/articles", "log-off-1").await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(!text.contains("log-off-1"));
     proxy.stop().await
 }

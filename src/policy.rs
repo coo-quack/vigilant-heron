@@ -184,9 +184,9 @@ mod tests {
     use crate::prefilter::normalized_path;
     use crate::test_support::site;
 
-    const REDIRECT: &str = "action = \"redirect\"\nredirect_to = \"https://example.com/blocked\"";
-    const FAIL_CLOSED: &str = "fail_closed_paths = [\"/WP-LOGIN.php\"]";
-    const SHADOW: &str = "mode = \"shadow\"";
+    const REDIRECT: &str = "action redirect https://example.com/blocked;";
+    const FAIL_CLOSED: &str = "fail_closed_path /WP-LOGIN.php;";
+    const SHADOW: &str = "mode shadow;";
 
     fn fields(parts: &[&str]) -> String {
         parts.join("\n")
@@ -397,8 +397,8 @@ mod tests {
         } else {
             "on_decision_error"
         };
-        let setting_line = format!("{key} = \"{setting}\"");
-        let mode_line = format!("mode = \"{mode}\"");
+        let setting_line = format!("{key} {setting};");
+        let mode_line = format!("mode {mode};");
         let config_fields = [FAIL_CLOSED.to_owned(), setting_line, mode_line];
         let config = site(&config_fields.join("\n"))?;
         let path = if fail_closed {
@@ -425,9 +425,9 @@ mod tests {
     fn rule_is_decided_regardless_of_failure_settings() -> Result<(), ConfigError> {
         for setting in ["allow", "block"] {
             let config = site(&fields(&[
-                "deny_paths = [\"/.env\"]",
-                &format!("on_rate_limit = \"{setting}\""),
-                &format!("on_decision_error = \"{setting}\""),
+                "deny_path /.env;",
+                &format!("on_rate_limit {setting};"),
+                &format!("on_decision_error {setting};"),
             ]))?;
             let decision = decide(&config, &normalized_path("/.env"), &Assessment::Rule);
             assert_eq!(decision.action, Action::Block);

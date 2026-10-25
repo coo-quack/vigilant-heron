@@ -99,7 +99,7 @@ mod tests {
         #[case] raw: &str,
         #[case] expected_path: &str,
     ) -> Result<(), ConfigError> {
-        let config = site("deny_paths = [\"/xmlrpc.php\"]")?;
+        let config = site("deny_path /xmlrpc.php;")?;
         let path = normalized_path(raw);
         assert_eq!(path, expected_path);
         assert_eq!(
@@ -111,7 +111,7 @@ mod tests {
 
     #[test]
     fn deny_rule_is_not_applied_to_other_paths() -> Result<(), ConfigError> {
-        let config = site("deny_paths = [\"/xmlrpc.php\"]")?;
+        let config = site("deny_path /xmlrpc.php;")?;
         assert_eq!(
             screen(&config, &Method::POST, "/index.php", false, false),
             Screening::Inspect
@@ -149,7 +149,7 @@ mod tests {
     #[case::trailing_dot("/xmlrpc.php/.")]
     #[case::encoded_slash_and_dots("/a%2F..%2Fxmlrpc.php")]
     fn deny_rule_cannot_be_bypassed_with_path_tricks(#[case] raw: &str) -> Result<(), ConfigError> {
-        let config = site("deny_paths = [\"/xmlrpc.php\"]")?;
+        let config = site("deny_path /xmlrpc.php;")?;
         let path = normalized_path(raw);
         assert_eq!(
             screen(&config, &Method::POST, &path, false, true),
@@ -217,7 +217,7 @@ mod tests {
 
     #[test]
     fn deny_rule_takes_precedence_over_static_skip() -> Result<(), ConfigError> {
-        let config = site("deny_paths = [\"/assets/\"]")?;
+        let config = site("deny_path /assets/;")?;
         assert_eq!(
             screen(&config, &Method::GET, "/assets/app.js", false, true),
             Screening::Rule

@@ -32,32 +32,33 @@ fn token_lookup(token: &'static str) -> impl Fn(&str) -> Option<String> {
 fn jev_config(fake_url: &str, upstream_url: &str, token: &'static str) -> Result<Config, BoxError> {
     let text = format!(
         r#"
-listen = "127.0.0.1:0"
+listen 127.0.0.1:0;
 
-[decision]
-backend = "jev"
-model = "jev-latest"
-url = "{fake_url}"
-api_token_env = "{TOKEN_ENV}"
-timeout_ms = 2000
-inspect_body_bytes = 512
-max_body_bytes = 1024
+decision {{
+    backend jev;
+    model jev-latest;
+    url "{fake_url}";
+    api_token_env "{TOKEN_ENV}";
+    timeout 2000ms;
+    inspect_body 512;
+    max_body 1024;
+}}
 
-[default]
-status = 421
+default_status 421;
 
-[[sites]]
-hosts = ["example.com"]
-upstream = "{upstream_url}"
-mode = "enforce"
-action = "block"
-block_threshold = 0.9
-instruction_threshold = 0.5
-fail_closed_paths = ["/wp-login.php"]
+site example.com {{
+    upstream "{upstream_url}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    fail_closed_path /wp-login.php;
+}}
 "#
     );
-    Ok(Config::from_toml_str_with_lookup(
+    Ok(Config::parse_str_with_lookup(
         &text,
+        "test.conf",
         token_lookup(token),
     )?)
 }

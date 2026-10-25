@@ -18,7 +18,7 @@ services:
       context: ..
       target: runtime
     volumes:
-      - ./config.toml:/etc/vigilant-heron/config.toml:ro
+      - ./vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro
     depends_on:
       - stub-decider
       - upstream
@@ -28,7 +28,7 @@ services:
       context: ..
       target: runtime
     volumes:
-      - ./config-clef.toml:/etc/vigilant-heron/config.toml:ro
+      - ./config-clef.conf:/etc/vigilant-heron/vigilant-heron.conf:ro
     environment:
       # Test-only token. The stub decider accepts exactly this bearer token.
       E2E_CLEF_TOKEN: test-token
@@ -41,7 +41,7 @@ services:
       context: ..
       target: runtime
     volumes:
-      - ./config-jev.toml:/etc/vigilant-heron/config.toml:ro
+      - ./config-jev.conf:/etc/vigilant-heron/vigilant-heron.conf:ro
     environment:
       # Test-only token. The stub decider accepts exactly this bearer token.
       E2E_JEV_TOKEN: test-token
