@@ -168,3 +168,9 @@
   The expectation `session=1` in the lexical test became `session=[REDACTED]`,
   because the list now includes `session` (the previous expectation encoded the
   shorter list).
+- Security (F7): the decision event's `meta.host` is the name of the matched
+  site (its first name, or the pattern of a wildcard or regex site), never the
+  client's `Host`. The client's `Host` stays in the `untrusted` headers only. A
+  `Host` that is not a hostname, an IPv4 address or a bracketed IPv6 literal with
+  an optional port now gets 400 with reason `invalid_host`, before the access
+  list. A request with no `Host` header is routed as before.

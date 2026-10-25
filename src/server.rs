@@ -50,7 +50,7 @@ use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
 use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
 use crate::realip::RealIp;
-use crate::router::{Router, normalize_host};
+use crate::router::{Router, is_valid_host, normalize_host};
 use crate::rules::RuleInput;
 use crate::sanitize::{self, EventInput, truncate_utf8};
 use crate::system_one::SystemOneBackend;
@@ -646,6 +646,19 @@ async fn pipeline<B: DecisionBackend>(
             true,
         );
     }
+    // A Host that is not a hostname or a literal is refused before it is routed.
+    let host_header = parts.headers.get(HOST);
+    if host_header.is_some_and(|value| !value.to_str().is_ok_and(is_valid_host)) {
+        return reject(
+            parts,
+            trace,
+            "",
+            StatusCode::BAD_REQUEST,
+            "invalid_host",
+            &state.global_sinks,
+            !done.load(Ordering::Acquire),
+        );
+    }
     // The access list comes next, before the body is read and before the host is judged.
     let entries = matched.map_or(state.access.as_slice(), |site| site.access.as_slice());
     let access_denied = !access::permits(entries, trace.client_addr);
@@ -744,7 +757,15 @@ async fn pipeline<B: DecisionBackend>(
             Screening::SkipRule(id) => Some(Arc::clone(id)),
             Screening::Skip | Screening::Inspect => None,
         };
-        let assessment = assess(state, parts, &sniffed, trace.client_ip, &screening).await;
+        let assessment = assess(
+            state,
+            parts,
+            &sniffed,
+            trace.client_ip,
+            site_name(site),
+            &screening,
+        )
+        .await;
         (assessment, rule_id)
     };
     let mut decision = policy::decide(site, &path, &assessment);
@@ -1056,6 +1077,7 @@ async fn assess<B: DecisionBackend>(
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
+    site: &str,
     screening: &Screening,
 ) -> Assessment {
     match screening {
@@ -1063,8 +1085,8 @@ async fn assess<B: DecisionBackend>(
         Screening::SkipRule(_) => Assessment::SkipRule,
         Screening::Skip => Assessment::Skip,
         Screening::Inspect => {
-            // The event carries the host the client asked for, which may match a wildcard or regex name.
-            let host = host_name(parts);
+            // The event carries the name of the matched site, never the client's Host. The
+            // Host the client sent stays in the untrusted headers.
             let event = sanitize::build_event(&EventInput {
                 method: &parts.method,
                 path: parts.uri.path(),
@@ -1072,7 +1094,7 @@ async fn assess<B: DecisionBackend>(
                 headers: &parts.headers,
                 body: &sniffed.prefix,
                 body_continues: sniffed.truncated,
-                host: &host,
+                host: site,
                 client_ip,
                 redact_headers: &state.backend_redact,
                 redact_fields: &state.backend_redact_fields,

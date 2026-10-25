@@ -243,6 +243,73 @@ async fn every_real_ip_header_line_is_read(
     Ok(())
 }
 
+#[rstest]
+// Characters outside hostnames, and a port that is not digits, are refused before routing.
+#[case::space("exa mple.com")]
+#[case::slash("example.com/admin")]
+#[case::semicolon("example.com;x")]
+#[case::quote("ex\"ample.com")]
+#[case::bad_port("example.com:80x")]
+#[case::empty("")]
+#[tokio::test]
+async fn a_host_with_characters_outside_hostnames_gets_400(#[case] host: &str) -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path(&format!("invalid-host-{}", host.len()));
+    let _ = std::fs::remove_file(&log);
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        "",
+        "",
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        host,
+        &[("x-request-id", "host-bad-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(decider.calls(), 0);
+    let line = wait_for_line(&log, "host-bad-1").await?;
+    assert_eq!(line["action"], "reject");
+    assert_eq!(line["reason"], "invalid_host");
+    proxy.stop().await
+}
+
+#[rstest]
+#[case::port("example.com:8080")]
+#[case::trailing_dot("EXAMPLE.com.")]
+#[case::ipv6_literal_with_port("[2001:db8::1]:8443")]
+#[tokio::test]
+async fn a_valid_host_is_routed_as_before(#[case] host: &str) -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path(&format!("valid-host-{}", host.len()));
+    let _ = std::fs::remove_file(&log);
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        "",
+        "",
+    ))
+    .await?;
+
+    let reply = send(&proxy.base(), Method::GET, "/", host, &[], Bytes::new()).await?;
+
+    // Hostnames that match a site are forwarded, others take default_status (421).
+    assert_ne!(reply.status, StatusCode::BAD_REQUEST, "{host}");
+    proxy.stop().await
+}
+
 #[tokio::test]
 async fn an_access_denied_request_is_refused_even_on_a_redirect_site() -> TestResult {
     let decider = StubDecider::start().await?;

@@ -91,7 +91,7 @@ written as `$name` or `${name}`.
 | `$http_<name>` | A request header, with `_` for `-` |
 
 The `$reason` values are `model`, `below_threshold`, `rule`, `skip`, `skip_rule`,
-`access_denied`, `fail_closed_path`, `rate_limited_allowed`,
+`access_denied`, `invalid_host`, `fail_closed_path`, `rate_limited_allowed`,
 `rate_limited_blocked`, `decision_error_allowed`, `decision_error_blocked`, and the
 limit and timer reasons such as `limit_req`, `limit_conn`, `header_timeout`,
 `body_timeout`, `body_too_large`, `unreadable_body` and `uri_too_long`.

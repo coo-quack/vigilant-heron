@@ -157,15 +157,17 @@ the top-level list for that site. An unknown id is a configuration error.
 
 For each request, in this order:
 
-1. The access list. A denied client gets 403 (`reason access_denied`).
-2. `deny_path` entries of the site. A match is a rule block (`reason rule`, no
+1. A `Host` that is not a hostname or a literal, with an optional port, gets 400
+   (`reason invalid_host`).
+2. The access list. A denied client gets 403 (`reason access_denied`).
+3. `deny_path` entries of the site. A match is a rule block (`reason rule`, no
    `$rule_id`).
-3. Block rules: the built-in rules that are on, then the top-level block rules
+4. Block rules: the built-in rules that are on, then the top-level block rules
    in the order of the file, then the site's block rules. The first match blocks.
-4. Skip rules: the top-level skip rules, then the site's. The first match
+5. Skip rules: the top-level skip rules, then the site's. The first match
    forwards the request without calling the backend (`reason skip_rule`).
-5. The static asset skip (`static_extensions`), which also forwards.
-6. The decision model. The thresholds and failure settings apply here only.
+6. The static asset skip (`static_extensions`), which also forwards.
+7. The decision model. The thresholds and failure settings apply here only.
 
 Limits (see [Limits](#limits)) run before all of these, at step 0. A request
 refused by a limit gets its status and never reaches steps 1 to 6. In a shadow

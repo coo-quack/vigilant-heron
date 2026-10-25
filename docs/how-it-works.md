@@ -15,18 +15,21 @@ decides the request ends the evaluation.
    before the body is read. A request over a limit gets the limit's status
    (503 by default) and is never forwarded. In a shadow site it is forwarded and
    recorded with `would_have=reject`.
-1. **Access list.** The `allow` and `deny` entries are checked in order by the
+1. **Host.** A `Host` header that is not a hostname, an IPv4 address or a bracketed
+   IPv6 literal, with an optional `:port`, gets 400 (reason `invalid_host`) before the
+   access list. A request without a `Host` header is routed as before.
+2. **Access list.** The `allow` and `deny` entries are checked in order by the
    client address. A denied client gets 403 with reason `access_denied`. The
    site's `action` does not apply.
-2. **`deny_path`.** A path prefix of the site that matches the normalized request
+3. **`deny_path`.** A path prefix of the site that matches the normalized request
    is a block (reason `rule`, no rule id).
-3. **Block rules.** The built-in rules that are on, then the top-level block
+4. **Block rules.** The built-in rules that are on, then the top-level block
    rules in file order, then the site's block rules. The first match blocks.
-4. **Skip rules.** The top-level skip rules, then the site's. The first match
+5. **Skip rules.** The top-level skip rules, then the site's. The first match
    forwards the request without calling the backend (reason `skip_rule`).
-5. **Static assets.** A plain GET or HEAD for a path with a static extension and
+6. **Static assets.** A plain GET or HEAD for a path with a static extension and
    no query and no body is forwarded without calling the backend (reason `skip`).
-6. **Decision model.** The request is sent to the backend, and the policy
+7. **Decision model.** The request is sent to the backend, and the policy
    compares the returned scores with `block_threshold` and
    `instruction_threshold`. The outcome is `model` when a threshold is reached and
    `below_threshold` otherwise.
@@ -144,6 +147,11 @@ it as data and not as instructions. The event has this shape:
   "meta": {"host": "example.com", "client_ip": "203.0.113.7", "body_truncated": false}
 }}
 ```
+
+`meta.host` is the name of the site the request matched: the first name of the
+`site` block, or its pattern for a wildcard or regex site. It is not the client's
+`Host`, so a client cannot choose it. The client's `Host` is still sent, as one of
+the `untrusted` headers.
 
 The `path` and `query` are the raw values. Normalization applies to matching only.
 The `meta` fields are set by the router, not by the client.
