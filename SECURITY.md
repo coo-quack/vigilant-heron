@@ -69,6 +69,18 @@ nginx's, and the table in the README lists them all.
 The header limits check the bytes of each request as they are read. A request
 pipelined behind another on the same connection is not checked by them.
 
+A response sent before the request body is read (413, 403 for a rule block, 408
+or 400) is followed by a lingering close, as nginx does. The router reads and
+discards the client's remaining bytes, in a 4 KiB buffer, so a client that is
+still sending receives the response instead of a reset. Lingering is bounded:
+it ends when the client closes, after `lingering_timeout` without data, or after
+`lingering_time` in total, so it cannot hold a connection longer than
+`lingering_time`. The total is 30s by default and the silence is 5s. An
+attacker can still keep one connection open for `lingering_time` after each
+rejected request, so `max_connections` and the memory per connection still
+bound the load. `lingering_close off` removes this cost and gives up the
+orderly response to such clients.
+
 ## Access list and rules
 
 The access list, the `deny_path` entries and the rules are decided before the

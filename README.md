@@ -230,6 +230,9 @@ disables keep-alive, and `client_max_body_size 0` removes the body limit.
 | `keepalive_requests` | 1000 | top level | requests served on one connection | the last one answers `Connection: close` |
 | `send_timeout` | 60s | top level | time between two successive writes to the client | the connection closes |
 | `large_client_header_buffers` | 4 8k | top level | request line up to 8k, each header field up to 8k, the header section up to 4 × 8k | 414 for a long request line, 400 for a long field or section |
+| `lingering_close` | on | top level | when a connection lingers after its response: `on` only when request data was left unread, `always` after every response to a request, `off` never | the connection closes; see the note on lingering below |
+| `lingering_time` | 30s | top level | total time of one lingering close | the connection closes |
+| `lingering_timeout` | 5s | top level | silence, with no client data, that one lingering close waits for | the connection closes |
 | `client_body_timeout` | 60s | top level, site | time between two successive reads of the request body | 408 |
 | `client_max_body_size` | 1m | top level, site | the request body | 413, before the body is read when `Content-Length` says so |
 | `proxy_connect_timeout` | 60s | top level, site | connecting to the upstream | 504 |
@@ -246,10 +249,10 @@ An upstream that cannot be reached, or that resets the connection, still gets
 Notes on where the limits differ from nginx:
 
 - The connection timers and header limits (`client_header_timeout`,
-  `keepalive_timeout`, `keepalive_requests`, `send_timeout` and
-  `large_client_header_buffers`) are top-level only. They apply before the
-  `Host` selects a site, and a `site` block that sets one is a configuration
-  error.
+  `keepalive_timeout`, `keepalive_requests`, `send_timeout`,
+  `large_client_header_buffers` and the lingering directives) are top-level
+  only. They apply before the `Host` selects a site, and a `site` block that
+  sets one is a configuration error.
 - The `proxy_read_timeout` clock starts when the request is handed to the
   upstream client, so it includes connecting. `proxy_connect_timeout` bounds
   the connect on its own.
@@ -257,6 +260,14 @@ Notes on where the limits differ from nginx:
 - A connection whose `client_header_timeout` expires before it sent any byte
   of a request is closed without a response. The first request's clock starts
   when the connection is accepted.
+- Lingering is nginx's `lingering_close`, with the same names and defaults. The
+  router writes its answer in full, half-closes the connection, then reads and
+  discards what the client still sends. The discard buffer is 4 KiB. A lingering
+  close ends when the client closes, after `lingering_timeout` without data, or
+  after `lingering_time` in total, so no connection is held longer than
+  `lingering_time` after the close is decided. Connections that have not sent a
+  request byte, and idle keep-alive connections that time out, close at once in
+  every mode. A graceful shutdown waits for lingering closes that are in progress.
 
 Where each limit is enforced. The header limits and the connection timers
 apply to the bytes before hyper parses them, in the socket wrapper

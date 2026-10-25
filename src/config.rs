@@ -47,6 +47,10 @@ const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(75);
 /// Default `keepalive_requests`.
 const DEFAULT_KEEPALIVE_REQUESTS: usize = 1000;
+/// Default `lingering_time`.
+const DEFAULT_LINGERING_TIME: Duration = Duration::from_secs(30);
+/// Default `lingering_timeout`.
+const DEFAULT_LINGERING_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default `large_client_header_buffers` count.
 const DEFAULT_HEADER_BUFFER_COUNT: usize = 4;
 /// Default `large_client_header_buffers` size.
@@ -138,6 +142,31 @@ pub struct ConnectionConfig {
     pub send_timeout: Duration,
     /// Size limits of the request line and header fields.
     pub large_header_buffers: HeaderBuffers,
+    /// When a connection lingers after its response, reading and discarding the
+    /// client's data, before it closes.
+    pub lingering_close: LingeringClose,
+    /// Longest total time one lingering close may take.
+    pub lingering_time: Duration,
+    /// Longest silence, with no client data, that one lingering close waits for.
+    pub lingering_timeout: Duration,
+}
+
+/// When a connection lingers before it closes (`lingering_close`).
+///
+/// Lingering half-closes the connection after the response is written, then
+/// reads and discards the client's data until the client closes, until no data
+/// arrives for `lingering_timeout`, or until `lingering_time` has passed. A
+/// client that is still sending when the router closes would otherwise see a
+/// reset instead of the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LingeringClose {
+    /// Linger only when the request had data the router did not read: an unread
+    /// body, or a request header cut short by a limit.
+    On,
+    /// Linger after every response to a request, whether or not the request was read.
+    Always,
+    /// Close at once.
+    Off,
 }
 
 /// Limits for the request line and header section, as `large_client_header_buffers`.
@@ -470,6 +499,22 @@ fn parse_bool(directive: &Directive, text: &str) -> Result<bool, ConfigError> {
     }
 }
 
+/// Parses `lingering_close`: `on`, `always` or `off`.
+fn parse_lingering_close(directive: &Directive, text: &str) -> Result<LingeringClose, ConfigError> {
+    match text {
+        "on" => Ok(LingeringClose::On),
+        "always" => Ok(LingeringClose::Always),
+        "off" => Ok(LingeringClose::Off),
+        _ => Err(invalid(
+            directive,
+            format!(
+                "\"{}\" must be \"on\", \"always\" or \"off\"",
+                directive.name
+            ),
+        )),
+    }
+}
+
 fn parse_failure(directive: &Directive, text: &str) -> Result<FailureAction, ConfigError> {
     match text {
         "allow" => Ok(FailureAction::Allow),
@@ -545,12 +590,15 @@ const SITE_TIMEOUT_NAMES: [&str; 5] = [
 ];
 
 /// Connection timers that apply before a site is chosen, so only the top level may set them.
-const CONNECTION_NAMES: [&str; 6] = [
+const CONNECTION_NAMES: [&str; 9] = [
     "client_header_timeout",
     "keepalive_timeout",
     "keepalive_requests",
     "send_timeout",
     "large_client_header_buffers",
+    "lingering_close",
+    "lingering_time",
+    "lingering_timeout",
     "max_body",
 ];
 
@@ -650,6 +698,9 @@ where
             count: DEFAULT_HEADER_BUFFER_COUNT,
             size: DEFAULT_HEADER_BUFFER_SIZE,
         },
+        lingering_close: LingeringClose::On,
+        lingering_time: DEFAULT_LINGERING_TIME,
+        lingering_timeout: DEFAULT_LINGERING_TIMEOUT,
     };
     // The top-level values of the site-overridable timers, inherited by every site.
     let mut site_timeouts = SiteTimeouts {
@@ -778,6 +829,18 @@ where
             "large_client_header_buffers" => {
                 once(&mut seen, directive)?;
                 connection.large_header_buffers = parse_header_buffers(directive)?;
+            }
+            "lingering_close" => {
+                once(&mut seen, directive)?;
+                connection.lingering_close = parse_lingering_close(directive, one_arg(directive)?)?;
+            }
+            "lingering_time" => {
+                once(&mut seen, directive)?;
+                connection.lingering_time = parse_positive_time(directive, one_arg(directive)?)?;
+            }
+            "lingering_timeout" => {
+                once(&mut seen, directive)?;
+                connection.lingering_timeout = parse_positive_time(directive, one_arg(directive)?)?;
             }
             "client_body_timeout"
             | "client_max_body_size"
@@ -2300,6 +2363,36 @@ mod connection_limit_tests {
     }
 
     #[test]
+    fn lingering_defaults_match_nginx() -> Result<(), ConfigError> {
+        let config = parse("", "")?;
+        assert_eq!(config.connection.lingering_close, LingeringClose::On);
+        assert_eq!(config.connection.lingering_time, Duration::from_secs(30));
+        assert_eq!(config.connection.lingering_timeout, Duration::from_secs(5));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::on("on", LingeringClose::On)]
+    #[case::always("always", LingeringClose::Always)]
+    #[case::off("off", LingeringClose::Off)]
+    fn lingering_close_takes_its_three_values(
+        #[case] text: &str,
+        #[case] expected: LingeringClose,
+    ) -> Result<(), ConfigError> {
+        let config = parse(
+            &format!("lingering_close {text};\nlingering_time 2s;\nlingering_timeout 250ms;\n"),
+            "",
+        )?;
+        assert_eq!(config.connection.lingering_close, expected);
+        assert_eq!(config.connection.lingering_time, Duration::from_secs(2));
+        assert_eq!(
+            config.connection.lingering_timeout,
+            Duration::from_millis(250)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn keepalive_requests_and_header_buffers_are_read() -> Result<(), ConfigError> {
         let config = parse(
             "keepalive_requests 5;\nlarge_client_header_buffers 2 16k;\n",
@@ -2320,6 +2413,12 @@ mod connection_limit_tests {
     #[case::client_header_zero("client_header_timeout 0;\n", "must be greater than 0")]
     #[case::send_zero("send_timeout 0s;\n", "must be greater than 0")]
     #[case::keepalive_requests_zero("keepalive_requests 0;\n", "must be at least 1")]
+    #[case::lingering_time_zero("lingering_time 0s;\n", "must be greater than 0")]
+    #[case::lingering_timeout_zero("lingering_timeout 0;\n", "must be greater than 0")]
+    #[case::lingering_close_unknown(
+        "lingering_close maybe;\n",
+        "must be \"on\", \"always\" or \"off\""
+    )]
     #[case::buffers_missing_size("large_client_header_buffers 4;\n", "takes two arguments")]
     #[case::buffers_zero_count("large_client_header_buffers 0 8k;\n", "at least 1")]
     #[case::buffers_bad_size("large_client_header_buffers 4 8q;\n", "unknown size unit")]
@@ -2346,6 +2445,9 @@ mod connection_limit_tests {
             "keepalive_requests 5;",
             "send_timeout 5s;",
             "large_client_header_buffers 4 8k;",
+            "lingering_close on;",
+            "lingering_time 30s;",
+            "lingering_timeout 5s;",
         ] {
             let text = message(parse("", &format!("    {name}\n")));
             assert!(

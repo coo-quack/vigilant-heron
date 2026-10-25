@@ -449,3 +449,21 @@ async fn access_list_deny_all_gets_403() -> TestResult {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn rule_block_on_a_large_post_gets_403_through_nginx() -> TestResult {
+    // /xmlrpc.php is a deny rule on enforce.test. The 512 KB body stays under the 1 MB limit,
+    // so the rule decides after the router has read only a prefix of the body.
+    let reply = send(
+        &base(),
+        Method::POST,
+        "/xmlrpc.php",
+        "enforce.test",
+        &[("content-type", "text/xml")],
+        Bytes::from(vec![b'a'; 512 * 1024]),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}

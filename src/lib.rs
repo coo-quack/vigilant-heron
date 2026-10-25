@@ -34,7 +34,8 @@ mod transport;
 pub use accesslog::LogFormat;
 pub use config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, DecisionConfig, ErrorLogConfig,
-    FailureAction, HeaderBuffers, LogLevel, Mode, SiteAction, SiteConfig, SiteTimeouts,
+    FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, SiteAction, SiteConfig,
+    SiteTimeouts,
 };
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};

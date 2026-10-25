@@ -46,6 +46,12 @@
   keep-alive) and `keepalive_requests`. The connection timers and header limits
   are top-level only; the body timer and `client_max_body_size` can be set per
   site.
+- Lingering close, as nginx's `lingering_close`: after an early response (413,
+  403, 408, 400, 414) the router half-closes and discards the client's remaining
+  bytes, so a client that is still sending reads the response instead of a
+  reset. `lingering_close on|always|off` (default `on`), `lingering_time` (30s)
+  and `lingering_timeout` (5s) are top-level only. Lingering is bounded by both
+  times.
 - `large_client_header_buffers`: a request line over one buffer gets 414, a
   header field or a header section over its limit gets 400. A request header
   that stops arriving gets 408; a silent connection is closed.

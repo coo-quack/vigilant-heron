@@ -903,3 +903,211 @@ async fn an_early_answer_with_an_unread_body_closes_the_connection() -> TestResu
     );
     proxy.stop().await
 }
+
+/// Lingering timers short enough for the tests: silence ends a lingering close after 300 ms.
+const LINGER_FAST: &str = "lingering_timeout 300ms;\nlingering_time 3s;";
+
+/// Writes `total` bytes in pieces of `piece` bytes with `pause` between them, as a client
+/// still sending its body would. Returns the number of bytes written before a write failed.
+async fn trickle(
+    stream: &mut TcpStream,
+    total: usize,
+    piece: usize,
+    pause: Duration,
+) -> Result<usize, BoxError> {
+    let chunk = vec![b'b'; piece];
+    let mut sent = 0;
+    while sent < total {
+        if stream.write_all(&chunk).await.is_err() {
+            break;
+        }
+        sent += piece;
+        tokio::time::sleep(pause).await;
+    }
+    Ok(sent)
+}
+
+#[tokio::test]
+async fn content_length_over_the_limit_gets_413_while_the_client_keeps_sending() -> TestResult {
+    // The router answers from Content-Length and closes with the body unread. A client that is
+    // still sending must not be reset before it reads the 413.
+    let (upstream, hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        &format!("client_max_body_size 1k;\n{LINGER_FAST}"),
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 20000\r\n\r\n")
+        .await?;
+    let sent = trickle(&mut stream, 20_000, 1_000, Duration::from_millis(5)).await?;
+    assert_eq!(sent, 20_000, "the client must be able to finish its body");
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 413);
+    assert!(head.to_ascii_lowercase().contains("connection: close"));
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.calls(), 0);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn rule_block_with_a_body_gets_403_while_the_client_keeps_sending() -> TestResult {
+    // deny_path /blocked is a rule: the body is sniffed, then the block closes with the rest unread.
+    let (upstream, hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        &format!("client_max_body_size 1m;\n{LINGER_FAST}"),
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 200000\r\n\r\n")
+        .await?;
+    let sent = trickle(&mut stream, 200_000, 2_000, Duration::from_millis(2)).await?;
+    assert_eq!(sent, 200_000, "the client must be able to finish its body");
+    let (status, _, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 403);
+    assert_eq!(stub.calls(), 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn model_block_with_a_body_gets_403_while_the_client_keeps_sending() -> TestResult {
+    let (upstream, hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(StubBehavior {
+        attack: 0.95,
+        ..StubBehavior::default()
+    });
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        &format!("client_max_body_size 1m;\n{LINGER_FAST}"),
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 20000\r\n\r\n")
+        .await?;
+    let sent = trickle(&mut stream, 20_000, 1_000, Duration::from_millis(5)).await?;
+    assert_eq!(sent, 20_000, "the client must be able to finish its body");
+    let (status, _, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 403);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn lingering_close_off_closes_with_the_body_unread() -> TestResult {
+    // With lingering off the socket closes at once, so the rest of the body meets a closed
+    // socket and the client's writes fail.
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        "client_max_body_size 1k;\nlingering_close off;",
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 20000\r\n\r\n")
+        .await?;
+    let sent = trickle(&mut stream, 20_000, 1_000, Duration::from_millis(5)).await?;
+    assert!(
+        sent < 20_000,
+        "with lingering off the router closes before the body is sent"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn always_lingers_after_a_normal_response() -> TestResult {
+    // keepalive_requests 1 makes the 200 close the connection. A client that sends more after
+    // the response gets an orderly end of stream, not a reset.
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        &format!("keepalive_requests 1;\nlingering_close always;\n{LINGER_FAST}"),
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await?;
+    let (status, _, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stream.write_all(b"late bytes").await?;
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(SETTLE, stream.read(&mut byte)).await??;
+    assert_eq!(read, 0, "the close must be an orderly end of stream");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn lingering_close_off_resets_a_client_that_sends_after_a_normal_response() -> TestResult {
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        "keepalive_requests 1;\nlingering_close off;",
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"GET /one HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await?;
+    let (status, _, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 200);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    stream.write_all(b"late bytes").await?;
+    // The router has closed by now, so it answers the late bytes with a reset.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut byte = [0u8; 1];
+    let outcome = tokio::time::timeout(SETTLE, stream.read(&mut byte)).await?;
+    let kind = outcome.err().map(|error| error.kind());
+    assert_eq!(kind, Some(std::io::ErrorKind::ConnectionReset));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn access_list_deny_with_a_body_gets_403_while_the_client_keeps_sending() -> TestResult {
+    // The access list refuses before the body is read. The client is still sending, so the
+    // router must linger rather than reset the connection before the 403 is read.
+    let (upstream, hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        &format!("client_max_body_size 1m;\n{LINGER_FAST}"),
+        "deny all;",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 200000\r\n\r\n")
+        .await?;
+    let sent = trickle(&mut stream, 200_000, 2_000, Duration::from_millis(2)).await?;
+    assert_eq!(sent, 200_000, "the client must be able to finish its body");
+    let (status, _, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 403);
+    assert_eq!(stub.calls(), 0);
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    proxy.stop().await
+}
