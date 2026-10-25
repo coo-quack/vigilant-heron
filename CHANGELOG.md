@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- **Breaking:** the access list and the rules run before the decision backend,
+  and a rule block now also comes from the built-in set. Existing configurations
+  keep their behavior except for requests the built-in rules match, which are
+  now blocked without a backend call. Turn them off with `builtin_rules off;`,
+  or disable single ids with `disable_rule`.
+- Access list, as in nginx: `allow` and `deny` with an address, a CIDR network or
+  `all`, at the top level and in a `site` (a site's list replaces the top-level
+  one). The first match decides, and the client address comes from the realip
+  settings. A denied client gets 403 with reason `access_denied`, before the body
+  is read; on a shadow site it is forwarded and recorded with `would_have=block`.
+- Rules in nginx syntax: `rule <id> { description; action block|skip; ... }` at
+  the top level (all sites, or the sites named by `site`) and inside a `site`.
+  Conditions: `method`, `path` (prefix, `=`, `^~`, `~`, `~*`), `query`, `header`,
+  `body` (the inspected prefix), `any` and `client`. Regexes use the `regex`
+  crate (linear time), with a 512-byte source and 1 MiB compiled size limit, and
+  at most 1000 rules per configuration. Ids are unique across files and `vh-`
+  is reserved.
+- Built-in rules (`src/rules/builtin.conf`, ids `vh-<category>-<nnn>`) for SQL
+  injection, XSS, path traversal, command injection, file inclusion, SSRF,
+  template injection, XXE and known scanner user agents. They are written to miss
+  an attack rather than block code pastes, prose about SQL or HTML, base64 blobs
+  or Japanese text. `builtin_rules` and `disable_rule` control them, at the top
+  level and per site.
+- Logs: `$rule_id` is the id of the rule that decided the request. The reasons
+  `access_denied`, `rule` and `skip_rule` are new. The built-in `json` format
+  has a `rule_id` field.
+- `eval/rules.py` measures the built-in rules on the labelled dataset and the
+  combined pipeline with the saved model results. `eval/run.py` runs with the
+  built-in rules off, so it still measures the model alone.
+
 - **Breaking:** `decision.max_body` is replaced by the top-level
   `client_max_body_size`, which takes nginx's units and defaults to `1m`
   (`max_body` defaulted to 10m). `client_max_body_size 0` is unlimited. A body
@@ -16,6 +46,12 @@
   keep-alive) and `keepalive_requests`. The connection timers and header limits
   are top-level only; the body timer and `client_max_body_size` can be set per
   site.
+- Lingering close, as nginx's `lingering_close`: after an early response (413,
+  403, 408, 400, 414) the router half-closes and discards the client's remaining
+  bytes, so a client that is still sending reads the response instead of a
+  reset. `lingering_close on|always|off` (default `on`), `lingering_time` (30s)
+  and `lingering_timeout` (5s) are top-level only. Lingering is bounded by both
+  times.
 - `large_client_header_buffers`: a request line over one buffer gets 414, a
   header field or a header section over its limit gets 400. A request header
   that stops arriving gets 408; a silent connection is closed.

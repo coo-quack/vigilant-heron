@@ -122,6 +122,28 @@ counts, and the decision events that failed, grouped by `decision_error`.
 The client is Python, so at high concurrency the client itself can be the
 bottleneck. Record the machine with each report.
 
+## Built-in rules (`eval/rules.py`)
+
+`eval/rules.py` runs the built-in rules over `dev.jsonl` and `holdout.jsonl`
+with the release router and the stub decider, with `backend http`. It reads each
+row's `$rule_id` and `reason` from the access log and reports:
+
+- rule blocks per block kind, and the rule ids that fired
+- every allow row that a rule decided (the target is none)
+- the combined pipeline, rule block OR model score at or above 0.87 (attack) or
+  0.8 (ai_instruction), against the saved real-model results named by
+  `--model-results` (Jev, then Clef). `credential_attack` rows are excluded.
+
+```bash
+cargo build --release --workspace
+python3 -I eval/rules.py
+```
+
+The rule set is tuned on dev only. Holdout is reported once, as the out-of-sample
+result. `eval/config.template.conf` sets `builtin_rules off;`, so `run.py`
+measures the decision model alone and its results stay comparable with the
+saved runs.
+
 ## Rules
 
 - Labels are never edited to match model output. A label that was wrong is

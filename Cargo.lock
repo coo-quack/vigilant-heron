@@ -1162,6 +1162,7 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "proptest",
+ "regex",
  "rstest",
  "rustls",
  "rustls-native-certs",

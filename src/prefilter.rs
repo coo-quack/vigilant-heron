@@ -1,27 +1,39 @@
-//! Checks that need no model: rule blocks and static asset skips.
+//! Checks that need no model, in the order they run: `deny_path`, block rules,
+//! skip rules and the static asset skip.
+//!
+//! The access list is checked before this module, and the decision model after it.
+
+use std::sync::Arc;
 
 use http::Method;
 
 use crate::config::SiteConfig;
+use crate::rules::{RuleInput, first_match};
 
 /// Result of the checks that run before the decision backend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Screening {
-    /// A `deny_paths` entry matched; the backend is never called.
-    Rule,
+    /// A block rule matched, or a `deny_path` entry did (`None`). The backend is never called.
+    Rule(Option<Arc<str>>),
+    /// A skip rule matched; forwarded without calling the backend.
+    SkipRule(Arc<str>),
     /// A static asset request; forwarded without calling the backend.
     Skip,
     /// Nothing matched; the backend decides.
     Inspect,
 }
 
-/// Normalizes a raw request path for matching: one percent-decode, dot-segment
-/// removal, then lowercasing.
+/// Percent-decodes a raw request path once and removes dot segments. Case is kept.
 ///
 /// The result is used only for matching. The request is forwarded with its raw path.
-pub(crate) fn normalized_path(raw: &str) -> String {
+pub(crate) fn decoded_path(raw: &str) -> String {
     let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
-    remove_dot_segments(&decoded).to_lowercase()
+    remove_dot_segments(&decoded)
+}
+
+/// Normalizes a raw request path for `deny_path` and static matching: [`decoded_path`], then lowercasing.
+pub(crate) fn normalized_path(raw: &str) -> String {
+    decoded_path(raw).to_lowercase()
 }
 
 /// Applies RFC 3986 `remove_dot_segments` with empty segments collapsed.
@@ -46,28 +58,48 @@ fn remove_dot_segments(path: &str) -> String {
     normalized
 }
 
-/// Screens a request against the site's rules.
+/// Screens a request against the site's deny paths, rules and static assets.
+///
+/// Block rules are checked before skip rules, so a skip rule never lets through
+/// a request that a block rule matches.
+pub(crate) fn screen(site: &SiteConfig, input: &RuleInput<'_>, body_is_empty: bool) -> Screening {
+    let path = input.path.to_lowercase();
+    if denied(site, &path) {
+        return Screening::Rule(None);
+    }
+    if let Some(rule) = first_match(&site.rules.block, input) {
+        tracing::debug!(rule = %rule.id, description = %rule.description, "rule matched");
+        return Screening::Rule(Some(Arc::clone(&rule.id)));
+    }
+    if let Some(rule) = first_match(&site.rules.skip, input) {
+        tracing::debug!(rule = %rule.id, description = %rule.description, "skip rule matched");
+        return Screening::SkipRule(Arc::clone(&rule.id));
+    }
+    if static_skip(site, input.method, &path, input.has_query(), body_is_empty) {
+        return Screening::Skip;
+    }
+    Screening::Inspect
+}
+
+/// Returns true when a `deny_path` entry is a prefix of `path`, which must come from [`normalized_path`].
+pub(crate) fn denied(site: &SiteConfig, path: &str) -> bool {
+    site.deny_paths
+        .iter()
+        .any(|denied| path.starts_with(denied.to_lowercase().as_str()))
+}
+
+/// Returns true when a plain read of a static asset may skip the backend.
 ///
 /// `path` must come from [`normalized_path`].
-pub(crate) fn screen(
+pub(crate) fn static_skip(
     site: &SiteConfig,
     method: &Method,
     path: &str,
     has_query: bool,
     body_is_empty: bool,
-) -> Screening {
-    if site
-        .deny_paths
-        .iter()
-        .any(|denied| path.starts_with(denied.to_lowercase().as_str()))
-    {
-        return Screening::Rule;
-    }
+) -> bool {
     let plain_read = *method == Method::GET || *method == Method::HEAD;
-    if plain_read && !has_query && body_is_empty && is_static_path(site, path) {
-        return Screening::Skip;
-    }
-    Screening::Inspect
+    plain_read && !has_query && body_is_empty && is_static_path(site, path)
 }
 
 fn is_static_path(site: &SiteConfig, path: &str) -> bool {
@@ -81,13 +113,30 @@ fn is_static_path(site: &SiteConfig, path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use http::Method;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use http::{HeaderMap, Method};
     use proptest::prelude::*;
     use rstest::rstest;
 
     use super::*;
     use crate::error::ConfigError;
     use crate::test_support::site;
+
+    /// Screens a request with no headers and no body prefix, given its raw path.
+    fn screen_path(
+        site: &SiteConfig,
+        method: &Method,
+        raw_path: &str,
+        has_query: bool,
+        body_is_empty: bool,
+    ) -> Screening {
+        let headers = HeaderMap::new();
+        let query = has_query.then_some("x=1");
+        let client = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let input = RuleInput::new(method, raw_path, query, &headers, &[], client);
+        screen(site, &input, body_is_empty)
+    }
 
     #[rstest]
     #[case::plain("/xmlrpc.php", "/xmlrpc.php")]
@@ -103,8 +152,8 @@ mod tests {
         let path = normalized_path(raw);
         assert_eq!(path, expected_path);
         assert_eq!(
-            screen(&config, &Method::GET, &path, false, true),
-            Screening::Rule
+            screen_path(&config, &Method::GET, &path, false, true),
+            Screening::Rule(None)
         );
         Ok(())
     }
@@ -113,7 +162,7 @@ mod tests {
     fn deny_rule_is_not_applied_to_other_paths() -> Result<(), ConfigError> {
         let config = site("deny_path /xmlrpc.php;")?;
         assert_eq!(
-            screen(&config, &Method::POST, "/index.php", false, false),
+            screen_path(&config, &Method::POST, "/index.php", false, false),
             Screening::Inspect
         );
         Ok(())
@@ -152,8 +201,8 @@ mod tests {
         let config = site("deny_path /xmlrpc.php;")?;
         let path = normalized_path(raw);
         assert_eq!(
-            screen(&config, &Method::POST, &path, false, true),
-            Screening::Rule
+            screen_path(&config, &Method::POST, &path, false, true),
+            Screening::Rule(None)
         );
         Ok(())
     }
@@ -209,7 +258,7 @@ mod tests {
         let config = site("")?;
         let path = normalized_path(raw_path);
         assert_eq!(
-            screen(&config, &method, &path, has_query, body_is_empty),
+            screen_path(&config, &method, &path, has_query, body_is_empty),
             expected
         );
         Ok(())
@@ -219,8 +268,8 @@ mod tests {
     fn deny_rule_takes_precedence_over_static_skip() -> Result<(), ConfigError> {
         let config = site("deny_path /assets/;")?;
         assert_eq!(
-            screen(&config, &Method::GET, "/assets/app.js", false, true),
-            Screening::Rule
+            screen_path(&config, &Method::GET, "/assets/app.js", false, true),
+            Screening::Rule(None)
         );
         Ok(())
     }

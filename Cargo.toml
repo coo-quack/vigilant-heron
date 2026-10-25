@@ -63,6 +63,7 @@ hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
 hyper-rustls = { version = "0.27.10", default-features = false, features = ["ring", "tls12", "http1", "logging", "native-tokio"] }
 hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1"] }
 percent-encoding = "2.3.2"
+regex = "1.13.1"
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8.5"
 serde = { version = "1.0.229", features = ["derive"] }

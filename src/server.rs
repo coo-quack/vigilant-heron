@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +30,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
+use crate::access::{self, AccessEntry};
 use crate::accesslog::{AccessRecord, LogFormat};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
 use crate::config::{AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, SiteConfig};
@@ -41,6 +42,7 @@ use crate::prefilter::{self, Screening};
 use crate::proxy::Proxy;
 use crate::realip::RealIp;
 use crate::router::{Router, normalize_host};
+use crate::rules::RuleInput;
 use crate::sanitize::{self, EventInput, truncate_utf8};
 use crate::system_one::SystemOneBackend;
 use crate::transport::{
@@ -60,6 +62,8 @@ struct Sink {
 /// Shared state for every connection.
 pub(crate) struct AppState<B> {
     router: Router,
+    /// The top-level access list, used for requests that match no site.
+    access: Vec<AccessEntry>,
     sites: Vec<SiteConfig>,
     /// Upstream client of each site, in site order.
     proxies: Vec<Proxy>,
@@ -143,6 +147,7 @@ impl AppState<Backend> {
             .collect();
         Ok(Self {
             router: Router::new(&config.sites),
+            access: config.access,
             sites: config.sites,
             proxies,
             inspect_body_bytes: config.decision.inspect_body_bytes,
@@ -266,6 +271,7 @@ async fn serve_connection<B: DecisionBackend>(
 
 /// Facts about a request that are known before its decision.
 struct Trace<'a> {
+    client_addr: IpAddr,
     client_ip: &'a str,
     remote_addr: &'a str,
     request_id: Option<&'a str>,
@@ -285,12 +291,14 @@ async fn handle<B: DecisionBackend>(
         .served
         .fetch_add(1, Ordering::Relaxed)
         .saturating_add(1);
-    let client = client_ip(state, request.headers(), peer);
+    let client_addr = client_addr(state, request.headers(), peer);
+    let client = client_addr.to_string();
     let request_id = request_id(state, request.headers());
     let remote = peer.ip().to_string();
     let (parts, body) = request.into_parts();
     let done = Arc::new(AtomicBool::new(body.is_end_stream()));
     let trace = Trace {
+        client_addr,
         client_ip: &client,
         remote_addr: &remote,
         request_id: request_id.as_deref(),
@@ -321,17 +329,28 @@ async fn pipeline<B: DecisionBackend>(
     trace: &Trace<'_>,
     peer: SocketAddr,
 ) -> Response<ResponseBody> {
-    let Some(index) = state.router.lookup(parts.headers.get(HOST)) else {
-        let host = parts
-            .headers
-            .get(HOST)
-            .and_then(|value| value.to_str().ok())
-            .map(normalize_host)
-            .unwrap_or_default();
+    // The access list comes first, before the body is read and before the host is judged.
+    let index = state.router.lookup(parts.headers.get(HOST));
+    let matched = index.and_then(|index| state.sites.get(index));
+    let entries = matched.map_or(state.access.as_slice(), |site| site.access.as_slice());
+    let access_denied = !access::permits(entries, trace.client_addr);
+    if access_denied && matched.is_none() {
+        // No site means no mode, so a refusal with no site is final.
         return reject(
             parts,
             trace,
-            &host,
+            &host_name(parts),
+            StatusCode::FORBIDDEN,
+            "access_denied",
+            &state.global_sinks,
+            !done.load(Ordering::Acquire),
+        );
+    }
+    let Some(index) = index else {
+        return reject(
+            parts,
+            trace,
+            &host_name(parts),
             state.default_status,
             "unknown_host",
             &state.global_sinks,
@@ -351,8 +370,12 @@ async fn pipeline<B: DecisionBackend>(
     let timeouts = site.timeouts;
 
     // A Content-Length over the limit is refused before any of the body is read.
-    if let (Some(max), Some(length)) = (timeouts.max_body_bytes, content_length(&parts.headers))
-        && length > u64::try_from(max).unwrap_or(u64::MAX)
+    // A denied client is decided from its headers alone, so this check waits for it.
+    if let (false, Some(max), Some(length)) = (
+        access_denied,
+        timeouts.max_body_bytes,
+        content_length(&parts.headers),
+    ) && length > u64::try_from(max).unwrap_or(u64::MAX)
     {
         return reject(
             parts,
@@ -371,24 +394,44 @@ async fn pipeline<B: DecisionBackend>(
         timeouts.max_body_bytes,
         Arc::clone(done),
     );
-    let sniffed = match body.sniff(state.inspect_body_bytes).await {
-        Ok(sniffed) => sniffed,
-        Err(error) => {
-            let (status, reason) = body_failure(error.as_ref());
-            return reject(parts, trace, site_name(site), status, reason, sinks, true);
+    let sniffed = if access_denied {
+        // The body of a denied request is not read: it is refused, or in shadow mode forwarded as it is.
+        Sniffed {
+            prefix: Bytes::new(),
+            truncated: false,
+        }
+    } else {
+        match body.sniff(state.inspect_body_bytes).await {
+            Ok(sniffed) => sniffed,
+            Err(error) => {
+                let (status, reason) = body_failure(error.as_ref());
+                return reject(parts, trace, site_name(site), status, reason, sinks, true);
+            }
         }
     };
 
     let raw_path = parts.uri.path();
     let path = prefilter::normalized_path(raw_path);
-    let screening = prefilter::screen(
-        site,
-        &parts.method,
-        &path,
-        parts.uri.query().is_some(),
-        sniffed.is_empty_body(),
-    );
-    let assessment = assess(state, site, parts, &sniffed, trace.client_ip, screening).await;
+    let (assessment, rule_id) = if access_denied {
+        (Assessment::AccessDenied, None)
+    } else {
+        let input = RuleInput::new(
+            &parts.method,
+            raw_path,
+            parts.uri.query(),
+            &parts.headers,
+            sniffed.prefix.as_ref(),
+            trace.client_addr,
+        );
+        let screening = prefilter::screen(site, &input, sniffed.is_empty_body());
+        let rule_id = match &screening {
+            Screening::Rule(id) => id.clone(),
+            Screening::SkipRule(id) => Some(Arc::clone(id)),
+            Screening::Skip | Screening::Inspect => None,
+        };
+        let assessment = assess(state, site, parts, &sniffed, trace.client_ip, &screening).await;
+        (assessment, rule_id)
+    };
     let decision = policy::decide(site, &path, &assessment);
     let outcome = respond(proxy, site, parts, body, peer, &decision).await;
     let mut response = outcome.response;
@@ -416,6 +459,7 @@ async fn pipeline<B: DecisionBackend>(
         status: response.status().as_u16(),
         action,
         reason,
+        rule_id: rule_id.as_deref().unwrap_or(""),
         would_have: decision.would_have.as_ref().map(Action::name),
         attack: fields.attack,
         ai_instruction: fields.ai_instruction,
@@ -591,10 +635,11 @@ async fn assess<B: DecisionBackend>(
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
-    screening: Screening,
+    screening: &Screening,
 ) -> Assessment {
     match screening {
-        Screening::Rule => Assessment::Rule,
+        Screening::Rule(_) => Assessment::Rule,
+        Screening::SkipRule(_) => Assessment::SkipRule,
         Screening::Skip => Assessment::Skip,
         Screening::Inspect => {
             let host = site.hosts.first().map_or("", String::as_str);
@@ -628,11 +673,22 @@ async fn assess<B: DecisionBackend>(
     }
 }
 
-fn client_ip<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> String {
+/// The client address chosen by the realip settings.
+fn client_addr<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     let header = headers
         .get(&state.realip.header)
         .and_then(|value| value.to_str().ok());
-    state.realip.client_ip(peer.ip(), header).to_string()
+    state.realip.client_ip(peer.ip(), header)
+}
+
+/// The host of the request, normalized, or an empty string when it has none.
+fn host_name(parts: &Parts) -> String {
+    parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(normalize_host)
+        .unwrap_or_default()
 }
 
 /// Reads the configured request-id header, lossily decoded and cut to 128 bytes.
@@ -689,7 +745,7 @@ fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
             fields.retry_after = retry_after.as_deref();
         }
         Assessment::DecisionFailed { cause } => fields.decision_error = Some(cause),
-        Assessment::Rule | Assessment::Skip => {}
+        Assessment::Rule | Assessment::Skip | Assessment::SkipRule | Assessment::AccessDenied => {}
     }
     fields
 }
@@ -722,6 +778,7 @@ fn reject(
         status: status.as_u16(),
         action: "reject",
         reason,
+        rule_id: "",
         would_have: None,
         attack: None,
         ai_instruction: None,
@@ -756,6 +813,7 @@ fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, start
         status: rejection.status,
         action: "reject",
         reason: rejection.reason,
+        rule_id: "",
         would_have: None,
         attack: None,
         ai_instruction: None,

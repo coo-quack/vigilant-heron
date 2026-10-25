@@ -19,6 +19,7 @@ services:
       target: runtime
     volumes:
       - ./vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro
+      - ./rules.d:/etc/vigilant-heron/rules.d:ro
     depends_on:
       - stub-decider
       - upstream

@@ -4,6 +4,9 @@
 //! (`client_header_timeout`), the idle time between requests (`keepalive_timeout`),
 //! the wait between writes (`send_timeout`), and checks the request line and
 //! header fields against `large_client_header_buffers` before hyper parses them.
+//! When a connection closes while client data may still arrive, [`ClientIo`]
+//! lingers first (`lingering_close`): it half-closes after the response and discards
+//! the client's bytes until the client closes or a bound passes.
 //! [`UpstreamIo`] wraps an upstream socket and bounds the wait between writes
 //! (`proxy_send_timeout`). Body timers live in [`crate::body`].
 //!
@@ -23,7 +26,7 @@ use hyper_util::client::legacy::connect::{Connected, Connection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 
-use crate::config::{ConnectionConfig, HeaderBuffers};
+use crate::config::{ConnectionConfig, HeaderBuffers, LingeringClose};
 
 /// Written to a client that stopped while sending its request header.
 const RESPONSE_408: &[u8] =
@@ -37,6 +40,9 @@ const RESPONSE_400: &[u8] =
 
 /// hyper's default read buffer per connection (`DEFAULT_MAX_BUFFER_SIZE` in hyper 1.12).
 pub(crate) const HYPER_DEFAULT_BUFFER: usize = 8192 + 4096 * 100;
+
+/// Bytes read and discarded at a time by a lingering close. Its memory is bounded by this.
+const LINGER_BUFFER: usize = 4096;
 
 const PHASE_HEADER: u8 = 0;
 const PHASE_KEEP_ALIVE: u8 = 1;
@@ -247,6 +253,12 @@ pub(crate) struct ClientTimers {
     pub(crate) send: Duration,
     /// Header limits.
     pub(crate) head: HeadLimits,
+    /// When a connection lingers before it closes.
+    pub(crate) linger: LingeringClose,
+    /// Longest total time of one lingering close.
+    pub(crate) linger_time: Duration,
+    /// Longest silence that one lingering close waits for.
+    pub(crate) linger_timeout: Duration,
 }
 
 impl ClientTimers {
@@ -257,6 +269,9 @@ impl ClientTimers {
             keep_alive: config.keepalive_timeout,
             send: config.send_timeout,
             head: HeadLimits::from_buffers(config.large_header_buffers),
+            linger: config.lingering_close,
+            linger_time: config.lingering_time,
+            linger_timeout: config.lingering_timeout,
         }
     }
 }
@@ -273,7 +288,7 @@ pub(crate) fn expired(
         .is_ready()
 }
 
-/// A client socket with the connection timers and the header limits applied.
+/// A client socket with the connection timers, the header limits and lingering close applied.
 pub(crate) struct ClientIo<S> {
     inner: S,
     phase: Arc<PhaseCell>,
@@ -285,6 +300,35 @@ pub(crate) struct ClientIo<S> {
     scanner: HeadScanner,
     /// Whether any byte of the current request header has arrived.
     head_started: bool,
+    /// Whether any byte of any request header has arrived on this connection.
+    saw_request: bool,
+    /// The lingering close in progress, once the connection has decided to close.
+    linger: Option<Box<Lingering>>,
+    /// Set once a lingering close has finished, so later calls do not linger again.
+    lingered: bool,
+}
+
+/// State of a lingering close: the answer still to be written, the flush and
+/// half-close, then the discarding of the client's data.
+struct Lingering {
+    /// Bytes of a fixed answer not yet written.
+    answer: &'static [u8],
+    /// Whether the write side has been flushed since the answer was written.
+    flushed: bool,
+    /// Whether the write side has been shut down.
+    half_closed: bool,
+    /// Whether client data is read and discarded. False closes at once after the answer.
+    discard: bool,
+    /// Bounds the whole lingering close, from its start.
+    total: Pin<Box<Sleep>>,
+    /// Bounds the silence between two reads of client data. Restarted on each read.
+    silence: Pin<Box<Sleep>>,
+    /// Receives the discarded client data. Its size bounds the memory of a lingering close.
+    buffer: Box<[u8]>,
+    /// The error the connection ends with, returned once the lingering close is over.
+    error: Option<io::Error>,
+    /// The `lingering_timeout` that restarts `silence` on each read.
+    silence_limit: Duration,
 }
 
 impl<S> ClientIo<S> {
@@ -304,6 +348,9 @@ impl<S> ClientIo<S> {
             write_timer: None,
             scanner: HeadScanner::new(timers.head),
             head_started: false,
+            saw_request: false,
+            linger: None,
+            lingered: false,
         }
     }
 
@@ -324,17 +371,121 @@ impl<S> ClientIo<S> {
             Box::pin(tokio::time::sleep(self.timers.header)),
         ));
     }
-}
 
-impl<S: AsyncWrite + Unpin> ClientIo<S> {
-    /// Writes a fixed answer to the client. Best effort: the answer is a few bytes.
-    fn answer(&mut self, cx: &mut Context<'_>, bytes: &[u8], rejection: Rejection) {
-        let _ = Pin::new(&mut self.inner).poll_write(cx, bytes);
-        self.record(rejection);
+    /// Whether a normal close, after hyper has finished the response, lingers.
+    ///
+    /// `on` lingers when the body was not read in full, which is the `Closing` phase.
+    /// `always` lingers once the connection has carried a request.
+    fn lingers_on_close(&self) -> bool {
+        match self.timers.linger {
+            LingeringClose::Off => false,
+            LingeringClose::Always => self.saw_request,
+            LingeringClose::On => self.phase.get() == Phase::Closing,
+        }
     }
 
-    /// Closes the connection after a request header that broke a limit.
-    fn header_violation(&mut self, cx: &mut Context<'_>, violation: HeadViolation) -> io::Error {
+    /// Starts a lingering close. `answer` is written in full first, then flushed.
+    /// With `discard` false the connection closes once the answer is flushed.
+    fn begin_linger(&mut self, answer: &'static [u8], error: Option<io::Error>, discard: bool) {
+        self.read_timer = None;
+        self.linger = Some(Box::new(Lingering {
+            answer,
+            flushed: false,
+            half_closed: false,
+            discard,
+            total: Box::pin(tokio::time::sleep(self.timers.linger_time)),
+            silence: Box::pin(tokio::time::sleep(self.timers.linger_timeout)),
+            buffer: vec![0u8; LINGER_BUFFER].into_boxed_slice(),
+            error,
+            silence_limit: self.timers.linger_timeout,
+        }));
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> ClientIo<S> {
+    /// Advances the lingering close. Returns `Ready` once it is over, with the error
+    /// the connection ends with, if any.
+    ///
+    /// The steps run in order: the pending answer is written, the write side is
+    /// flushed, the write side is shut down, and client data is read and discarded
+    /// until EOF, until `lingering_timeout` passes without data, or until
+    /// `lingering_time` has passed in total. A write error or a flush error ends
+    /// the answer, since the peer is gone.
+    fn poll_linger(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let Some(mut linger) = self.linger.take() else {
+            return Poll::Ready(Ok(()));
+        };
+        let mut pending = false;
+        loop {
+            if !linger.answer.is_empty() {
+                match Pin::new(&mut self.inner).poll_write(cx, linger.answer) {
+                    Poll::Ready(Ok(written)) if written > 0 => {
+                        linger.answer = linger.answer.get(written..).unwrap_or_default();
+                        continue;
+                    }
+                    Poll::Ready(_) => linger.answer = &[],
+                    Poll::Pending => {
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+            if !linger.flushed {
+                match Pin::new(&mut self.inner).poll_flush(cx) {
+                    Poll::Ready(_) => linger.flushed = true,
+                    Poll::Pending => {
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+            if !linger.discard {
+                break;
+            }
+            if !linger.half_closed {
+                match Pin::new(&mut self.inner).poll_shutdown(cx) {
+                    Poll::Ready(_) => linger.half_closed = true,
+                    Poll::Pending => {
+                        pending = true;
+                        break;
+                    }
+                }
+            }
+            let mut read = ReadBuf::new(&mut linger.buffer);
+            match Pin::new(&mut self.inner).poll_read(cx, &mut read) {
+                Poll::Ready(Ok(())) if !read.filled().is_empty() => {
+                    linger.silence = Box::pin(tokio::time::sleep(linger.silence_limit));
+                }
+                // EOF or an error: the peer has gone, so there is nothing left to wait for.
+                Poll::Ready(_) => break,
+                Poll::Pending => {
+                    pending = true;
+                    break;
+                }
+            }
+        }
+        if pending {
+            let total_passed = linger.total.as_mut().poll(cx).is_ready();
+            let silent = linger.silence.as_mut().poll(cx).is_ready();
+            if !(total_passed || silent) {
+                self.linger = Some(linger);
+                return Poll::Pending;
+            }
+        }
+        self.lingered = true;
+        Poll::Ready(match linger.error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        })
+    }
+
+    /// Closes the connection after a request header that broke a limit. The answer is
+    /// written in full before the connection lingers or closes.
+    fn header_violation(
+        &mut self,
+        cx: &mut Context<'_>,
+        violation: HeadViolation,
+    ) -> Poll<io::Result<()>> {
         self.phase.set(Phase::Busy);
         let (bytes, rejection, reason) = match violation {
             HeadViolation::RequestLineTooLong => (
@@ -354,30 +505,45 @@ impl<S: AsyncWrite + Unpin> ClientIo<S> {
                 "request header is too large",
             ),
         };
-        self.answer(cx, bytes, rejection);
-        io::Error::new(io::ErrorKind::InvalidData, reason)
+        self.record(rejection);
+        // The rest of the header is unread, so the connection lingers unless lingering is off.
+        let discard = self.timers.linger != LingeringClose::Off;
+        self.begin_linger(
+            bytes,
+            Some(io::Error::new(io::ErrorKind::InvalidData, reason)),
+            discard,
+        );
+        self.poll_linger(cx)
     }
 
     /// Closes the connection when a read wait runs out.
-    fn read_timed_out(&mut self, cx: &mut Context<'_>, phase: Phase) -> io::Error {
+    fn read_timed_out(&mut self, cx: &mut Context<'_>, phase: Phase) -> Poll<io::Result<()>> {
         self.read_timer = None;
         match phase {
-            Phase::AwaitingHeader => {
-                if self.head_started {
-                    self.answer(
-                        cx,
-                        RESPONSE_408,
-                        Rejection {
-                            status: 408,
-                            reason: "header_timeout",
-                        },
-                    );
-                }
-                io::Error::new(io::ErrorKind::TimedOut, "client header timeout")
+            Phase::AwaitingHeader if self.head_started => {
+                self.record(Rejection {
+                    status: 408,
+                    reason: "header_timeout",
+                });
+                // A client that is still sending its header may still be sending: linger.
+                let discard = self.timers.linger != LingeringClose::Off;
+                self.begin_linger(
+                    RESPONSE_408,
+                    Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "client header timeout",
+                    )),
+                    discard,
+                );
+                self.poll_linger(cx)
             }
-            Phase::AwaitingKeepAlive | Phase::Busy | Phase::Closing => {
-                io::Error::new(io::ErrorKind::TimedOut, "keep-alive timeout")
-            }
+            Phase::AwaitingHeader => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client header timeout",
+            ))),
+            Phase::AwaitingKeepAlive | Phase::Busy | Phase::Closing => Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::TimedOut, "keep-alive timeout"),
+            )),
         }
     }
 }
@@ -389,6 +555,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientIo<S> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if this.linger.is_some() {
+            // The connection is lingering: client data is discarded, not handed to hyper.
+            return this.poll_linger(cx);
+        }
         let phase = this.phase.get();
         match phase {
             Phase::Closing => {
@@ -422,6 +592,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientIo<S> {
                     this.start_header_timer();
                 }
                 this.head_started = true;
+                this.saw_request = true;
                 match this.scanner.feed(fresh) {
                     Ok(false) => {}
                     Ok(true) => {
@@ -429,9 +600,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientIo<S> {
                         this.phase.set(Phase::Busy);
                         this.stop_timing_reads();
                     }
-                    Err(violation) => {
-                        return Poll::Ready(Err(this.header_violation(cx, violation)));
-                    }
+                    Err(violation) => return this.header_violation(cx, violation),
                 }
                 Poll::Ready(Ok(()))
             }
@@ -446,7 +615,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientIo<S> {
                     None => None,
                 };
                 match expired {
-                    Some(phase) => Poll::Ready(Err(this.read_timed_out(cx, phase))),
+                    Some(phase) => this.read_timed_out(cx, phase),
                     None => Poll::Pending,
                 }
             }
@@ -480,13 +649,21 @@ impl<S: AsyncWrite + Unpin> ClientIo<S> {
     }
 }
 
-impl<S: AsyncWrite + Unpin> AsyncWrite for ClientIo<S> {
+/// The error for a write after the connection has started to close.
+fn closing_write_error() -> io::Error {
+    io::Error::new(io::ErrorKind::BrokenPipe, "connection is closing")
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientIo<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.linger.is_some() || this.lingered {
+            return Poll::Ready(Err(closing_write_error()));
+        }
         let attempt = Pin::new(&mut this.inner).poll_write(cx, buf);
         this.timed_write(cx, attempt)
     }
@@ -497,6 +674,9 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClientIo<S> {
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        if this.linger.is_some() || this.lingered {
+            return Poll::Ready(Err(closing_write_error()));
+        }
         let attempt = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
         this.timed_write(cx, attempt)
     }
@@ -506,11 +686,29 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClientIo<S> {
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        if this.linger.is_some() || this.lingered {
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_flush(cx)
     }
 
+    /// Ends the connection. With lingering on, the write side is half-closed only
+    /// after the response is flushed, and the client's data is discarded until the
+    /// linger ends. Hyper calls this after the response is complete.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        if this.linger.is_some() {
+            return this.poll_linger(cx);
+        }
+        if this.lingered {
+            return Poll::Ready(Ok(()));
+        }
+        if this.lingers_on_close() {
+            this.begin_linger(&[], None, true);
+            return this.poll_linger(cx);
+        }
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -608,10 +806,16 @@ impl<S> Connection for UpstreamIo<S> {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error;
+
     use proptest::prelude::*;
     use rstest::rstest;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+
+    type BoxError = Box<dyn Error + Send + Sync>;
 
     fn limits(line: usize, total: usize) -> HeadLimits {
         HeadLimits { line, total }
@@ -731,5 +935,171 @@ mod tests {
             let pieces = scan_in_chunks(&head, chunk, limits(line_limit, total_limit));
             prop_assert_eq!(whole, pieces);
         }
+    }
+    /// A connected pair of sockets: the client end, and the server end that the router wraps.
+    async fn socket_pair() -> io::Result<(TcpStream, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let client = TcpStream::connect(listener.local_addr()?).await?;
+        let (server, _) = listener.accept().await?;
+        Ok((client, server))
+    }
+
+    fn linger_timers(
+        linger: LingeringClose,
+        linger_time: Duration,
+        linger_timeout: Duration,
+    ) -> ClientTimers {
+        ClientTimers {
+            header: Duration::from_secs(5),
+            keep_alive: Duration::from_secs(5),
+            send: Duration::from_secs(5),
+            head: limits(64, 512),
+            linger,
+            linger_time,
+            linger_timeout,
+        }
+    }
+
+    /// Wraps the server end in a client socket that is about to close after a response.
+    fn closing(server: TcpStream, timers: ClientTimers) -> ClientIo<TcpStream> {
+        let phase = Arc::new(PhaseCell::new());
+        phase.set(Phase::Closing);
+        ClientIo::new(server, phase, timers, Arc::new(Mutex::new(None)))
+    }
+
+    #[tokio::test]
+    async fn lingering_ends_after_the_silence_limit_when_the_client_stays_quiet()
+    -> Result<(), BoxError> {
+        let (_client, server) = socket_pair().await?;
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = closing(server, timers);
+        let started = std::time::Instant::now();
+        io.shutdown().await?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "lingering ended before the silence limit: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "lingering waited past the silence limit: {elapsed:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lingering_ends_at_the_total_time_while_the_client_keeps_sending()
+    -> Result<(), BoxError> {
+        let (mut client, server) = socket_pair().await?;
+        let writer = tokio::spawn(async move {
+            for _ in 0..40 {
+                if client.write_all(&[b'x'; 10]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_millis(600),
+            Duration::from_millis(200),
+        );
+        let mut io = closing(server, timers);
+        let started = std::time::Instant::now();
+        io.shutdown().await?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(550),
+            "lingering ended before the total time: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "data arriving every 50 ms must not extend lingering past lingering_time: {elapsed:?}"
+        );
+        writer.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn lingering_ends_at_once_when_the_client_closes() -> Result<(), BoxError> {
+        let (mut client, server) = socket_pair().await?;
+        client.write_all(b"tail").await?;
+        drop(client);
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        );
+        let mut io = closing(server, timers);
+        let started = std::time::Instant::now();
+        io.shutdown().await?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_header_violation_answer_is_written_in_full_before_the_close() -> Result<(), BoxError>
+    {
+        let (mut client, server) = socket_pair().await?;
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(
+            server,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        let reader = tokio::spawn(async move {
+            let mut buf = [0u8; 256];
+            while io.read(&mut buf).await.is_ok_and(|read| read > 0) {}
+            io
+        });
+        // The request line is longer than the 64-byte limit, so the answer is 414.
+        client
+            .write_all(b"GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\n\r\n")
+            .await?;
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await?;
+        assert_eq!(answer, RESPONSE_414);
+        let _ = reader.await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_header_violation_with_lingering_off_still_writes_the_whole_answer()
+    -> Result<(), BoxError> {
+        let (mut client, server) = socket_pair().await?;
+        let timers = linger_timers(
+            LingeringClose::Off,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(
+            server,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        client
+            .write_all(b"GET /aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa HTTP/1.1\r\n\r\n")
+            .await?;
+        let mut buf = [0u8; 256];
+        let error = io.read(&mut buf).await.err();
+        assert_eq!(
+            error.map(|error| error.kind()),
+            Some(io::ErrorKind::InvalidData)
+        );
+        drop(io);
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).await?;
+        assert_eq!(answer, RESPONSE_414);
+        Ok(())
     }
 }
