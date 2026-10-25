@@ -30,6 +30,7 @@ ROUTER_BIN = ROOT / "target" / "release" / "vigilant-heron"
 STUB_BIN = ROOT / "target" / "release" / "stub-decider"
 
 SITE_HOST = "eval.example.com"
+REQUEST_ID_HEADER = "X-Request-Id"
 OFFLINE_TOKEN = "test-token"
 STUB_PORT = 9000
 JEV_DEFAULT_URL = "https://api.typesafe.ai/v1/systemone"
@@ -139,7 +140,7 @@ def splits_to_run(split):
 def send_row(port, row):
     request = row["request"]
     target = request["path"] + (f"?{request['query']}" if request["query"] else "")
-    headers = {"Host": SITE_HOST}
+    headers = {"Host": SITE_HOST, REQUEST_ID_HEADER: row["id"]}
     headers.update(request["headers"])
     body = None
     if request["body"] is not None:
@@ -157,76 +158,195 @@ def send_row(port, row):
         connection.close()
 
 
-class DecisionLog:
-    """Reads the router's JSON log and returns decision events in order."""
+class LogIndex:
+    """Reads the router's JSON log in the background and indexes decision events by request id."""
 
     def __init__(self, path):
         self.path = path
         self.offset = 0
+        self.events = {}
+        self.condition = threading.Condition()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._read_forever, daemon=True)
+        self.thread.start()
 
-    def next_event(self, timeout=15):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+    def _read_forever(self):
+        pending = b""
+        while not self.stop.is_set():
             with self.path.open("rb") as handle:
                 handle.seek(self.offset)
                 data = handle.read()
-            lines = data.split(b"\n")
-            for line in lines[:-1]:
-                self.offset += len(line) + 1
-                if not line.strip():
-                    continue
-                entry = json.loads(line)
-                if entry.get("target") == "vigilant_heron::decision":
-                    return entry.get("fields", {})
-            time.sleep(0.05)
-        return None
+            if data:
+                self.offset += len(data)
+                pending += data
+                *complete, pending = pending.split(b"\n")
+                with self.condition:
+                    for line in complete:
+                        self._index(line)
+                    self.condition.notify_all()
+            else:
+                time.sleep(0.02)
+
+    def _index(self, line):
+        if not line.strip():
+            return
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return
+        if entry.get("target") != "vigilant_heron::decision":
+            return
+        fields = entry.get("fields", {})
+        request_id = fields.get("request_id")
+        if request_id is not None:
+            self.events.setdefault(request_id, []).append(fields)
+
+    def wait_for(self, request_id, timeout=30):
+        """Returns the decision events logged for `request_id`, after waiting for at least one."""
+        deadline = time.monotonic() + timeout
+        with self.condition:
+            while not self.events.get(request_id):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self.condition.wait(remaining)
+            return list(self.events.get(request_id, []))
+
+    def close(self):
+        self.stop.set()
+        self.thread.join(timeout=5)
+
+
+class Budget:
+    """Shared spend for all in-flight rows.
+
+    Each row reserves an estimate before it is sent, so requests in flight cannot
+    push the total past the limit. The reservation is settled with the real
+    input tokens when the decision event arrives. A reservation is the larger of
+    the average and the largest settled request so far.
+    """
+
+    def __init__(self, base_yen, max_yen, usd_per_mtok):
+        self.base_yen = base_yen
+        self.max_yen = max_yen
+        self.usd_per_mtok = usd_per_mtok
+        self.lock = threading.Lock()
+        self.settled_tokens = 0
+        self.settled_count = 0
+        self.largest = 0
+        self.reserved_yen = 0.0
+        self.stopped = False
+
+    def _estimate(self):
+        average = self.settled_tokens / self.settled_count if self.settled_count else FIRST_REQUEST_TOKEN_ESTIMATE
+        return max(average, self.largest)
+
+    def reserve(self):
+        """Reserves the estimate for one row. Returns the reserved JPY, or None when the budget is spent."""
+        with self.lock:
+            if self.stopped:
+                return None
+            estimate_yen = yen(self._estimate(), self.usd_per_mtok)
+            settled_yen = self.base_yen + yen(self.settled_tokens, self.usd_per_mtok)
+            if settled_yen + self.reserved_yen + estimate_yen > self.max_yen:
+                self.stopped = True
+                return None
+            self.reserved_yen += estimate_yen
+            return estimate_yen
+
+    def settle(self, reserved_yen, tokens):
+        with self.lock:
+            self.reserved_yen -= reserved_yen
+            if tokens is not None:
+                self.settled_tokens += tokens
+                self.largest = max(self.largest, tokens)
+            self.settled_count += 1
+
+    def stop(self):
+        with self.lock:
+            self.stopped = True
+
+    def spent_yen(self):
+        with self.lock:
+            return self.base_yen + yen(self.settled_tokens, self.usd_per_mtok)
+
+    def run_tokens(self):
+        with self.lock:
+            return self.settled_tokens
 
 
 def yen(tokens, usd_per_mtok):
     return tokens * usd_per_mtok / 1_000_000 * JPY_PER_USD
 
 
-def run_split(split, rows, router_port, log, max_yen, result_handle, state):
-    """Sends the rows of one split. `state` is shared across splits for the budget.
+class JoinError(RuntimeError):
+    pass
 
-    `state["base_yen"]` is what earlier runs spent; the budget covers base plus this run.
+
+def run_row(row, port, log, budget, split):
+    """Sends one row, joins it to its decision event, and settles the budget. None when the budget is spent."""
+    reserved = budget.reserve()
+    if reserved is None:
+        return None
+    try:
+        status, debug = send_row(port, row)
+        events = log.wait_for(row["id"])
+    except Exception:
+        budget.settle(reserved, None)
+        raise
+    request = row["request"]
+    matching = [e for e in events if e.get("method") == request["method"] and e.get("path") == request["path"]]
+    if len(events) != 1 or len(matching) != 1:
+        budget.settle(reserved, None)
+        budget.stop()
+        raise JoinError(
+            f"{row['id']}: expected exactly one decision event for this request, found {len(events)} with the id"
+        )
+    event = matching[0]
+    tokens = event.get("input_tokens")
+    tokens = tokens if isinstance(tokens, int) else None
+    budget.settle(reserved, tokens)
+    return {
+        "id": row["id"],
+        "split": split,
+        "label": row["label"],
+        "kind": row["kind"],
+        "status": status,
+        "blocked": status == 403,
+        "debug": debug,
+        "action": event.get("action"),
+        "reason": event.get("reason"),
+        "attack": event.get("attack"),
+        "ai_instruction": event.get("ai_instruction"),
+        "category": event.get("category"),
+        "input_tokens": tokens,
+        "latency_ms": event.get("latency_ms"),
+        "join_ok": True,
+    }
+
+
+def run_split(split, rows, router_port, log, budget, concurrency):
+    """Sends the rows of one split with `concurrency` parallel requests.
+
+    Returns the results in dataset order. Rows the budget did not allow are left out.
     """
-    results = []
-    for row in rows:
-        average = state["tokens"] / state["done"] if state["done"] else FIRST_REQUEST_TOKEN_ESTIMATE
-        spent_yen = state["base_yen"] + yen(state["tokens"], state["price"])
-        next_yen = yen(average, state["price"])
-        if spent_yen + next_yen > max_yen:
-            state["stopped"] = True
-            break
-        status, debug = send_row(router_port, row)
-        event = log.next_event()
-        join_ok = bool(event) and event.get("method") == row["request"]["method"] and event.get("path") == row["request"]["path"]
-        tokens = event.get("input_tokens") if event else None
-        if isinstance(tokens, int):
-            state["tokens"] += tokens
-        state["done"] += 1
-        record = {
-            "id": row["id"],
-            "split": split,
-            "label": row["label"],
-            "kind": row["kind"],
-            "status": status,
-            "blocked": status == 403,
-            "debug": debug,
-            "action": event.get("action") if event else None,
-            "reason": event.get("reason") if event else None,
-            "attack": event.get("attack") if event else None,
-            "ai_instruction": event.get("ai_instruction") if event else None,
-            "category": event.get("category") if event else None,
-            "input_tokens": tokens if isinstance(tokens, int) else None,
-            "latency_ms": event.get("latency_ms") if event else None,
-            "join_ok": join_ok,
-        }
-        results.append(record)
-        result_handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-        result_handle.flush()
-    return results
+    from concurrent.futures import ThreadPoolExecutor
+
+    results = {}
+    errors = []
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = {pool.submit(run_row, row, router_port, log, budget, split): row["id"] for row in rows}
+        for future in futures:
+            try:
+                result = future.result()
+            except JoinError as error:
+                errors.append(str(error))
+                continue
+            if result is not None:
+                results[futures[future]] = result
+    if errors:
+        raise JoinError("; ".join(errors))
+    return [results[row["id"]] for row in rows if row["id"] in results]
 
 
 def predicted_block(record, threshold):
@@ -337,8 +457,11 @@ def main():
     parser.add_argument("--max-yen", type=float, default=30.0, help="budget in JPY for base spend plus this run")
     parser.add_argument("--spent-yen", type=float, default=0.0, help="JPY already spent by earlier runs")
     parser.add_argument("--limit", type=int, help="send at most N rows of each split")
+    parser.add_argument("--concurrency", type=int, default=4, help="rows in flight at the same time")
     parser.add_argument("--router", type=pathlib.Path, default=ROUTER_BIN)
     args = parser.parse_args()
+    if args.concurrency < 1:
+        raise SystemExit("--concurrency must be at least 1")
 
     backend = BACKENDS[args.backend]
     price = args.usd_per_mtok if args.usd_per_mtok is not None else backend["usd_per_mtok"]
@@ -398,8 +521,8 @@ def main():
         processes.append(router)
         wait_for_port(router_port, router)
 
-        log = DecisionLog(log_path)
-        state = {"tokens": 0, "done": 0, "stopped": False, "price": price, "base_yen": args.spent_yen}
+        log = LogIndex(log_path)
+        budget = Budget(args.spent_yen, args.max_yen, price)
         markdown = []
         for split in splits_to_run(args.split):
             rows = load_rows(split)
@@ -407,18 +530,25 @@ def main():
                 rows = rows[: args.limit]
             result_path = RESULTS_DIR / f"{stamp}-{args.backend}-{split}.jsonl"
             result_files[split] = result_path
+            try:
+                results = run_split(split, rows, router_port, log, budget, args.concurrency)
+            except JoinError as error:
+                raise SystemExit(f"aborted: {error}") from error
             with result_path.open("w", encoding="utf-8") as handle:
-                results = run_split(split, rows, router_port, log, args.max_yen, handle, state)
+                for record in results:
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             missing = sum(1 for r in results if r["input_tokens"] is None)
-            markdown.append(report(split, len(rows), results, state["stopped"], missing, price))
-            if state["stopped"]:
+            markdown.append(report(split, len(rows), results, budget.stopped, missing, price))
+            if budget.stopped:
                 break
-        run_yen = yen(state["tokens"], price)
+        log.close()
+        run_yen = yen(budget.run_tokens(), price)
         total_yen = args.spent_yen + run_yen
         markdown.append(
             "## Budget\n\n"
             f"- Backend: {args.backend} ({backend['model']}), price ${price} per million input tokens\n"
-            f"- Input tokens billed in this run: {state['tokens']}; {run_yen:.4f} JPY\n"
+            f"- Concurrency: {args.concurrency}\n"
+            f"- Input tokens billed in this run: {budget.run_tokens()}; {run_yen:.4f} JPY\n"
             f"- Spent before this run: {args.spent_yen:.4f} JPY\n"
             f"- Cumulative spend: {total_yen:.4f} JPY (limit {args.max_yen} JPY)\n"
         )

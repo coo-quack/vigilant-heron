@@ -28,6 +28,24 @@ and posts to `--jev-url` (default `https://api.typesafe.ai/v1/systemone`).
 slow answer is not turned into a fail-open allow. Latency is still reported.
 Results are written as `results/<UTC>-<backend>-<split>.jsonl`.
 
+## Concurrency
+
+`--concurrency N` (default 4) sends N rows at once. Each row carries
+`X-Request-Id: <row id>`, and the router logs it as `request_id`, so every row
+is joined to its decision event by id, not by order. The run aborts with a clear
+error if any row has no decision event, or more than one.
+
+The budget stays correct under concurrency. Before a row is sent, its estimated
+cost is reserved: the average input tokens so far, or the largest request so
+far if that is bigger. The reservation counts against the limit while the
+request is in flight. When the decision event arrives, the reservation is
+replaced by the real input tokens. A row is not sent if its reservation would
+push the total past `--max-yen`. The reservation is an estimate, so a request
+that costs more than every earlier one can still overshoot by that difference.
+
+Results are written in dataset order, so the per-row files of two runs with
+different concurrency can be compared directly.
+
 ## Offline run (free)
 
 The offline mode points the router at the stub decider's Clef route. It costs
@@ -85,6 +103,25 @@ report with:
   scanner_probe and credential_attack. The others show `n/a`.
 - latency p50 and p95, input tokens, cost in USD and JPY, and the misclassified ids
 
+## Load test (offline only)
+
+`eval/load.py` measures the router itself, not a model. It always starts the
+stub decider with an extra delay (`STUB_DELAY_MS`), a local upstream, and a
+release build of the router. It never calls a paid provider.
+
+```bash
+cargo build --release --workspace
+python3 -I eval/load.py --concurrency 16 --requests 2000 --stub-delay-ms 20 --worker-threads 4
+```
+
+Options: `--concurrency` (client threads, each with its own connection),
+`--requests`, `--stub-delay-ms`, `--max-concurrency` (the router's
+`decision.max_concurrency`, default 64), `--worker-threads` (unset by default,
+meaning one per CPU core). It prints throughput, latency p50/p95/p99, status
+counts, and the decision events that failed, grouped by `decision_error`.
+The client is Python, so at high concurrency the client itself can be the
+bottleneck. Record the machine with each report.
+
 ## Rules
 
 - Labels are never edited to match model output. A label that was wrong is
@@ -92,6 +129,10 @@ report with:
   scores. Git history shows every change to `dataset/`.
 - The dev split is for looking at failures. The holdout split is for the final
   number. Do not tune thresholds or wording on holdout.
+- Labels are not the only thing a run must not change: a row's request may be
+  re-encoded to be valid HTTP, but only when the router never received it
+  (for example a literal `<` in a query string, rejected before judging). Such a
+  fix is recorded in the commit message.
 - Each request is judged alone. Credential attacks (rapid logins with common
   passwords) and bursts cannot be seen from a single request, so they are
   expected to be missed.
