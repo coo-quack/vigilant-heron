@@ -8,7 +8,7 @@ vigilant-heron is in early development. Run every new site in shadow mode first,
 
 ## 1. Install
 
-Install the router with the [Docker image or a binary you build](/install). The steps below assume the `vigilant-heron` command is on your `PATH`. With Docker, run the same commands inside the container, as the [Installation](/install#docker-image) page shows.
+Build the router from source, or build its Docker image, as the [Installation](/install) page shows. The steps below assume the `vigilant-heron` command is on your `PATH`. With Docker, run the same commands inside the container, as the [Installation](/install#docker-image) page shows.
 
 ## 2. Start a test upstream
 

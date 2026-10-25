@@ -17,35 +17,25 @@ client ──► nginx / Cloudflare ──► vigilant-heron ──► your site
 
 ## Install
 
-**Docker image.** The image is published for `linux/amd64` and `linux/arm64`:
+Build from source. You need the Rust toolchain that `rust-toolchain.toml` names. `rustup` installs it on the first build:
 
 ```bash
-docker pull ghcr.io/coo-quack/vigilant-heron:<version>
-```
-
-Replace `<version>` with a release number, or use `latest`. The package is private while the repository is private, so log in to `ghcr.io` first. The container runs as `nonroot`, so its configuration must set a writable pid file, for example `pid /tmp/vigilant-heron.pid;`, and listen on `0.0.0.0`:
-
-```bash
-docker run -d --name vigilant-heron -p 8080:8080 \
-  -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
-  -e TYPESAFE_API_KEY \
-  ghcr.io/coo-quack/vigilant-heron:<version>
-```
-
-See [Installation](docs/install.md) for Docker Compose, nginx and Cloudflare, and updates.
-
-**Build from source.** You need the Rust toolchain that `rust-toolchain.toml` names. `rustup` installs it on the first build:
-
-```bash
+git clone https://github.com/coo-quack/vigilant-heron.git
+cd vigilant-heron
 cargo build --release --locked
-./target/release/vigilant-heron --help
+./target/release/vigilant-heron --version
 ```
 
-**Install with Cargo.** This puts the binary in `~/.cargo/bin`:
+To put the binary on your `PATH`, run `cargo install --locked --path .` in the clone.
+
+**Docker.** No image is published yet, so build it from the Dockerfile:
 
 ```bash
-cargo install --git https://github.com/coo-quack/vigilant-heron --locked
+docker build -t vigilant-heron .
+docker run --rm vigilant-heron --version
 ```
+
+The container runs as `nonroot`, so its configuration must set `listen 0.0.0.0:8080;` and a writable pid file, for example `pid /tmp/vigilant-heron.pid;`. See [Installation](docs/install.md) for the full Docker example, Docker Compose, nginx and Cloudflare in front, and systemd.
 
 ## Quick start
 
@@ -126,9 +116,12 @@ cargo install --git https://github.com/coo-quack/vigilant-heron --locked
 | `-c <path>`, `--config <path>` | Use this configuration file. |
 | `-t` | Check the configuration and exit. |
 | `-T` | Check the configuration and print it, with every `include` expanded. |
-| `-s reload\|reopen\|stop\|quit` | Signal the running router. `reload` re-reads the file, `reopen` reopens the log files, `stop` and `quit` shut down gracefully. |
+| `-s reload\|reopen\|stop\|quit` | Signal the running router. `reload` re-reads the file without dropping connections, `reopen` reopens the log files, `stop` and `quit` shut down gracefully. |
+| `start` | Check the file, then run the router in the background. It prints `started (pid N)`. |
+| `stop` | Stop the background router gracefully and wait until it has exited. |
+| `restart` | Check the file, then stop and start the background router. Use it for settings read at startup, such as `listen`. |
 
-The router finds its configuration in this order: `-c`, then the `VIGILANT_HERON_CONFIG` environment variable, then `/etc/vigilant-heron/vigilant-heron.conf`. `-s` finds the running router through the `pid` directive. See [Command line](docs/cli.md) for the details. In Docker, run it with `docker exec vigilant-heron /usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf`.
+The router finds its configuration in this order: `-c`, then the `VIGILANT_HERON_CONFIG` environment variable, then `/etc/vigilant-heron/vigilant-heron.conf`. `-s`, `stop` and `restart` find the running router through the `pid` directive. Under Docker or systemd, run the router in the foreground and let the container or service manager run it. See [Command line](docs/cli.md) for the details. In Docker, send a signal with `docker exec vigilant-heron /usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf`.
 
 ## What happens to each request
 

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `start`, `stop` and `restart` run the router in the background on a host. `start`
+  checks the file first, refuses when a router already runs, and prints
+  `started (pid N)`. `stop` sends the graceful shutdown and waits until the process
+  has exited, and prints `not running` when none runs. `restart` checks the file
+  first, so an invalid file leaves the running router alone. Under Docker or
+  systemd, run the router in the foreground, as before.
+- The shutdown signals (SIGINT, SIGTERM, SIGQUIT) are registered before the pid
+  file is written. A stop sent right after the pid file appears now runs the
+  cleanup that removes it, where it used to end the process without that cleanup.
+- `docs/install.md` builds from source and from the Dockerfile. It no longer
+  mentions a published image, and it has a systemd unit example.
+- `SECURITY.md` lists the reporting channels: email and a GitHub security advisory.
+
 - Command line, as nginx's: `-h`/`--help` and `-v`/`--version`, `-c <path>` as a
   short form of `--config`, `-T` (test, then print the configuration with every
   include expanded under its `# configuration file <path>:` header), and

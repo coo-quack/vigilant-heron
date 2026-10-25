@@ -28,8 +28,9 @@ Shadow mode records what it would have done without blocking.
 
 ```
 src/
-  main.rs        # Entry point: runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen, SIGTERM/SIGINT/SIGQUIT graceful stop
-  cli.rs         # Options (-h -v -c -t -T -s), usage text, -s signals through rustix via the pid file
+  main.rs        # Entry point: runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen, SIGTERM/SIGINT/SIGQUIT graceful stop, signal handlers registered before the pid file
+  cli.rs         # Options (-h -v -c -t -T -s, start/stop/restart words), usage text, -s signals through rustix via the pid file
+  lifecycle.rs   # start/stop/restart: detached child (own process group), pid-file readiness, bounded waits, no SIGKILL
   pidfile.rs     # PID file: written after bind (atomic rename), removed on drop
   lib.rs         # Public API: Config, ConfigError, serve, install_error_log
   conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)

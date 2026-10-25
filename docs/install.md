@@ -1,22 +1,46 @@
 # Installation
 
-You can run vigilant-heron from its Docker image or from a binary you build yourself. The Docker image is the quickest way to start. Both need the same configuration file.
+You can run vigilant-heron as a binary that you build from source, or as a Docker image that you build from the same repository. Both use the same configuration file.
 
 ## Requirements
 
-- **Operating system:** Linux or macOS. The `-s` signal command needs a Unix system.
-- **Docker** (for the image), or the Rust toolchain (for a build). The toolchain version is pinned in `rust-toolchain.toml` as 1.99.1. `rustup` installs it on the first `cargo` call.
+- **Operating system:** Linux or macOS. The `-s` signal command and the background commands need a Unix system.
+- **Rust toolchain** for a binary, or **Docker** for the image. The toolchain version is pinned in `rust-toolchain.toml` as 1.99.1. `rustup` installs it on the first `cargo` call.
 - **An API key** for the decision model. The default model, Jev, reads its key from the `TYPESAFE_API_KEY` environment variable. The router refuses to start when that variable is unset or blank. See [Decision backends](/decision-backends) for other models.
 - **Outbound HTTPS** from the router to the model's API (`api.typesafe.ai` by default).
 - **Network access** from the router to each `upstream` address.
 
-The repository is private, so the image and the source are visible only to members of the organization. Log in to `ghcr.io` with an account that can read the repository before you pull the image.
+## Build from source
+
+Get the code and build a release binary. `--locked` makes the build use the versions in `Cargo.lock`:
+
+```bash
+git clone https://github.com/coo-quack/vigilant-heron.git
+cd vigilant-heron
+cargo build --release --locked
+./target/release/vigilant-heron --version
+```
+
+To install the binary into `~/.cargo/bin`, so that `vigilant-heron` is on your `PATH`, run this in the clone:
+
+```bash
+cargo install --locked --path .
+```
 
 ## Docker image
 
-The image is published as `ghcr.io/coo-quack/vigilant-heron:<version>` for `linux/amd64` and `linux/arm64`. Replace `<version>` with a release number from the [GitHub Releases](https://github.com/coo-quack/vigilant-heron/releases) page.
+No image is published yet, so build it from the Dockerfile in the clone:
 
-1. **Write a configuration file.** Inside the container, the router must listen on `0.0.0.0`, and it must write its pid file to `/tmp`, because the image runs as `nonroot` and cannot write to `/run`:
+```bash
+docker build -t vigilant-heron .
+```
+
+The image runs as the `nonroot` user on distroless, and its binary is `/usr/local/bin/vigilant-heron`. The configuration must set two things for the container:
+
+- `listen 0.0.0.0:8080;`, so that the published port reaches the router.
+- `pid /tmp/vigilant-heron.pid;`, because the `nonroot` user cannot write to `/run`.
+
+1. **Write a configuration file.** Here is a complete example:
 
    ```nginx
    listen 0.0.0.0:8080;               # 0.0.0.0 so that the published port reaches the router
@@ -38,7 +62,7 @@ The image is published as `ghcr.io/coo-quack/vigilant-heron:<version>` for `linu
    docker run --rm \
      -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
      -e TYPESAFE_API_KEY \
-     ghcr.io/coo-quack/vigilant-heron:<version> \
+     vigilant-heron \
      -t -c /etc/vigilant-heron/vigilant-heron.conf
    ```
 
@@ -48,19 +72,19 @@ The image is published as `ghcr.io/coo-quack/vigilant-heron:<version>` for `linu
    docker run -d --name vigilant-heron -p 8080:8080 \
      -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
      -e TYPESAFE_API_KEY \
-     ghcr.io/coo-quack/vigilant-heron:<version>
+     vigilant-heron
    ```
 
    Without `-c`, the image starts with `/etc/vigilant-heron/vigilant-heron.conf`, so the mount above is all it needs.
 
 ### Docker Compose
 
-Save this as `compose.yaml` next to `vigilant-heron.conf`:
+Save this as `compose.yaml` next to `vigilant-heron.conf`, after you have built the image with the command above:
 
 ```yaml
 services:
   vigilant-heron:
-    image: ghcr.io/coo-quack/vigilant-heron:<version>
+    image: vigilant-heron
     ports:
       - "8080:8080"
     volumes:
@@ -72,28 +96,7 @@ services:
 
 Start it with `TYPESAFE_API_KEY=... docker compose up -d`. Compose reads `${TYPESAFE_API_KEY}` from your shell or from a `.env` file beside `compose.yaml`. Do not commit that `.env` file.
 
-### Build the image yourself
-
-```bash
-docker build --target runtime -t vigilant-heron .
-```
-
-## Build from source
-
-```bash
-git clone https://github.com/coo-quack/vigilant-heron.git
-cd vigilant-heron
-cargo build --release --locked
-./target/release/vigilant-heron --version
-```
-
-`--locked` makes the build use the versions in `Cargo.lock`. The binary is `target/release/vigilant-heron`. Copy it to a directory on your `PATH`, such as `/usr/local/bin`.
-
-To install the binary into `~/.cargo/bin` without cloning first:
-
-```bash
-cargo install --git https://github.com/coo-quack/vigilant-heron --locked
-```
+To send a signal to the router in the container, use `docker exec`, as [Command line](/cli#docker) shows.
 
 ## Configuration file location and -c and -t
 
@@ -168,18 +171,52 @@ real_ip_header CF-Connecting-IP;
 
 Cloudflare publishes its ranges and changes them now and then. A range that is missing from `real_ip_from` makes requests from it look like they come from Cloudflare.
 
+## Run as a service with systemd
+
+To run the router as a service, run it in the foreground under systemd, not with `start`. systemd then restarts it when it crashes, reloads it on `systemctl reload`, and stops it gracefully. This unit assumes a system user `vigilant-heron`, a binary in `/usr/local/bin`, and the configuration in `/etc/vigilant-heron`. The configuration must set the pid file in the runtime directory:
+
+```nginx
+pid /run/vigilant-heron/vigilant-heron.pid;
+```
+
+
+```ini
+# /etc/systemd/system/vigilant-heron.service
+[Unit]
+Description=vigilant-heron router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vigilant-heron
+# systemd creates /run/vigilant-heron and gives it to the service user.
+# The configuration names a pid file in that directory: pid /run/vigilant-heron/vigilant-heron.pid;
+RuntimeDirectory=vigilant-heron
+# A file of KEY=value lines, readable only by root and the service: TYPESAFE_API_KEY=...
+EnvironmentFile=/etc/vigilant-heron/env
+ExecStart=/usr/local/bin/vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf
+ExecReload=/usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf
+# SIGTERM already stops the router gracefully; this makes it explicit.
+KillSignal=SIGTERM
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now vigilant-heron
+sudo systemctl reload vigilant-heron    # after a configuration change
+systemctl status vigilant-heron
+```
+
+A reload keeps connections open. Use `sudo systemctl restart vigilant-heron` only for a setting that is read at startup, or after you install a new binary. Check the file before you reload with `vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf`.
+
 ## Updating
-
-- **Docker:** check the new version's configuration with `-t` first, using the same `docker run --rm ... -t` command as above. Then replace the container:
-
-  ```bash
-  docker pull ghcr.io/coo-quack/vigilant-heron:<new-version>
-  docker rm -f vigilant-heron
-  docker run -d --name vigilant-heron -p 8080:8080 \
-    -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
-    -e TYPESAFE_API_KEY \
-    ghcr.io/coo-quack/vigilant-heron:<new-version>
-  ```
 
 - **From source:** pull the new code, build it, and check the configuration:
 
@@ -189,23 +226,32 @@ Cloudflare publishes its ranges and changes them now and then. A range that is m
   ./target/release/vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf
   ```
 
-Read the [Changelog](/changelog) before you update. A reload (`-s reload`) reads the configuration again, but it does not load a new binary. Restart the router after you update the binary. Settings such as `listen` and `worker_threads` take effect only at startup, as [Configuration](/configuration#reload-and-log-reopen) lists.
+  Restart the router after you update the binary. A reload reads the configuration again, but it does not load a new program. Settings such as `listen` and `worker_threads` also take effect only at startup, as [Configuration](/configuration#reload-and-log-reopen) lists.
 
-To update a `cargo install` copy, run the same command with `--force`:
+- **Docker:** rebuild the image from the new code, and replace the container:
 
-```bash
-cargo install --git https://github.com/coo-quack/vigilant-heron --locked --force
-```
+  ```bash
+  docker build -t vigilant-heron .
+  docker rm -f vigilant-heron
+  docker run -d --name vigilant-heron -p 8080:8080 \
+    -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
+    -e TYPESAFE_API_KEY \
+    vigilant-heron
+  ```
+
+Read the [Changelog](/changelog) before you update.
 
 ## Uninstall
 
-- **Docker:**
+- **Installed with `cargo install`:** run `cargo uninstall vigilant-heron`.
+- **Built from source:** delete the clone and the binary you copied.
+- **Docker:** remove the container and the image:
 
   ```bash
   docker rm -f vigilant-heron
-  docker image rm ghcr.io/coo-quack/vigilant-heron:<version>
+  docker image rm vigilant-heron
   ```
 
-- **From source:** delete the clone and the binary you copied. For a `cargo install` copy, run `cargo uninstall vigilant-heron`.
+- **systemd:** run `sudo systemctl disable --now vigilant-heron`, then delete the unit file.
 
 The router installs nothing else on the system. The pid file is removed when the router exits. If the router stopped without removing it, delete the file named by your `pid` directive. Your configuration file and logs stay where you put them.
