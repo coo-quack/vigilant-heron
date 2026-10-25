@@ -37,6 +37,7 @@ src/
   logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog, error log
   router.rs      # Host normalization and site lookup
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
+  limits.rs      # limit_req / limit_conn zones, leaky bucket, connection counts, location selection; runs first
   rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   sanitize.rs    # Backend event: header drop, body redaction, truncation
@@ -96,6 +97,10 @@ examples/
   never contain a credential header (`$http_cookie`, `$http_authorization`, and
   the others are rejected at load), and every value is escaped so a log line
   cannot be split.
+- Limits (`limit_req`, `limit_conn`) run first, before the access list and the
+  body is read. Their key uses only variables known before the body, and a
+  limited request never reaches the rules or the backend. In shadow mode they are
+  dry runs.
 - Comments and documentation are in English.
 - CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`) are
   registered as required checks in coo-quack/iac; do not rename them.

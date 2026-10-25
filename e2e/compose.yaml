@@ -108,6 +108,11 @@ configs:
           return 200 "body { color: #222; }\n";
         }
 
+        # Held for one second by the stub echo, so a concurrent request overlaps it.
+        location /hold {
+          proxy_pass http://stub-decider:9000/echo/hold;
+        }
+
         location / {
           default_type text/plain;
           return 200 "upstream ok\n";

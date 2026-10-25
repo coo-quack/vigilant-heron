@@ -163,6 +163,10 @@ For each request, in this order:
 5. The static asset skip (`static_extensions`), which also forwards.
 6. The decision model. The thresholds and failure settings apply here only.
 
+Limits (see [Limits](#limits)) run before all of these, at step 0. A request
+refused by a limit gets its status and never reaches steps 1 to 6. In a shadow
+site a limited request is forwarded and recorded with `would_have=reject`.
+
 Block rules are always checked before skip rules, so a skip rule never lets
 through a request that a block rule matches. No failure setting changes steps 1
 to 5: a rule decision holds when the backend rate-limits, errors or is slow.
@@ -177,6 +181,121 @@ can include `$rule_id` as well. The `reason` values for these decisions are:
   enforce site, and `allow` with `would_have=block` on a shadow site)
 - `rule`: blocked by a block rule (also `deny_path`, which has no `$rule_id`)
 - `skip_rule`: forwarded by a skip rule
+
+## Limits
+
+Request-rate and connection limits follow nginx's `ngx_http_limit_req_module`
+and `ngx_http_limit_conn_module`. They are checked first, before the access list,
+the body and the rules.
+
+```nginx
+limit_req_zone $client_ip zone=perip:10m rate=10r/s;
+limit_conn_zone $client_ip zone=conns:10m;
+
+site example.com {
+    upstream http://upstream:80;
+
+    location = /wp-login.php {
+        limit_req zone=perip burst=2 nodelay;
+        limit_req_status 429;
+    }
+    location /downloads/ {
+        limit_conn conns 4;
+    }
+}
+```
+
+### Zones
+
+- `limit_req_zone <key> zone=<name>:<size> rate=<N>r/s|r/m;` is a leaky bucket
+  per key. `rate` is the drain rate.
+- `limit_conn_zone <key> zone=<name>:<size>;` counts requests in progress per key.
+- Zones are top-level directives. They may appear anywhere in the top level, and
+  each name is used once across both kinds.
+- The key is a string of literal text and variables, known before the body is
+  read: `$client_ip` (the address after realip selection, the analogue of
+  `$binary_remote_addr`), `$remote_addr` (the peer), `$site`, `$host` (normalized),
+  `$method`, `$path` (decoded and dot-normalized, case kept) and `$http_<name>`.
+  The credential headers that log formats refuse (`cookie`, `authorization`,
+  `proxy-authorization`, `x-api-key`, `x-auth-token`, and the decision's redacted
+  headers) are refused here too.
+- A key that comes out empty is not counted, as in nginx. Literal text keeps a
+  key non-empty, so `$http_x_tenant-` is counted even when the header is missing.
+- `<size>` is the memory of the zone. It holds `size / 128` states for
+  `limit_req` and `size / 64` for `limit_conn`, the nginx state sizes. A size that
+  holds no state is an error.
+
+### Directives
+
+Inside `site`, `location`, or at the top level (a site or location that does not
+set a directive inherits it):
+
+- `limit_req zone=<name> [burst=<n>] [nodelay | delay=<n>];` may repeat.
+- `limit_conn <zone> <number>;` may repeat.
+- `limit_req_status <code>;` and `limit_conn_status <code>;`: the status of a
+  rejected request, 4xx or 5xx, default 503. 429 is a sensible choice.
+- `limit_req_dry_run on|off;` and `limit_conn_dry_run on|off;`: the limit only
+  accounts; nothing is rejected or delayed.
+- `limit_req_log_level` and `limit_conn_log_level`: `info`, `notice`, `warn` or
+  `error` (default `error`). The router's error log has no notice level, so
+  `notice` is written at info.
+
+Inheritance follows nginx. A level that has any `limit_req` replaces the list it
+inherits; the same holds for `limit_conn`. Each other setting is inherited unless
+the level sets it.
+
+`limit_req` without `burst` rejects every request beyond the rate. With `burst`,
+the excess requests wait for their turn at the rate. `nodelay` lets the burst
+pass at once, and `delay=<n>` lets the first `n` excess requests pass at once
+and makes the rest wait. `delay` needs a burst and cannot exceed it, and it
+cannot be combined with `nodelay`. Waiting does not block other requests.
+
+The `limit_req` bucket admits a request that finds it empty and then up to
+`burst` more before it rejects, so `rate=1r/s burst=2 nodelay` admits three
+requests at once. Over any time window, the requests admitted are at most the
+rate times the window, plus `burst + 1`.
+
+### Location blocks
+
+`location [=|~|~*|^~] <path> { ... }` may appear inside a `site`. Matching is
+nginx's: an exact `=` match wins; otherwise the longest prefix is found, and a
+`^~` prefix that matches ends the search; otherwise the regexes are tried in file
+order and the first match wins; otherwise the longest prefix is used. The path
+is the normalized request path. Plain paths are compared lowercased, as
+`deny_path` is, and must start with `/`. A regex with `~` matches the decoded
+path with case kept, and `~*` ignores case. Regexes use the `regex` crate, so
+they are linear-time and have no backreferences or lookaround, which differs from
+nginx's PCRE. A repeated plain location is an error, as in nginx.
+
+Only the eight limit directives may appear inside a `location`. Any other
+directive is an error at its line.
+
+### Outcome
+
+- A request refused by `limit_req` or `limit_conn` gets the status of its
+  directive. The access log records `action` `reject` and `reason` `limit_req` or
+  `limit_conn`, and it is never forwarded.
+- The variables `$limit_req_status` (`PASSED`, `DELAYED`, `REJECTED`,
+  `DELAYED_DRY_RUN`, `REJECTED_DRY_RUN`) and `$limit_conn_status` (`PASSED`,
+  `REJECTED`, `REJECTED_DRY_RUN`) are available in a `log_format`. When several
+  zones apply, the worst outcome is shown. The built-in `json` format does not
+  include them.
+- In a shadow site, and for a dry-run directive, every limit is a dry run. A
+  request that would have been refused is forwarded, and the access log and the
+  debug header record `would_have=reject`.
+- A delayed request waits asynchronously and then goes on to the rest of the
+  pipeline. The delay counts against the client's timeouts.
+- `limit_conn` counts a request from the moment its header is read until its
+  response body is done, or dropped on a client disconnect. A refused request is
+  not counted.
+- When a zone has no free state, nginx's behavior applies: the least recently used
+  idle state is evicted first. If every state is in use (a delayed request in
+  `limit_req`, or a request in progress in `limit_conn`), the request gets an error
+  status: 500 for `limit_req` and 503 for `limit_conn`. These two statuses are not
+  configurable.
+
+These limits are per process. A router with several processes keeps separate
+counts.
 
 ## Failure behavior
 

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Request-rate and connection limits, with nginx's `limit_req` and `limit_conn`
+  semantics: `limit_req_zone` and `limit_conn_zone` at the top level, `limit_req`,
+  `limit_conn`, their status, dry-run and log-level directives at the top level,
+  in a `site` and in a `location`. Limits run before the access list, and a
+  refused request gets its status (default 503) without reaching the backend.
+  New access-log variables `$limit_req_status` and `$limit_conn_status`.
+  `location` blocks inside `site` select a path with nginx's matching rules.
 - **Breaking:** the access list and the rules run before the decision backend,
   and a rule block now also comes from the built-in set. Existing configurations
   keep their behavior except for requests the built-in rules match, which are
