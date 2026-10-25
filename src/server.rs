@@ -4,17 +4,18 @@
 //! call, policy. Rules are decided before the backend is called, so no failure
 //! setting can turn a rule block into an allow.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
 use http::header::{HOST, HeaderName, HeaderValue, LOCATION};
 use http::request::Parts;
-use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::{HeaderMap, Request, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Incoming;
@@ -25,12 +26,17 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::config::{BackendConfig, Config, DecisionConfig, MAX_REQUEST_ID_BYTES, SiteConfig};
+use crate::accesslog::{AccessRecord, LogFormat};
+use crate::config::{
+    AccessLogConfig, BackendConfig, Config, DecisionConfig, MAX_REQUEST_ID_BYTES, SiteConfig,
+};
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
 use crate::error::{DecisionError, ServeError};
+use crate::logsink::{Writer, spawn_writer};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
 use crate::proxy::Proxy;
+use crate::realip::RealIp;
 use crate::router::{Router, normalize_host};
 use crate::sanitize::{self, EventInput, truncate_utf8};
 use crate::system_one::SystemOneBackend;
@@ -38,6 +44,12 @@ use crate::system_one::SystemOneBackend;
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
 
 type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+/// A destination's writer with the format its lines use.
+struct Sink {
+    writer: Writer,
+    format: LogFormat,
+}
 
 /// Shared state for every connection.
 pub(crate) struct AppState<B> {
@@ -49,8 +61,12 @@ pub(crate) struct AppState<B> {
     backend: B,
     proxy: Proxy,
     default_status: StatusCode,
-    client_ip_header: Option<HeaderName>,
+    realip: RealIp,
     request_id_header: Option<HeaderName>,
+    /// Access logs of each site, in site order.
+    site_sinks: Vec<Vec<Sink>>,
+    /// Access logs of requests that match no site.
+    global_sinks: Vec<Sink>,
 }
 
 impl AppState<Backend> {
@@ -79,11 +95,35 @@ impl AppState<Backend> {
                 limits,
             )),
         };
-        // The request-id header identifies the request to the proxy's log only.
+        // The request-id header identifies the request to the log only.
         let mut backend_redact = config.decision.redact_headers.clone();
         if let Some(name) = &config.request_id_header {
             backend_redact.push(name.as_str().to_owned());
         }
+        let mut writers: HashMap<String, Writer> = HashMap::new();
+        let mut sinks_for = |logs: &[AccessLogConfig]| -> Vec<Sink> {
+            logs.iter()
+                .map(|log| {
+                    let writer = writers
+                        .entry(log.destination.label())
+                        .or_insert_with(|| spawn_writer(log.destination.clone()))
+                        .clone();
+                    Sink {
+                        writer,
+                        format: log.format.clone(),
+                    }
+                })
+                .collect()
+        };
+        let global_sinks = sinks_for(&config.access_logs);
+        let site_sinks = config
+            .sites
+            .iter()
+            .map(|site| {
+                let logs = site.access_logs.as_deref().unwrap_or(&config.access_logs);
+                sinks_for(logs)
+            })
+            .collect();
         Ok(Self {
             router: Router::new(&config.sites),
             sites: config.sites,
@@ -92,8 +132,10 @@ impl AppState<Backend> {
             backend,
             proxy: Proxy::new(),
             default_status: config.default_status,
-            client_ip_header: config.client_ip_header,
+            realip: config.realip,
             request_id_header: config.request_id_header,
+            site_sinks,
+            global_sinks,
         })
     }
 }
@@ -172,40 +214,57 @@ async fn serve_connection<B: DecisionBackend>(
     }
 }
 
-/// What the log records about the request before a decision is made.
+/// Facts about a request that are known before its decision.
 struct Trace<'a> {
     client_ip: &'a str,
+    remote_addr: &'a str,
     request_id: Option<&'a str>,
     started: Instant,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the per-request pipeline reads top to bottom; splitting it would scatter the rule-first order"
+)]
 async fn handle<B: DecisionBackend>(
     state: &AppState<B>,
     peer: SocketAddr,
     request: Request<Incoming>,
 ) -> Response<ResponseBody> {
     let started = Instant::now();
-    let client_ip = client_ip(state, request.headers(), peer);
+    let client = client_ip(state, request.headers(), peer);
     let request_id = request_id(state, request.headers());
+    let remote = peer.ip().to_string();
     let (parts, body) = request.into_parts();
     let trace = Trace {
-        client_ip: &client_ip,
+        client_ip: &client,
+        remote_addr: &remote,
         request_id: request_id.as_deref(),
         started,
     };
-    let Some(site) = state
-        .router
-        .lookup(parts.headers.get(HOST))
-        .and_then(|index| state.sites.get(index))
-    else {
+    let Some(index) = state.router.lookup(parts.headers.get(HOST)) else {
         let host = parts
             .headers
             .get(HOST)
             .and_then(|value| value.to_str().ok())
             .map(normalize_host)
             .unwrap_or_default();
-        return reject(&parts, &trace, &host, state.default_status, "unknown_host");
+        return reject(
+            &parts,
+            &trace,
+            &host,
+            state.default_status,
+            "unknown_host",
+            &state.global_sinks,
+        );
     };
+    let Some(site) = state.sites.get(index) else {
+        return status_response(state.default_status, "");
+    };
+    let sinks = state
+        .site_sinks
+        .get(index)
+        .map_or(&state.global_sinks[..], Vec::as_slice);
     let body = match Limited::new(body, state.decision.max_body_bytes)
         .collect()
         .await
@@ -218,6 +277,7 @@ async fn handle<B: DecisionBackend>(
                 site_name(site),
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "body_too_large",
+                sinks,
             );
         }
         Err(_) => {
@@ -227,6 +287,7 @@ async fn handle<B: DecisionBackend>(
                 site_name(site),
                 StatusCode::BAD_REQUEST,
                 "unreadable_body",
+                sinks,
             );
         }
     };
@@ -240,23 +301,51 @@ async fn handle<B: DecisionBackend>(
         parts.uri.query().is_some(),
         body.is_empty(),
     );
-    let assessment = assess(state, site, &parts, &body, &client_ip, screening).await;
+    let assessment = assess(state, site, &parts, &body, &client, screening).await;
     let decision = policy::decide(site, &path, &assessment);
     let mut response = respond(state, site, &parts, body, peer, &decision).await;
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
     }
-    emit(&LogRecord {
+    let fields = verdict_fields(&assessment);
+    let record = AccessRecord {
+        time: SystemTime::now(),
+        request_id: trace.request_id,
+        client_ip: trace.client_ip,
+        remote_addr: trace.remote_addr,
         site: site_name(site),
-        method: &parts.method,
+        host: parts
+            .headers
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        method: parts.method.as_str(),
         path: raw_path,
+        status: response.status().as_u16(),
         action: decision.action.name(),
         reason: decision.reason.name(),
-        would_have: decision.would_have.as_ref().map_or("none", Action::name),
-        verdict: verdict_fields(&assessment),
-        trace,
-    });
+        would_have: decision.would_have.as_ref().map(Action::name),
+        attack: fields.attack,
+        ai_instruction: fields.ai_instruction,
+        category: fields.category,
+        decision_error: fields.decision_error,
+        retry_after: fields.retry_after,
+        input_tokens: fields.input_tokens,
+        latency_ms: latency(started),
+    };
+    write_access(sinks, &record, &parts.headers);
     response
+}
+
+fn latency(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Queues one line per destination. A destination whose queue is full drops the line.
+fn write_access(sinks: &[Sink], record: &AccessRecord<'_>, headers: &HeaderMap) {
+    for sink in sinks {
+        sink.writer.send(sink.format.render(record, headers));
+    }
 }
 
 async fn respond<B>(
@@ -345,14 +434,10 @@ async fn assess<B: DecisionBackend>(
 }
 
 fn client_ip<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> String {
-    state
-        .client_ip_header
-        .as_ref()
-        .and_then(|name| headers.get(name))
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map_or_else(|| peer.ip().to_string(), str::to_owned)
+    let header = headers
+        .get(&state.realip.header)
+        .and_then(|value| value.to_str().ok());
+    state.realip.client_ip(peer.ip(), header).to_string()
 }
 
 /// Reads the configured request-id header, lossily decoded and cut to 128 bytes.
@@ -367,7 +452,7 @@ fn site_name(site: &SiteConfig) -> &str {
     site.hosts.first().map_or("", String::as_str)
 }
 
-/// The verdict fields written to the decision event. Each is empty when no backend answered.
+/// The verdict fields of an access record. Each is empty when no backend answered.
 struct VerdictFields<'a> {
     attack: Option<f64>,
     ai_instruction: Option<f64>,
@@ -410,28 +495,34 @@ fn reject(
     site: &str,
     status: StatusCode,
     reason: &str,
+    sinks: &[Sink],
 ) -> Response<ResponseBody> {
-    emit(&LogRecord {
+    let record = AccessRecord {
+        time: SystemTime::now(),
+        request_id: trace.request_id,
+        client_ip: trace.client_ip,
+        remote_addr: trace.remote_addr,
         site,
-        method: &parts.method,
+        host: parts
+            .headers
+            .get(HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or(""),
+        method: parts.method.as_str(),
         path: parts.uri.path(),
+        status: status.as_u16(),
         action: "reject",
         reason,
-        would_have: "none",
-        verdict: VerdictFields {
-            attack: None,
-            ai_instruction: None,
-            category: None,
-            input_tokens: None,
-            decision_error: None,
-            retry_after: None,
-        },
-        trace: Trace {
-            client_ip: trace.client_ip,
-            request_id: trace.request_id,
-            started: trace.started,
-        },
-    });
+        would_have: None,
+        attack: None,
+        ai_instruction: None,
+        category: None,
+        decision_error: None,
+        retry_after: None,
+        input_tokens: None,
+        latency_ms: latency(trace.started),
+    };
+    write_access(sinks, &record, &parts.headers);
     status_response(status, "")
 }
 
@@ -445,41 +536,6 @@ fn add_debug_header(headers: &mut HeaderMap, decision: &Decision) {
     if let Ok(value) = HeaderValue::from_str(&value) {
         headers.insert(DEBUG_HEADER, value);
     }
-}
-
-/// The fields of the one `vigilant_heron::decision` event written per request.
-struct LogRecord<'a> {
-    site: &'a str,
-    method: &'a Method,
-    path: &'a str,
-    action: &'a str,
-    reason: &'a str,
-    would_have: &'a str,
-    verdict: VerdictFields<'a>,
-    trace: Trace<'a>,
-}
-
-fn emit(record: &LogRecord<'_>) {
-    let latency_ms = u64::try_from(record.trace.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let verdict = &record.verdict;
-    tracing::info!(
-        target: "vigilant_heron::decision",
-        site = record.site,
-        method = %record.method,
-        path = record.path,
-        action = record.action,
-        reason = record.reason,
-        would_have = record.would_have,
-        attack = verdict.attack,
-        ai_instruction = verdict.ai_instruction,
-        category = verdict.category,
-        input_tokens = verdict.input_tokens,
-        decision_error = verdict.decision_error,
-        retry_after = verdict.retry_after,
-        request_id = record.trace.request_id,
-        latency_ms,
-        client_ip = record.trace.client_ip,
-    );
 }
 
 fn status_response(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
@@ -502,33 +558,33 @@ mod tests {
 
     use super::*;
 
-    const CONFIG: &str = r#"
-listen = "127.0.0.1:0"
-max_connections = 1
+    const CONFIG: &str = r"
+listen 127.0.0.1:0;
+max_connections 1;
 
-[decision]
-backend = "http"
-url = "http://127.0.0.1:9/decide"
-timeout_ms = 150
-inspect_body_bytes = 512
-max_body_bytes = 1024
+decision {
+    backend http;
+    url http://127.0.0.1:9/decide;
+    timeout 150ms;
+    inspect_body 512;
+    max_body 1024;
+}
 
-[default]
-status = 421
+default_status 421;
 
-[[sites]]
-hosts = ["example.com"]
-upstream = "http://127.0.0.1:9"
-mode = "enforce"
-action = "block"
-block_threshold = 0.9
-instruction_threshold = 0.5
-"#;
+site example.com {
+    upstream http://127.0.0.1:9;
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}
+";
 
     #[tokio::test]
     async fn shutdown_returns_promptly_while_every_connection_slot_is_busy()
     -> Result<(), Box<dyn Error + Send + Sync>> {
-        let config = Config::from_toml_str(CONFIG)?;
+        let config = Config::parse_str(CONFIG, "test.conf")?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         // An idle connection takes the only slot and never sends a request.

@@ -39,30 +39,30 @@ async fn live_proxy(
 ) -> Result<common::Proxy, BoxError> {
     let text = format!(
         r#"
-listen = "127.0.0.1:0"
+listen 127.0.0.1:0;
 
-[decision]
-backend = "clef"
-model = "clef-flash"
-url = "{url}"
-api_token_env = "{TOKEN_ENV}"
-timeout_ms = 10000
-inspect_body_bytes = 8192
-max_body_bytes = 10485760
+decision {{
+    backend clef;
+    model clef-flash;
+    url "{url}";
+    api_token_env "{TOKEN_ENV}";
+    timeout 10000ms;
+    inspect_body 8192;
+    max_body 10485760;
+}}
 
-[default]
-status = 421
+default_status 421;
 
-[[sites]]
-hosts = ["example.com"]
-upstream = "{upstream_url}"
-mode = "enforce"
-action = "block"
-block_threshold = 0.5
-instruction_threshold = 0.5
+site example.com {{
+    upstream "{upstream_url}";
+    mode enforce;
+    action block;
+    block_threshold 0.5;
+    instruction_threshold 0.5;
+}}
 "#
     );
-    let config = Config::from_toml_str_with_lookup(&text, move |name| {
+    let config = Config::parse_str_with_lookup(&text, "test.conf", move |name| {
         (name == TOKEN_ENV).then(|| token.clone())
     })?;
     start_proxy_config(config).await

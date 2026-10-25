@@ -38,7 +38,7 @@ COPY --from=build /out/vigilant-heron /usr/local/bin/vigilant-heron
 USER nonroot
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/vigilant-heron"]
-CMD ["--config", "/etc/vigilant-heron/config.toml"]
+CMD ["--config", "/etc/vigilant-heron/vigilant-heron.conf"]
 
 # Test double for the decision backend, used only by the e2e stack.
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS stub-decider

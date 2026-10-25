@@ -47,39 +47,39 @@ impl Setup {
 
     fn config(&self) -> Result<Config, BoxError> {
         let action = if self.redirect {
-            "action = \"redirect\"\nredirect_to = \"https://example.com/blocked\""
+            "action redirect https://example.com/blocked;"
         } else {
-            "action = \"block\""
+            "action block;"
         };
         let text = format!(
             r#"
-listen = "127.0.0.1:0"
+listen 127.0.0.1:0;
 
-[decision]
-backend = "jev"
-model = "jev-latest"
-url = "{url}"
-api_token_env = "{TOKEN_ENV}"
-timeout_ms = {timeout}
-max_concurrency = {concurrency}
-queue_timeout_ms = {queue}
-inspect_body_bytes = 512
-max_body_bytes = 1024
+decision {{
+    backend jev;
+    model jev-latest;
+    url "{url}";
+    api_token_env "{TOKEN_ENV}";
+    timeout {timeout}ms;
+    max_concurrency {concurrency};
+    queue_timeout {queue}ms;
+    inspect_body 512;
+    max_body 1024;
+}}
 
-[default]
-status = 421
+default_status 421;
 
-[[sites]]
-hosts = ["example.com"]
-upstream = "{upstream}"
-mode = "enforce"
-{action}
-block_threshold = 0.9
-instruction_threshold = 0.5
-deny_paths = ["/.env"]
-fail_closed_paths = ["/wp-login.php"]
-on_rate_limit = "{rate}"
-on_decision_error = "{error}"
+site example.com {{
+    upstream "{upstream}";
+    mode enforce;
+    {action}
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    deny_path /.env;
+    fail_closed_path /wp-login.php;
+    on_rate_limit {rate};
+    on_decision_error {error};
+}}
 "#,
             url = self.decide_url,
             timeout = self.timeout_ms,
@@ -90,9 +90,11 @@ on_decision_error = "{error}"
             error = self.on_decision_error,
         );
         let token = GOOD_TOKEN;
-        Ok(Config::from_toml_str_with_lookup(&text, move |name| {
-            (name == TOKEN_ENV).then(|| token.to_owned())
-        })?)
+        Ok(Config::parse_str_with_lookup(
+            &text,
+            "test.conf",
+            move |name| (name == TOKEN_ENV).then(|| token.to_owned()),
+        )?)
     }
 }
 

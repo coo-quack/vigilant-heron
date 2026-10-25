@@ -85,7 +85,7 @@ When bumping a version, open a PR from `develop` → `main` with:
 2. Add a `## vX.Y.Z (YYYY-MM-DD)` section to `CHANGELOG.md`
    - `release.yml` extracts that section as the GitHub Release notes, so the
      heading must start with `## vX.Y.Z`
-3. Review `README.md` and `examples/config.toml` for changed keys or behavior
+3. Review `README.md` and `examples/vigilant-heron.conf` for changed directives or behavior
 
 After merging into `main`, `release.yml` automatically:
 

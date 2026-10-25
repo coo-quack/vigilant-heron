@@ -7,14 +7,19 @@
 //! policy turns the scores into a block, a redirect or a forward to the upstream.
 //!
 //! Shadow mode forwards every request and only records what would have happened.
-//! The [`serve`] function runs the proxy on a listener that the caller binds.
+//! The configuration uses nginx-style directives. [`serve`] runs the proxy on a
+//! listener that the caller binds.
 
+mod accesslog;
+mod conf;
 mod config;
 mod decision;
 mod error;
+mod logsink;
 mod policy;
 mod prefilter;
 mod proxy;
+mod realip;
 mod router;
 mod sanitize;
 mod server;
@@ -22,7 +27,13 @@ mod system_one;
 #[cfg(test)]
 mod test_support;
 
-pub use config::{BackendConfig, Config, DecisionConfig, LogFormat, Mode, SiteAction, SiteConfig};
+pub use accesslog::LogFormat;
+pub use config::{
+    AccessLogConfig, BackendConfig, Config, DecisionConfig, ErrorLogConfig, FailureAction,
+    LogLevel, Mode, SiteAction, SiteConfig,
+};
 pub use error::{ConfigError, ServeError};
+pub use logsink::{Destination, ErrorLogHandle, install_error_log};
+pub use realip::{IpNet, RealIp};
 pub use server::serve;
 pub use system_one::{ApiToken, ClefModel};

@@ -234,7 +234,7 @@ pub(crate) struct Proxy {
 
 /// Starts the proxy with `config_text` on an ephemeral loopback port.
 pub(crate) async fn start_proxy(config_text: &str) -> Result<Proxy, BoxError> {
-    start_proxy_config(Config::from_toml_str(config_text)?).await
+    start_proxy_config(Config::parse_str(config_text, "test.conf")?).await
 }
 
 /// Starts the proxy with an already validated `config` on an ephemeral loopback port.
@@ -326,46 +326,45 @@ pub(crate) async fn send(
 pub(crate) fn config_text(decide_url: &str, upstream_url: &str, timeout_ms: u64) -> String {
     format!(
         r#"
-listen = "127.0.0.1:0"
+listen 127.0.0.1:0;
 
-[decision]
-backend = "http"
-url = "{decide_url}"
-timeout_ms = {timeout_ms}
-inspect_body_bytes = 512
-max_body_bytes = 1024
+decision {{
+    backend http;
+    url "{decide_url}";
+    timeout {timeout_ms}ms;
+    inspect_body 512;
+    max_body 1024;
+}}
 
-[default]
-status = 421
+default_status 421;
 
-[[sites]]
-hosts = ["example.com", "www.example.com"]
-upstream = "{upstream_url}"
-mode = "enforce"
-action = "block"
-block_threshold = 0.9
-instruction_threshold = 0.5
-deny_paths = ["/xmlrpc.php"]
-fail_closed_paths = ["/wp-login.php"]
-debug_headers = true
+site example.com www.example.com {{
+    upstream "{upstream_url}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    deny_path /xmlrpc.php;
+    fail_closed_path /wp-login.php;
+    debug_headers on;
+}}
 
-[[sites]]
-hosts = ["redirect.test"]
-upstream = "{upstream_url}"
-mode = "enforce"
-action = "redirect"
-redirect_to = "https://example.com/blocked"
-block_threshold = 0.9
-instruction_threshold = 0.5
+site redirect.test {{
+    upstream "{upstream_url}";
+    mode enforce;
+    action redirect https://example.com/blocked;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
 
-[[sites]]
-hosts = ["shadow.test"]
-upstream = "{upstream_url}"
-mode = "shadow"
-action = "block"
-block_threshold = 0.9
-instruction_threshold = 0.5
-debug_headers = true
+site shadow.test {{
+    upstream "{upstream_url}";
+    mode shadow;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    debug_headers on;
+}}
 "#
     )
 }

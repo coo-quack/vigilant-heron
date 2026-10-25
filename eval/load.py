@@ -28,29 +28,29 @@ ROUTER_BIN = ROOT / "target" / "release" / "vigilant-heron"
 STUB_BIN = ROOT / "target" / "release" / "stub-decider"
 STUB_PORT = 9000
 SITE_HOST = "load.example.com"
-CONFIG_TEXT = """listen = "@LISTEN@"
-log_format = "json"
-request_id_header = "x-request-id"
+CONFIG_TEXT = """listen @LISTEN@;
+request_id_header x-request-id;
+access_log @ACCESS_LOG@ json;
 @WORKER_THREADS@
 
-[decision]
-backend = "http"
-url = "http://127.0.0.1:9000/decide"
-timeout_ms = 300
-max_concurrency = @MAX_CONCURRENCY@
-inspect_body_bytes = 8192
-max_body_bytes = 10485760
+decision {
+    backend http;
+    url http://127.0.0.1:9000/decide;
+    timeout 300ms;
+    max_concurrency @MAX_CONCURRENCY@;
+    inspect_body 8192;
+    max_body 10485760;
+}
 
-[default]
-status = 421
+default_status 421;
 
-[[sites]]
-hosts = ["load.example.com"]
-upstream = "http://127.0.0.1:@UPSTREAM@"
-mode = "enforce"
-action = "block"
-block_threshold = 0.87
-instruction_threshold = 0.8
+site load.example.com {
+    upstream http://127.0.0.1:@UPSTREAM@;
+    mode enforce;
+    action block;
+    block_threshold 0.87;
+    instruction_threshold 0.8;
+}
 """
 
 
@@ -163,11 +163,11 @@ def decision_errors(log_path):
             entry = json.loads(line)
         except ValueError:
             continue
-        if entry.get("target") != "vigilant_heron::decision":
+        if not isinstance(entry, dict) or not entry.get("request_id"):
             continue
         decisions += 1
-        cause = entry.get("fields", {}).get("decision_error")
-        if cause is not None:
+        cause = entry.get("decision_error")
+        if cause:
             counts[cause] = counts.get(cause, 0) + 1
     return decisions, counts
 
@@ -212,14 +212,17 @@ def main():
         upstream_port = free_port()
         upstream = start_upstream(upstream_port)
         router_port = free_port()
-        config_path = RESULTS_DIR / f"{stamp}-load-config.toml"
+        config_path = RESULTS_DIR / f"{stamp}-load-config.conf"
+        access_path = RESULTS_DIR / f"{stamp}-load-access.jsonl"
+        access_path.touch()
         config_path.write_text(
             CONFIG_TEXT.replace("@LISTEN@", f"127.0.0.1:{router_port}")
             .replace("@UPSTREAM@", str(upstream_port))
+            .replace("@ACCESS_LOG@", str(access_path))
             .replace("@MAX_CONCURRENCY@", str(args.max_concurrency))
             .replace(
                 "@WORKER_THREADS@",
-                f"worker_threads = {args.worker_threads}" if args.worker_threads else "",
+                f"worker_threads {args.worker_threads};" if args.worker_threads else "",
             ),
             encoding="utf-8",
         )
@@ -245,7 +248,7 @@ def main():
             upstream.shutdown()
             upstream.server_close()
 
-    decisions, failures = decision_errors(log_path)
+    decisions, failures = decision_errors(access_path)
     done = len(latencies)
     lines = [
         f"## Load run: concurrency {args.concurrency}, {args.requests} requests",

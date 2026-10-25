@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Breaking:** the configuration is nginx-style (`vigilant-heron.conf`), not
+  TOML. Each TOML key has a directive, times and sizes take units, and
+  `include` splits files. The default path is `/etc/vigilant-heron/vigilant-heron.conf`.
+  There is no automatic converter; see the README for the mapping.
+- **Breaking:** the `vigilant_heron::decision` tracing event is replaced by
+  access logs: one line per request to the destinations named by `access_log`,
+  with `log_format` and the built-in `json` and `main` formats. `error_log`
+  controls operational messages. Default: `access_log stdout json;`.
+- `client_ip_header` is replaced by `real_ip_from`, `real_ip_header` and
+  `real_ip_recursive`, with nginx semantics: the header is believed only from a
+  trusted proxy.
 - Defaults: `decision.backend` is `"jev"` (with its URL, model and token
   variable), `timeout_ms` is 300, site thresholds are 0.87 and 0.8. Configs that
   used the JSON protocol must set `backend = "http"`.

@@ -36,7 +36,7 @@ the log and optional debug header record what would have happened.
 ## Failure behavior
 
 A decision fails when the backend answers HTTP 429, when no concurrency slot is
-free within `timeout_ms`, or when it fails in any other way. The two groups have
+free within `timeout`, or when it fails in any other way. The two groups have
 their own site settings, both `"allow"` by default:
 
 - `on_rate_limit`: the 429 and "no slot in time" group
@@ -45,7 +45,7 @@ their own site settings, both `"allow"` by default:
   obtained is in this group.
 
 Saturation is always in the rate-limit group: a request that gets no
-concurrency slot within `decision.queue_timeout_ms` is `backend_busy`, and that
+concurrency slot within `decision` `queue_timeout` is `backend_busy`, and that
 never falls under `on_decision_error`.
 
 `fail_closed_paths` wins over both: a failure on such a path is always blocked.
@@ -60,17 +60,17 @@ outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
 |---|---|---|
 | `max_connections` | client connections open at the same time | 1024 |
 | `worker_threads` | runtime threads that run the proxy | one per CPU core |
-| `decision.max_concurrency` | decision-backend calls in flight at the same time | 64 |
-| `decision.queue_timeout_ms` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
+| `decision` `max_concurrency` | decision-backend calls in flight at the same time | 64 |
+| `decision` `queue_timeout` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
 
-Waiting for a slot is bounded by `queue_timeout_ms` only. A call that gets a
-slot then has the rest of `timeout_ms`. Saturation is therefore always a rate
+Waiting for a slot is bounded by `queue_timeout` only. A call that gets a
+slot then has the rest of `timeout`. Saturation is therefore always a rate
 limit, and it follows `on_rate_limit`, never `on_decision_error`.
 
-The defaults are: `decision.backend = "jev"` (its URL, model and token variable
-are set by default too), `timeout_ms = 300`, `block_threshold = 0.87`,
-`instruction_threshold = 0.8`, and both failure settings `"allow"`. Configs that
-want the JSON protocol must set `backend = "http"`.
+The defaults are: `backend jev` (its URL, model and token variable
+are set by default too), `timeout 300ms`, `block_threshold 0.87`,
+`instruction_threshold 0.8`, and both failure settings `"allow"`. Configs that
+want the JSON protocol must set `backend http;`.
 
 ## Evaluation
 
@@ -80,18 +80,39 @@ The harness is described in [`eval/README.md`](eval/README.md).
 
 ## Configuration
 
-See [`examples/config.toml`](examples/config.toml) for every key with
-comments. Sites are listed under `[[sites]]`, each with its own hosts,
-upstream, mode, action and thresholds.
+The configuration uses nginx syntax: `directive arguments;` and blocks such as
+`decision { ... }` and `site example.com { ... }`, with `#` comments and
+`include` for splitting files. See
+[`examples/vigilant-heron.conf`](examples/vigilant-heron.conf) for every
+directive with comments.
+
+Times take `ms`, `s`, `m` or `h` (a bare number is seconds, as in nginx). Sizes
+take `k`, `m` or `g`. Every error names the file and line, for example
+`vigilant-heron.conf:12: "block_threshold" must be between 0 and 1`.
+
+Access logs are written per request, one line each, to the destinations named by
+`access_log` (`stdout`, `stderr`, a file, or `syslog:server=HOST:PORT`). The
+default is `access_log stdout json;`. Formats are defined with `log_format`
+from the variables listed in the example file. `error_log` controls the
+operational messages. A file destination is reopened on SIGUSR1, so logrotate
+can move it away.
+
+Migration from the earlier TOML configuration: there is no automatic converter.
+Each `[[sites]]` table becomes a `site` block, `timeout_ms = 150` becomes
+`timeout 150ms;`, and `deny_paths = [...]` becomes `deny_path ...;`. The keys
+keep their names unless the table above says otherwise.
 
 ## Running
 
 ```bash
-cargo run --release -- --config examples/config.toml
+TYPESAFE_API_KEY=... cargo run --release -- --config examples/vigilant-heron.conf
 ```
 
+The example uses the default backend, Jev, so the token variable it names must
+be set or the router refuses to start.
+
 The config path can also come from `VIGILANT_HERON_CONFIG`; the default is
-`/etc/vigilant-heron/config.toml`.
+`/etc/vigilant-heron/vigilant-heron.conf`.
 
 With Docker, use the published image (`linux/amd64` and `linux/arm64`). The
 package is private while the repository is private, so log in to `ghcr.io`
@@ -99,7 +120,7 @@ first:
 
 ```bash
 docker run --rm -p 8080:8080 \
-  -v "$PWD/config.toml:/etc/vigilant-heron/config.toml:ro" \
+  -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
   ghcr.io/coo-quack/vigilant-heron:<version>
 ```
 
@@ -113,19 +134,20 @@ docker build --target runtime -t vigilant-heron .
 
 ## Decision backends
 
-`decision.backend` selects the protocol. The default, `"http"`, is the JSON
-protocol below. `"clef"` calls Cloudflare Clef on Workers AI, and `"jev"` calls
-TypeSafe Jev. Both use the same System One request and answer shapes, so they
+`backend` in the `decision` block selects the protocol. The default is `jev`.
+`clef` calls Cloudflare Clef on Workers AI, `jev` calls TypeSafe Jev, and `http`
+is the JSON protocol below. Both use the same System One request and answer shapes, so they
 share one implementation.
 
 ### Clef (Cloudflare Workers AI)
 
-```toml
-[decision]
-backend = "clef"
-model = "clef-flash"        # or "clef" (64K context)
-url = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash"
-api_token_env = "CLOUDFLARE_AI_TOKEN"
+```
+decision {
+    backend clef;
+    model clef-flash;           # or clef (64K context)
+    url https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash;
+    api_token_env CLOUDFLARE_AI_TOKEN;
+}
 ```
 
 The token is read from the environment variable named by `api_token_env` when
@@ -140,12 +162,13 @@ before enabling it.
 
 ### Jev (TypeSafe)
 
-```toml
-[decision]
-backend = "jev"
-model = "jev-latest"        # any identifier of 1 to 100 characters from [A-Za-z0-9._-]
-url = "https://api.typesafe.ai/v1/systemone"
-api_token_env = "TYPESAFE_API_KEY"
+```
+decision {
+    backend jev;
+    model jev-latest;           # any identifier of 1 to 100 characters from A-Za-z0-9._-
+    url https://api.typesafe.ai/v1/systemone;
+    api_token_env TYPESAFE_API_KEY;
+}
 ```
 
 The token handling is the same as for Clef. The request is the System One shape
@@ -155,7 +178,7 @@ see [SECURITY.md](SECURITY.md).
 
 ### HTTP protocol
 
-With `backend = "http"`, the router posts JSON to `decision.url`:
+With `backend http;`, the router posts JSON to the decision `url`:
 
 ```json
 {"event": {

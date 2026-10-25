@@ -3,10 +3,13 @@
 use http::StatusCode;
 
 /// Errors found while loading or validating a configuration.
+///
+/// Every error that comes from the file names the file and the line, so the
+/// message reads `file:line: problem`.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The configuration file could not be read.
-    #[error("cannot read config file {}: {source}", path.display())]
+    /// A configuration file could not be read.
+    #[error("cannot read configuration file {}: {source}", path.display())]
     Read {
         /// Path that was read.
         path: std::path::PathBuf,
@@ -14,163 +17,35 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// The text is not valid TOML or does not match the expected shape.
-    #[error("config is not valid TOML for this schema: {0}")]
-    Parse(#[from] toml::de::Error),
-    /// No `[[sites]]` table was given.
-    #[error("config must declare at least one [[sites]] table")]
-    NoSites,
-    /// A site has an empty `hosts` list.
-    #[error("sites[{site}] has no hosts")]
-    EmptyHosts {
-        /// Zero-based index into `sites`.
-        site: usize,
+    /// The text is not valid configuration syntax.
+    #[error("{file}:{line}: {message}")]
+    Syntax {
+        /// File the text came from, as named by the user.
+        file: String,
+        /// One-based line number.
+        line: usize,
+        /// What is wrong.
+        message: String,
     },
-    /// A site lists a host that normalizes to nothing.
-    #[error("sites[{site}] has an invalid host {value:?}")]
-    InvalidHost {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Host exactly as written in the config.
-        value: String,
+    /// An `include` names a missing file, is nested too deeply, or forms a cycle.
+    #[error("{file}:{line}: {message}")]
+    Include {
+        /// File that holds the `include` directive.
+        file: String,
+        /// One-based line number of the directive.
+        line: usize,
+        /// What is wrong.
+        message: String,
     },
-    /// The same normalized host appears twice.
-    #[error("host {host:?} is listed more than once")]
-    DuplicateHost {
-        /// Normalized host name.
-        host: String,
-    },
-    /// A threshold is outside `0..=1` or is NaN.
-    #[error("sites[{site}].{name} must be between 0 and 1, got {value}")]
-    ThresholdOutOfRange {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Name of the threshold key.
-        name: &'static str,
-        /// Value that was rejected.
-        value: f64,
-    },
-    /// `action = "redirect"` without `redirect_to`.
-    #[error("sites[{site}] uses action = \"redirect\" and needs redirect_to")]
-    MissingRedirectTo {
-        /// Zero-based index into `sites`.
-        site: usize,
-    },
-    /// `redirect_to` given together with `action = "block"`.
-    #[error("sites[{site}] sets redirect_to but action is \"block\"")]
-    UnexpectedRedirectTo {
-        /// Zero-based index into `sites`.
-        site: usize,
-    },
-    /// `redirect_to` cannot be sent as a `Location` header value.
-    #[error("sites[{site}].redirect_to is not a valid header value: {value:?}")]
-    InvalidRedirectTo {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Value that was rejected.
-        value: String,
-    },
-    /// An upstream is not an absolute `http://` URI.
-    #[error("sites[{site}].upstream must be an absolute http:// URI, got {value:?}")]
-    InvalidUpstream {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Value that was rejected.
-        value: String,
-    },
-    /// `decision.url` is not an absolute `http://` or `https://` URI.
-    #[error("decision.url must be an absolute http:// or https:// URI, got {value:?}")]
-    InvalidDecisionUrl {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// A key that the selected backend requires is missing.
-    #[error("decision.{field} is required when decision.backend is \"{backend}\"")]
-    MissingBackendField {
-        /// Backend that was selected.
-        backend: &'static str,
-        /// Name of the missing key.
-        field: &'static str,
-    },
-    /// A key is set but the selected backend does not use it.
-    #[error("decision.{field} is not valid with decision.backend = \"{backend}\"")]
-    UnexpectedBackendField {
-        /// Backend that was selected.
-        backend: &'static str,
-        /// Name of the key that was set.
-        field: &'static str,
-    },
-    /// The Clef model is not `clef-flash` or `clef`.
-    #[error("decision.model must be \"clef-flash\" or \"clef\" for Clef, got {value:?}")]
-    InvalidClefModel {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// The model identifier is empty or contains characters outside `[A-Za-z0-9._-]`.
-    #[error("decision.model must be 1 to 100 characters from [A-Za-z0-9._-], got {value:?}")]
-    InvalidModelId {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// The environment variable named by `api_token_env` is not set.
-    #[error("environment variable {name} (decision.api_token_env) is not set")]
-    MissingApiToken {
-        /// Name of the environment variable.
-        name: String,
-    },
-    /// The environment variable named by `api_token_env` is empty.
-    #[error("environment variable {name} (decision.api_token_env) is empty")]
-    EmptyApiToken {
-        /// Name of the environment variable.
-        name: String,
-    },
-    /// `client_ip_header` is not a valid header name.
-    #[error("client_ip_header is not a valid header name: {value:?}")]
-    InvalidClientIpHeader {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// `decision.queue_timeout_ms` is larger than `decision.timeout_ms`.
-    #[error("decision.queue_timeout_ms ({queue}) must not exceed decision.timeout_ms ({timeout})")]
-    QueueTimeoutExceedsTimeout {
-        /// Configured queue timeout.
-        queue: u64,
-        /// Configured decision timeout.
-        timeout: u64,
-    },
-    /// `worker_threads` is zero.
-    #[error("worker_threads must be at least 1 when set")]
-    ZeroWorkerThreads,
-    /// `max_connections` is zero.
-    #[error("max_connections must be at least 1")]
-    ZeroMaxConnections,
-    /// `decision.max_concurrency` is zero.
-    #[error("decision.max_concurrency must be at least 1")]
-    ZeroMaxConcurrency,
-    /// `request_id_header` is not a valid header name.
-    #[error("request_id_header is not a valid header name: {value:?}")]
-    InvalidRequestIdHeader {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// `decision.timeout_ms` is zero.
-    #[error("decision.timeout_ms must be greater than 0")]
-    ZeroTimeout,
-    /// `decision.inspect_body_bytes` is larger than `decision.max_body_bytes`.
-    #[error(
-        "decision.inspect_body_bytes ({inspect}) must not exceed decision.max_body_bytes ({max})"
-    )]
-    InspectExceedsMax {
-        /// Configured inspection size.
-        inspect: usize,
-        /// Configured body size limit.
-        max: usize,
-    },
-    /// `default.status` is not a 4xx or 5xx code.
-    #[error("default.status must be a 4xx or 5xx code, got {status}")]
-    InvalidDefaultStatus {
-        /// Status that was rejected.
-        status: u16,
+    /// A directive has a value or context the configuration does not allow.
+    #[error("{file}:{line}: {message}")]
+    Invalid {
+        /// File that holds the directive.
+        file: String,
+        /// One-based line number of the directive.
+        line: usize,
+        /// What is wrong, naming the directive.
+        message: String,
     },
 }
 

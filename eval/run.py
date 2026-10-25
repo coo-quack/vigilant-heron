@@ -25,7 +25,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 DATASET_DIR = ROOT / "eval" / "dataset"
 RESULTS_DIR = ROOT / "eval" / "results"
-TEMPLATE = ROOT / "eval" / "config.template.toml"
+TEMPLATE = ROOT / "eval" / "config.template.conf"
 ROUTER_BIN = ROOT / "target" / "release" / "vigilant-heron"
 STUB_BIN = ROOT / "target" / "release" / "stub-decider"
 
@@ -158,8 +158,23 @@ def send_row(port, row):
         connection.close()
 
 
+def to_float(value):
+    """A number from a log string, None when the value is missing or not numeric."""
+    try:
+        return float(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def to_int(value):
+    try:
+        return int(value) if value not in (None, "") else None
+    except (TypeError, ValueError):
+        return None
+
+
 class LogIndex:
-    """Reads the router's JSON log in the background and indexes decision events by request id."""
+    """Reads the router's access log in the background and indexes its lines by request id."""
 
     def __init__(self, path):
         self.path = path
@@ -194,12 +209,23 @@ class LogIndex:
             entry = json.loads(line)
         except ValueError:
             return
-        if entry.get("target") != "vigilant_heron::decision":
+        if not isinstance(entry, dict):
             return
-        fields = entry.get("fields", {})
-        request_id = fields.get("request_id")
-        if request_id is not None:
-            self.events.setdefault(request_id, []).append(fields)
+        request_id = entry.get("request_id")
+        if not request_id:
+            return
+        fields = {
+            "method": entry.get("method", ""),
+            "path": entry.get("path", ""),
+            "action": entry.get("action") or None,
+            "reason": entry.get("reason") or None,
+            "attack": to_float(entry.get("attack")),
+            "ai_instruction": to_float(entry.get("ai_instruction")),
+            "category": entry.get("category") or None,
+            "input_tokens": to_int(entry.get("input_tokens")),
+            "latency_ms": to_int(entry.get("latency_ms")),
+        }
+        self.events.setdefault(request_id, []).append(fields)
 
     def wait_for(self, request_id, timeout=30):
         """Returns the decision events logged for `request_id`, after waiting for at least one."""
@@ -495,7 +521,9 @@ def main():
         upstream_port = free_port()
         upstream = start_upstream(upstream_port)
         router_port = free_port()
-        config_path = RESULTS_DIR / f"{stamp}-{args.backend}-config.toml"
+        config_path = RESULTS_DIR / f"{stamp}-{args.backend}-config.conf"
+        access_path = RESULTS_DIR / f"{stamp}-{args.backend}-access.jsonl"
+        access_path.touch()
         config_text = TEMPLATE.read_text(encoding="utf-8")
         for placeholder, value in {
             "@LISTEN@": f"127.0.0.1:{router_port}",
@@ -504,6 +532,7 @@ def main():
             "@MODEL@": backend["model"],
             "@DECISION_URL@": decision_url,
             "@TOKEN_ENV@": backend["token_env"],
+            "@ACCESS_LOG@": str(access_path),
         }.items():
             config_text = config_text.replace(placeholder, value)
         config_path.write_text(config_text, encoding="utf-8")
@@ -521,7 +550,7 @@ def main():
         processes.append(router)
         wait_for_port(router_port, router)
 
-        log = LogIndex(log_path)
+        log = LogIndex(access_path)
         budget = Budget(args.spent_yen, args.max_yen, price)
         markdown = []
         for split in splits_to_run(args.split):

@@ -28,34 +28,41 @@ Shadow mode records what it would have done without blocking.
 
 ```
 src/
-  main.rs        # CLI: --config, tracing setup, signal handling
-  lib.rs         # Public API: Config, ConfigError, serve
-  config.rs      # TOML schema and validation
+  main.rs        # CLI: --config, runtime built from worker_threads, signal handling
+  lib.rs         # Public API: Config, ConfigError, serve, install_error_log
+  conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)
+  config.rs      # Directive tree -> validated Config; every error names file:line
+  realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
+  accesslog.rs   # log_format compiler, variables, escaping, built-in json and main formats
+  logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog, error log
   router.rs      # Host normalization and site lookup
   prefilter.rs   # Path normalization, deny rules, static skip
   sanitize.rs    # Backend event: header drop, body redaction, truncation
-  decision.rs    # DecisionBackend trait, shared HTTPS transport, HTTP backend, backend enum, Probability, Verdict
+  decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
-  policy.rs      # Pure decision table (rules, thresholds, fail-open/closed, shadow)
+  policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
   proxy.rs       # Forwarding to upstreams, hop-by-hop headers
-  server.rs      # Accept loop and per-request pipeline, decision log
+  server.rs      # Accept loop and per-request pipeline, access records
   error.rs       # Error types
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
   jev.rs         # In-process tests of the Jev backend against a fake endpoint
   failures.rs    # Failure settings, rule-first guarantee, queued requests with one slot
-  logging.rs     # Decision log fields (request_id, decision_error, retry_after)
+  logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack
-  config-clef.toml # Second router that uses backend = "clef" against the stub
-  config-jev.toml  # Third router that uses backend = "jev" against the stub
+  vigilant-heron.conf # Router for the http backend, with three sites
+  config-clef.conf    # Second router that uses backend clef against the stub
+  config-jev.conf     # Third router that uses backend jev against the stub
   compose.yaml   # nginx edge, three routers, stub decider, upstream
 eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
+examples/
+  vigilant-heron.conf # Fully commented sample configuration
 ```
 
 ## Key Constraints
@@ -64,7 +71,7 @@ eval/
   non-test code may not unwrap, expect, panic, index or slice by position.
   Never weaken `[workspace.lints]`; silence a lint only with
   `#[expect(lint, reason = "...")]`.
-- Matching (`deny_paths`, `fail_closed_paths`, static skip) uses the
+- Matching (`deny_path`, `fail_closed_path`, static skip) uses the
   normalized path; forwarding uses the raw path unchanged.
 - A model verdict can only add blocks: rule blocks are decided before the
   backend is called, and nothing turns a rule block into an allow.
@@ -72,7 +79,10 @@ eval/
   by `on_rate_limit` and `on_decision_error`. New rule types must follow this
   rule, and shadow mode still forwards everything, rules included.
 - Client data goes to the backend only under `event.untrusted`, after
-  credential headers are dropped and sensitive fields are redacted.
+  credential headers are dropped and sensitive fields are redacted. Access logs
+  never contain a credential header (`$http_cookie`, `$http_authorization`, and
+  the others are rejected at load), and every value is escaped so a log line
+  cannot be split.
 - Comments and documentation are in English.
 - CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`) are
   registered as required checks in coo-quack/iac; do not rename them.
