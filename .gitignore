@@ -39,3 +39,8 @@ e2e/*.local.toml
 # evaluation output (eval/run.py)
 eval/results/
 __pycache__/
+
+# documentation site (docs/)
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
