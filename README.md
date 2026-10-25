@@ -46,12 +46,22 @@ cargo run --release -- --config examples/config.toml
 The config path can also come from `VIGILANT_HERON_CONFIG`; the default is
 `/etc/vigilant-heron/config.toml`.
 
-With Docker:
+With Docker, use the published image (`linux/amd64` and `linux/arm64`). The
+package is private while the repository is private, so log in to `ghcr.io`
+first:
+
+```bash
+docker run --rm -p 8080:8080 \
+  -v "$PWD/config.toml:/etc/vigilant-heron/config.toml:ro" \
+  ghcr.io/coo-quack/vigilant-heron:<version>
+```
+
+Replace `<version>` with a release from the
+[GitHub Releases](https://github.com/coo-quack/vigilant-heron/releases) page,
+or use `latest`. To build the image yourself:
 
 ```bash
 docker build --target runtime -t vigilant-heron .
-docker run --rm -p 8080:8080 \
-  -v "$PWD/config.toml:/etc/vigilant-heron/config.toml:ro" vigilant-heron
 ```
 
 ## Decision backends
