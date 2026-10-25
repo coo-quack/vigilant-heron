@@ -11,9 +11,9 @@ export default defineConfig({
 
     nav: [
       { text: "Home", link: "/" },
-      { text: "Get started", link: "/getting-started" },
-      { text: "Configuration", link: "/configuration" },
-      { text: "Evaluation", link: "/evaluation" },
+      { text: "Getting Started", link: "/getting-started" },
+      { text: "Install", link: "/install" },
+      { text: "Rules", link: "/rules" },
       { text: "Changelog", link: "/changelog" },
     ],
 
@@ -21,15 +21,17 @@ export default defineConfig({
       {
         text: "Guide",
         items: [
-          { text: "Getting started", link: "/getting-started" },
+          { text: "Getting Started", link: "/getting-started" },
+          { text: "Installation", link: "/install" },
+          { text: "Command line", link: "/cli" },
           { text: "How it works", link: "/how-it-works" },
+          { text: "Decision backends", link: "/decision-backends" },
         ],
       },
       {
         text: "Reference",
         items: [
           { text: "Configuration", link: "/configuration" },
-          { text: "Decision backends", link: "/decision-backends" },
           { text: "Rules", link: "/rules" },
           { text: "Built-in rules", link: "/builtin-rules" },
           { text: "From CVE advisories to rules", link: "/cve-rules" },
@@ -39,15 +41,11 @@ export default defineConfig({
         ],
       },
       {
-        text: "Security & evaluation",
+        text: "Support",
         items: [
+          { text: "Troubleshooting", link: "/troubleshooting" },
           { text: "Security", link: "/security" },
           { text: "Evaluation", link: "/evaluation" },
-        ],
-      },
-      {
-        text: "Project",
-        items: [
           { text: "Contributing", link: "/contributing" },
           { text: "Changelog", link: "/changelog" },
         ],

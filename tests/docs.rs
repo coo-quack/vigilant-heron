@@ -7,7 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::PathBuf;
 
-use vigilant_heron::directives::{DECISION_DIRECTIVES, SITE_DIRECTIVES, TOP_LEVEL_DIRECTIVES};
+use vigilant_heron::directives::{
+    DECISION_DIRECTIVES, SITE_DIRECTIVES, STARTUP_ONLY_DIRECTIVES, TOP_LEVEL_DIRECTIVES,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -93,6 +95,41 @@ fn builtin_rule_table_lists_exactly_the_built_in_rules() -> TestResult {
     assert!(
         unknown.is_empty(),
         "docs/builtin-rules.md lists ids that src/rules/builtin.conf does not define: {unknown:?}"
+    );
+    Ok(())
+}
+
+/// The backticked names in a paragraph of `docs/cli.md` that starts at `start` and ends
+/// before `end`.
+fn names_between(doc: &str, start: &str, end: &str) -> Result<BTreeSet<String>, Box<dyn Error>> {
+    let from = doc
+        .find(start)
+        .ok_or_else(|| format!("docs/cli.md has no paragraph starting with {start:?}"))?;
+    let rest = doc.get(from..).ok_or("bad offset")?;
+    let to = rest
+        .find(end)
+        .ok_or_else(|| format!("docs/cli.md has no paragraph ending with {end:?}"))?;
+    let paragraph = rest.get(..to).ok_or("bad offset")?;
+    Ok(paragraph
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|name| !name.contains(' ') && !name.contains('/'))
+        .map(str::to_owned)
+        .collect())
+}
+
+#[test]
+fn the_startup_only_list_in_the_command_line_docs_matches_the_code() -> TestResult {
+    let doc = read("docs/cli.md")?;
+    let documented = names_between(&doc, "Those are", "A reload that changes one of them")?;
+    let code: BTreeSet<String> = STARTUP_ONLY_DIRECTIVES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    assert_eq!(
+        documented, code,
+        "docs/cli.md and STARTUP_ONLY_DIRECTIVES differ"
     );
     Ok(())
 }

@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+- `start`, `stop` and `restart` run the router in the background on a host. `start`
+  checks the file first, refuses when a router already runs, and prints
+  `started (pid N)`. `stop` sends the graceful shutdown and waits until the process
+  has exited, and prints `not running` when none runs. `restart` checks the file
+  first, so an invalid file leaves the running router alone. Under Docker or
+  systemd, run the router in the foreground, as before.
+- The shutdown signals (SIGINT, SIGTERM, SIGQUIT) are registered before the pid
+  file is written. A stop sent right after the pid file appears now runs the
+  cleanup that removes it, where it used to end the process without that cleanup.
+- `docs/install.md` builds from source and from the Dockerfile. It no longer
+  mentions a published image, and it has a systemd unit example.
+- `SECURITY.md` lists the reporting channels: email and a GitHub security advisory.
+
+- Command line, as nginx's: `-h`/`--help` and `-v`/`--version`, `-c <path>` as a
+  short form of `--config`, `-T` (test, then print the configuration with every
+  include expanded under its `# configuration file <path>:` header), and
+  `-s reload|reopen|stop|quit`. `-s` sends SIGHUP, SIGUSR1, SIGTERM or SIGQUIT to
+  the pid in the file the `pid` directive names. An unknown option prints the
+  usage and exits 1. `stop` and `quit` are both graceful in this version.
+- `pid <path>;` directive (default `/run/vigilant-heron.pid`). The router writes its
+  process id there once it is listening and removes it on exit. A write failure is
+  logged and the router keeps running. SIGQUIT now shuts down gracefully, like
+  SIGTERM and SIGINT.
+- `docs/cli.md` describes the command line, and `pid` is documented in
+  `docs/configuration.md`. The migration notes from the README moved to
+  `docs/configuration.md`.
+- README rewritten as a short introduction with install, a quick start, the
+  command line, the order of checks, and links to the documentation. The
+  reference stays in `docs/`.
+- Removed `rustfmt.toml`, which only repeated `edition = "2024"` from `Cargo.toml`.
+  `cargo fmt` output is unchanged.
+
 - `enable_rule <id> ...;` at the top level and in a `site` turns on built-in rules
   that are off by default. A built-in rule written with `default off;` runs only
   where it is enabled. The nearest level that names a rule decides, a site's lists

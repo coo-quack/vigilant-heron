@@ -8,6 +8,7 @@
 mod lexer;
 mod parser;
 
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -40,6 +41,88 @@ pub(crate) fn parse_source(source: &str, origin: &str) -> Result<Vec<Directive>,
     let mut stack = Vec::new();
     let directives = parse_text(source, origin)?;
     expand_includes(directives, &base, 0, &mut stack)
+}
+
+/// Returns the text of `path` with each top-level include replaced by the text of
+/// the files it names, as `nginx -T` prints it. Included lines are kept as comments.
+///
+/// # Errors
+///
+/// Returns the same errors as [`load_file`], and [`ConfigError::Include`] for an
+/// include that is not alone on one line, since its line is replaced as a whole.
+pub(crate) fn dump_file(path: &Path) -> Result<String, ConfigError> {
+    let mut stack = Vec::new();
+    let mut out = String::new();
+    dump_recursive(path, 0, &mut stack, &mut out)?;
+    Ok(out)
+}
+
+fn dump_recursive(
+    path: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+    out: &mut String,
+) -> Result<(), ConfigError> {
+    let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let directives = parse_text(&source, &path.display().to_string())?;
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if stack.contains(&canonical) {
+        return Err(ConfigError::Include {
+            file: path.display().to_string(),
+            line: 1,
+            message: "include cycle".to_owned(),
+        });
+    }
+    stack.push(canonical);
+    let base = path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let includes: Vec<&Directive> = directives
+        .iter()
+        .filter(|directive| directive.name == "include")
+        .collect();
+    let _ = writeln!(out, "# configuration file {}:", path.display());
+    for (index, text) in source.lines().enumerate() {
+        let line = index + 1;
+        let Some(include) = includes.iter().find(|directive| directive.line == line) else {
+            let _ = writeln!(out, "{text}");
+            continue;
+        };
+        let include_error = |message: String| ConfigError::Include {
+            file: include.file.to_string(),
+            line,
+            message,
+        };
+        if !text.trim_end().ends_with(';') || text.trim_start().starts_with('#') {
+            return Err(include_error(
+                "for -T, an include must be written alone on one line".to_owned(),
+            ));
+        }
+        let [pattern] = include.args.as_slice() else {
+            return Err(include_error(
+                "include takes exactly one path or glob".to_owned(),
+            ));
+        };
+        if depth + 1 > MAX_INCLUDE_DEPTH {
+            return Err(include_error(format!(
+                "includes are nested deeper than {MAX_INCLUDE_DEPTH} levels"
+            )));
+        }
+        let target = if Path::new(pattern).is_absolute() {
+            PathBuf::from(pattern)
+        } else {
+            base.join(pattern)
+        };
+        let _ = writeln!(out, "# {}", text.trim());
+        for included in resolve_include(&target, pattern).map_err(include_error)? {
+            dump_recursive(&included, depth + 1, stack, out)?;
+        }
+    }
+    stack.pop();
+    Ok(())
 }
 
 fn load_recursive(

@@ -1,197 +1,113 @@
-# Getting started
+# Getting Started
 
-vigilant-heron runs in front of your sites, behind nginx or Cloudflare. It needs
-a configuration file, a decision backend, and a token for that backend when the
-backend requires one.
+This page takes you from nothing to a blocked request in about ten minutes. You will write one small configuration file, check it, run the router, and send it a test attack.
 
 ::: warning Status
-The project is in early development. Run every new site in `shadow` mode first,
-and read the access log before you switch it to `enforce`.
+vigilant-heron is in early development. Run every new site in shadow mode first, and read the log before you enforce anything.
 :::
 
-## Install
+## 1. Install
 
-### Docker image
+Build the router from source, or build its Docker image, as the [Installation](/install) page shows. The steps below assume the `vigilant-heron` command is on your `PATH`. With Docker, run the same commands inside the container, as the [Installation](/install#docker-image) page shows.
 
-The image is published for `linux/amd64` and `linux/arm64`. While the repository
-is private, the image is also private, so log in to `ghcr.io` first.
+## 2. Start a test upstream
 
-```bash
-docker run --rm -p 8080:8080 \
-  -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
-  ghcr.io/coo-quack/vigilant-heron:latest
-```
-
-Replace `latest` with a release from the
-[GitHub Releases](https://github.com/coo-quack/vigilant-heron/releases) page to
-pin a version. To build the image yourself:
+The router forwards allowed requests to an upstream, which is your application. To try the router without an application, serve a folder with Python's built-in web server. Run this in its own terminal:
 
 ```bash
-docker build --target runtime -t vigilant-heron .
+mkdir -p site && echo "hello from the upstream" > site/index.html
+python3 -m http.server 3000 --bind 127.0.0.1 --directory site
 ```
 
-### Build from source
+## 3. Write a minimal configuration
 
-The toolchain is pinned in `rust-toolchain.toml`. With `rustup` installed, a
-release build is:
-
-```bash
-cargo build --release --locked
-./target/release/vigilant-heron --help
-```
-
-The binary is `target/release/vigilant-heron`.
-
-## A minimal configuration
-
-The smallest configuration that runs has a `listen` address, a `decision` block
-and one `site`. This one forwards to an upstream and uses the Jev defaults, so
-`TYPESAFE_API_KEY` has to be set.
+Save this as `vigilant-heron.conf`. It listens on port 8080 and forwards requests for `example.com` to an app on port 3000.
 
 ```nginx
-listen 0.0.0.0:8080;
+listen 127.0.0.1:8080;              # the address the router listens on
+pid /tmp/vigilant-heron.pid;        # where the router writes its process id
 
 decision {
-    backend jev;
-    timeout 300ms;
+    backend jev;                    # the decision model; it reads its key from TYPESAFE_API_KEY
 }
 
 site example.com {
-    upstream http://app:8080;
-    mode shadow;
+    upstream http://127.0.0.1:3000; # where allowed requests go
+    mode shadow;                    # record decisions, block nothing
 }
 ```
 
-`backend jev` is the default, so it can be left out. The `url`, `model` and
-`api_token_env` defaults are listed in [Configuration](/configuration#decision-block).
+- `upstream` is your application. Here it is the test server from step 2.
+- `mode shadow` means the router forwards every request and only records what it would have blocked.
 
-Run the router with the configuration file:
+## 4. Check the file
+
+`-t` reads the file, validates it, and exits. It does not start the server.
+
+```console
+$ TYPESAFE_API_KEY=... vigilant-heron -t -c vigilant-heron.conf
+configuration file vigilant-heron.conf test is successful
+```
+
+A mistake prints the file and line, for example `vigilant-heron.conf:6: unknown directive "upstrem"`, and exits 1. Fix the line and run the check again.
+
+## 5. Run the router
 
 ```bash
-TYPESAFE_API_KEY=... vigilant-heron --config vigilant-heron.conf
+TYPESAFE_API_KEY=... vigilant-heron -c vigilant-heron.conf
 ```
 
-The config path can also come from `VIGILANT_HERON_CONFIG`. Without either, the
-binary reads `/etc/vigilant-heron/vigilant-heron.conf`.
+The router keeps running in the foreground. Leave it in its own terminal. It prints one JSON line for each request.
 
-## Check the configuration with -t
+## 6. Send a normal request and a test attack
 
-`-t` checks the configuration the way `nginx -t` does. It reads the includes,
-rules, block pages and token variables, validates everything, and exits without
-binding the listen address.
+In a second terminal, send an ordinary request. It goes through the router to the test upstream:
 
-```console
-$ TYPESAFE_API_KEY=... vigilant-heron -t --config vigilant-heron.conf
-configuration file vigilant-heron.conf test is successful
-$ echo $?
-0
+```bash
+curl -i http://127.0.0.1:8080/ -H "Host: example.com"
 ```
 
-On failure the error names the file and line, the last line says the test
-failed, and the exit code is 1. A misspelled directive inside `decision` gives:
+The answer is `200 OK` with `hello from the upstream`.
 
-```console
-$ TYPESAFE_API_KEY=... vigilant-heron -t --config broken.conf
-vigilant-heron: broken.conf:5: unknown directive "timout" in decision
-configuration file broken.conf test failed
-$ echo $?
-1
+Now send a request whose query string contains a SQL injection:
+
+```bash
+curl -i "http://127.0.0.1:8080/?id=1%20UNION%20SELECT%20password%20FROM%20users" \
+  -H "Host: example.com"
 ```
 
-A missing token variable fails the same way, so `-t` also needs the token in
-the environment that the router will run in.
+Shadow mode forwards this request too, so the answer is still `200 OK`. The router records what it would have done. Look at the router's terminal. The log line for the attack contains these fields, among others:
 
-Run `-t` in CI or before every reload.
-
-## Run behind nginx
-
-Usually nginx terminates TLS and forwards to the router. Three things must be
-right for the screening to see the real client and the upgrade requests:
-
-- nginx must send the client address in a header, and the router must trust
-  only nginx as the peer (`real_ip_from`).
-- WebSocket upgrades need the `Upgrade` and `Connection` headers, and HTTP/1.1
-  to the router.
-- nginx should pass the `Host` header unchanged, because sites match on it.
-
-```nginx
-upstream vigilant_heron {
-    server 127.0.0.1:8080;
-    keepalive 16;
-}
-
-server {
-    listen 443 ssl;
-    server_name example.com;
-
-    location / {
-        proxy_pass http://vigilant_heron;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection $connection_upgrade;
-    }
-}
-
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
-}
+```json
+{"status":"200","action":"allow","reason":"rule","rule_id":"vh-sqli-001","would_have":"block",...}
 ```
 
-The router side of that setup:
+- `rule_id` is the built-in rule that matched. `vh-sqli-001` matches `UNION SELECT` in a query string.
+- `would_have` is `block`. In enforce mode, the router would have answered with 403.
+- `action` is `allow`, because shadow mode forwarded the request.
 
-```nginx
-real_ip_from 127.0.0.1;
-real_ip_header X-Real-IP;
-real_ip_recursive off;
+## 7. Switch to enforce mode
+
+When the shadow log shows the blocks you expect, change `mode shadow;` to `mode enforce;` in the file. Then reload the configuration with the `-s` command. This sends the router a signal, so it reads the file again without a restart:
+
+```bash
+vigilant-heron -s reload -c vigilant-heron.conf
 ```
 
-`real_ip_from` names the peers whose `X-Real-IP` header is believed. Without a
-trusted peer, the client is the TCP peer, which behind nginx is always nginx
-itself. The access list, the limits and the logs all use the address that the
-realip settings choose.
+Send the test attack again:
 
-Behind Cloudflare, use the `CF-Connecting-IP` header and list the Cloudflare
-ranges in `real_ip_from`:
-
-```nginx
-real_ip_from 173.245.48.0/20;   # one line per Cloudflare range you trust
-real_ip_header CF-Connecting-IP;
+```bash
+curl -i "http://127.0.0.1:8080/?id=1%20UNION%20SELECT%20password%20FROM%20users" \
+  -H "Host: example.com"
 ```
 
-Keep the list current. A range that is missing from `real_ip_from` means the
-client address is Cloudflare's, and the access list and the limits see that
-address instead.
-
-## Shadow mode first
-
-Set `mode shadow;` on a site before you enforce anything on it. In shadow mode
-every request is forwarded, rules and limits included, and the access log and
-the optional debug header record what would have happened in `would_have`.
-
-```nginx
-site example.com {
-    upstream http://app:8080;
-    mode shadow;
-    debug_headers on;
-}
-```
-
-Read the log for a day or more. Check three things:
-
-1. Requests that would be blocked are the ones you expected to block.
-2. No ordinary user, script or health check appears in `would_have=block`.
-3. `decision_error` and `reason` show whether the backend is reachable and fast
-   enough for the `timeout` you chose.
-
-When the numbers look right, change `mode shadow;` to `mode enforce;` and
-reload with `SIGHUP` (see [Configuration](/configuration#reload-and-log-reopen)).
+The response is now `403 Forbidden`, and the upstream never sees the request. The normal request from step 6 still returns `200 OK`.
 
 ## Next steps
 
-- [How it works](/how-it-works) explains the order in which a request is judged.
+- [Installation](/install) covers Docker Compose, nginx and Cloudflare in front, and updates.
+- [Command line](/cli) lists every option, including `-T` and the signal words for `-s`.
+- [How it works](/how-it-works) explains the order in which the router judges a request.
 - [Configuration](/configuration) lists every directive with its default.
 - [Decision backends](/decision-backends) covers the choice of model and the thresholds.
+- [Troubleshooting](/troubleshooting) helps when a request is blocked, or when the router does not start.

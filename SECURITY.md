@@ -1,9 +1,11 @@
 # Security
 
-## Reporting
+## Reporting Security Issues
 
-Report vulnerabilities privately to the maintainers of the coo-quack
-organization. Do not open a public issue.
+- **Email:** dev@quack.jp
+- **GitHub:** [Open a security advisory](https://github.com/coo-quack/vigilant-heron/security/advisories/new)
+
+Please do **not** open public GitHub issues for security vulnerabilities.
 
 ## Security advisories
 

@@ -14,12 +14,15 @@ services:
         target: /etc/nginx/conf.d/default.conf
 
   vigilant-heron:
+    # Named so that scripts/e2e-image.sh can run the same image with docker run.
+    image: vigilant-heron:e2e
     build:
       context: ..
       target: runtime
+    # A directory, so that a reload sees edits the script makes to a writable copy.
+    # scripts/e2e.sh points VH_E2E_ROUTER_DIR at that copy; the default is this directory.
     volumes:
-      - ./vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro
-      - ./rules.d:/etc/vigilant-heron/rules.d:ro
+      - ${VH_E2E_ROUTER_DIR:-.}:/etc/vigilant-heron:ro
     depends_on:
       - stub-decider
       - upstream

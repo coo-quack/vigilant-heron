@@ -46,6 +46,28 @@ These directives are written outside any block.
 
 Socket address that the router binds, such as `0.0.0.0:8080`.
 
+### `pid`
+
+- **Syntax:** `pid <path>;`
+- **Default:** `/run/vigilant-heron.pid`.
+- **Context:** top level.
+
+File where the router writes its process id once it is listening, and removes
+when it exits. `vigilant-heron -s reload|reopen|stop|quit` reads the id from this
+file. The write replaces any file already there, through a temporary file in the
+same directory. If the file cannot be written, the router logs a warning and keeps
+running, and `-s` then reports the missing file. Read at startup only: a reload
+does not move the file. The `-s` command reads the same path from the file it is
+given, so change it in the file before restarting.
+
+The default directory must be writable by the user that runs the router. The
+Docker image runs as `nonroot`, which cannot write to `/run`, so set a path in
+`/tmp` in the configuration mounted into the image:
+
+```nginx
+pid /tmp/vigilant-heron.pid;
+```
+
 ### `worker_threads`
 
 - **Syntax:** `worker_threads <number>;`
@@ -60,7 +82,7 @@ Runtime worker threads that run the proxy. At least 1 when set. Read at startup 
 - **Default:** none (wait until every connection has closed).
 - **Context:** top level.
 
-On `SIGINT` or `SIGTERM` the router stops accepting connections and waits for
+On `SIGINT`, `SIGTERM` (`-s stop`) or `SIGQUIT` (`-s quit`) the router stops accepting connections and waits for
 requests in flight, open WebSocket tunnels and lingering closes to finish. When
 this time is set and expires, every remaining connection and tunnel is closed and
 the process exits, as nginx's directive of the same name does. Without it a
@@ -717,15 +739,39 @@ error at its line.
   when a zone with the same name and size exists in the new file.
 - **`SIGUSR1`** reopens the file destinations of the access logs and the error log,
   so logrotate can move them away without a reload.
+- **`SIGTERM`** and **`SIGQUIT`** stop the router gracefully, as `-s stop` and
+  `-s quit` send them. Both wait for requests in flight, as described for
+  `worker_shutdown_timeout`. This version has no fast shutdown.
+
+The `-s` command sends these signals to the process named in the `pid` file. See
+[Command line](/cli).
 
 These settings take effect at startup only. A reload that changes one of them
 logs a warning, and the change applies at the next restart: `listen`,
-`worker_threads`, `worker_shutdown_timeout`, `max_connections`, and the connection
-timers and header limits.
+`pid`, `worker_threads`, `worker_shutdown_timeout`, `max_connections`, and the
+connection timers and header limits.
 
 ## Checking the configuration
 
 `vigilant-heron -t [--config <path>]` reads the file, its includes, rules, block
 pages and token variables, validates everything and exits. It never binds the
-listen address. The output and exit codes are shown in
-[Getting started](/getting-started#check-the-configuration-with-t).
+listen address. `-T` does the same check and then prints the configuration with
+every include expanded. The output and exit codes are shown in
+[Getting started](/getting-started#check-the-configuration-with-t) and in
+[Command line](/cli).
+
+## Migrating from earlier versions
+
+### From `max_body`
+
+The body limit is the top-level `client_max_body_size`, which defaults to 1m. It
+was 10m as `decision.max_body`, so uploads between 1 and 10 MB need
+`client_max_body_size 10m;`. A `max_body` line is an error that names its
+replacement.
+
+### From the TOML configuration
+
+There is no automatic converter. Each `[[sites]]` table becomes a `site` block,
+`timeout_ms = 150` becomes `timeout 150ms;`, and `deny_paths = [...]` becomes
+`deny_path ...;`. The other keys keep their names unless the tables above say
+otherwise.

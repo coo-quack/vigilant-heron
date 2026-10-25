@@ -1164,6 +1164,7 @@ dependencies = [
  "proptest",
  "regex",
  "rstest",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "serde",

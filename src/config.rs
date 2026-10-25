@@ -6,7 +6,7 @@
 //! line of the directive that caused it.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +68,8 @@ const DEFAULT_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_PROXY_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// Default `proxy_send_timeout`.
 const DEFAULT_PROXY_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `pid` path, where the router writes its process id.
+const DEFAULT_PID_FILE: &str = "/run/vigilant-heron.pid";
 /// The Jev endpoint used when `url` is omitted.
 const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 /// The Jev model used when `model` is omitted.
@@ -81,10 +83,30 @@ const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
     "css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "woff", "woff2", "ttf", "map",
 ];
 
+/// Top-level directives that are read at startup only. A reload that changes one of
+/// them logs a warning, and the change takes effect at the next start. `tests/docs.rs`
+/// checks the list in `docs/cli.md` against this one.
+pub const STARTUP_ONLY_DIRECTIVES: &[&str] = &[
+    "listen",
+    "pid",
+    "worker_threads",
+    "worker_shutdown_timeout",
+    "max_connections",
+    "client_header_timeout",
+    "keepalive_timeout",
+    "keepalive_requests",
+    "send_timeout",
+    "large_client_header_buffers",
+    "lingering_close",
+    "lingering_time",
+    "lingering_timeout",
+];
+
 /// Every directive name the top level accepts. The parser rejects any other name,
 /// and `docs/configuration.md` must document each one (checked by `tests/docs.rs`).
 pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
     "listen",
+    "pid",
     "worker_threads",
     "worker_shutdown_timeout",
     "max_connections",
@@ -207,6 +229,8 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
 pub struct Config {
     /// Socket address the binary binds, such as `0.0.0.0:8080`.
     pub listen: String,
+    /// File where the router writes its process id while it runs, read by `-s`.
+    pub pid_file: PathBuf,
     /// Runtime worker threads. `None` means one per CPU core (tokio's default).
     pub worker_threads: Option<usize>,
     /// Most connections served at the same time.
@@ -505,6 +529,58 @@ impl Config {
         let directives = conf::parse_source(input, origin)?;
         build(&directives, &lookup)
     }
+}
+
+/// The settings a process command needs, read without validating the whole file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSettings {
+    /// Where the router writes its process id. The `pid` directive, or the default.
+    pub pid_file: PathBuf,
+    /// The `worker_shutdown_timeout` directive, when one is set.
+    pub worker_shutdown_timeout: Option<Duration>,
+}
+
+/// Reads the `pid` and `worker_shutdown_timeout` settings of the configuration at `path`.
+///
+/// Only the file and its includes are read: the rest of the configuration is not
+/// validated, so `-s`, `stop` and `restart` work even when the token variables are
+/// not set in their shell.
+///
+/// # Errors
+///
+/// Returns the read, syntax and include errors of the file, and an error for a
+/// `worker_shutdown_timeout` value that is not a positive time.
+pub fn process_settings(path: &Path) -> Result<ProcessSettings, ConfigError> {
+    let directives = conf::load_file(path)?;
+    let mut settings = ProcessSettings {
+        pid_file: PathBuf::from(DEFAULT_PID_FILE),
+        worker_shutdown_timeout: None,
+    };
+    for directive in &directives {
+        match directive.name.as_str() {
+            "pid" => settings.pid_file = PathBuf::from(one_arg(directive)?),
+            "worker_shutdown_timeout" => {
+                settings.worker_shutdown_timeout =
+                    Some(parse_positive_time(directive, one_arg(directive)?)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(settings)
+}
+
+/// Returns the configuration at `path` as text, with each top-level include
+/// expanded in place. Each file starts with a `# configuration file <path>:` line.
+///
+/// The text is the file as written, so comments stay. Directives hold the names
+/// of token variables, never their values, so nothing secret is printed.
+///
+/// # Errors
+///
+/// Returns the same errors as [`Config::load`] for reading and parsing, and an
+/// include error when an include is not written on one line.
+pub fn dump_configuration(path: &Path) -> Result<String, ConfigError> {
+    conf::dump_file(path)
 }
 
 /// Where a directive came from, for error messages.
@@ -831,6 +907,7 @@ where
     let mut top_headers: Option<Vec<HeaderOp>> = None;
     let mut top_rules: Vec<ParsedRule> = Vec::new();
     let mut listen = None;
+    let mut pid_file = PathBuf::from(DEFAULT_PID_FILE);
     let mut worker_threads = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
     let mut worker_shutdown_timeout = None;
@@ -896,6 +973,10 @@ where
             "listen" => {
                 once(&mut seen, directive)?;
                 listen = Some(one_arg(directive)?.to_owned());
+            }
+            "pid" => {
+                once(&mut seen, directive)?;
+                pid_file = PathBuf::from(one_arg(directive)?);
             }
             "worker_threads" => {
                 once(&mut seen, directive)?;
@@ -1141,6 +1222,7 @@ where
 
     Ok(Config {
         listen,
+        pid_file,
         worker_threads,
         max_connections,
         worker_shutdown_timeout,
