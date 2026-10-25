@@ -31,6 +31,8 @@ use tokio::task::JoinHandle;
 use vigilant_heron::{Config, serve};
 
 /// Error type returned by test helpers.
+pub(crate) mod system_one;
+
 pub(crate) type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Result type returned by integration tests.

@@ -84,17 +84,33 @@ pub enum ConfigError {
         /// Value that was rejected.
         value: String,
     },
-    /// A Clef-only key is missing while `decision.backend = "clef"`.
-    #[error("decision.{field} is required when decision.backend is \"clef\"")]
-    MissingClefField {
+    /// A key that the selected backend requires is missing.
+    #[error("decision.{field} is required when decision.backend is \"{backend}\"")]
+    MissingBackendField {
+        /// Backend that was selected.
+        backend: &'static str,
         /// Name of the missing key.
         field: &'static str,
     },
-    /// A Clef-only key is set while the HTTP backend is selected.
-    #[error("decision.{field} is only valid when decision.backend is \"clef\"")]
-    UnexpectedClefField {
+    /// A key is set but the selected backend does not use it.
+    #[error("decision.{field} is not valid with decision.backend = \"{backend}\"")]
+    UnexpectedBackendField {
+        /// Backend that was selected.
+        backend: &'static str,
         /// Name of the key that was set.
         field: &'static str,
+    },
+    /// The Clef model is not `clef-flash` or `clef`.
+    #[error("decision.model must be \"clef-flash\" or \"clef\" for Clef, got {value:?}")]
+    InvalidClefModel {
+        /// Value that was rejected.
+        value: String,
+    },
+    /// The model identifier is empty or contains characters outside `[A-Za-z0-9._-]`.
+    #[error("decision.model must be 1 to 100 characters from [A-Za-z0-9._-], got {value:?}")]
+    InvalidModelId {
+        /// Value that was rejected.
+        value: String,
     },
     /// The environment variable named by `api_token_env` is not set.
     #[error("environment variable {name} (decision.api_token_env) is not set")]

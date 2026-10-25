@@ -2,8 +2,9 @@
 //!
 //! It serves two protocols. `POST /decide` speaks the router's JSON protocol.
 //! `POST /client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash` speaks the
-//! Clef protocol, answers in the Workers AI envelope, and requires the bearer
-//! token `test-token`. Both use the same fixed substring rules, so the e2e tests
+//! Clef protocol and answers in the Workers AI envelope. `POST /v1/systemone`
+//! speaks the Jev protocol and answers with a bare result. Both require the
+//! bearer token `test-token`. Both use the same fixed substring rules, so the e2e tests
 //! see the same scores on every run. Requests whose path contains `/slow` are
 //! held for one second before the answer.
 
@@ -25,7 +26,8 @@ use tokio::net::TcpListener;
 const LISTEN: &str = "0.0.0.0:9000";
 const DECIDE_PATH: &str = "/decide";
 const CLEF_PATH: &str = "/client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash";
-const CLEF_TOKEN: &str = "Bearer test-token";
+const JEV_PATH: &str = "/v1/systemone";
+const BEARER_TOKEN: &str = "Bearer test-token";
 const ATTACK_MARKERS: [&str; 4] = ["' or 1=1", "<script", "../", "union select"];
 const INSTRUCTION_MARKERS: [&str; 2] = ["ignore previous", "answer benign"];
 const HIGH: f64 = 0.99;
@@ -55,13 +57,13 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
             &json!({"error": "method"}),
         ));
     }
-    let clef_authorized = request
+    let authorized = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        == Some(CLEF_TOKEN);
+        == Some(BEARER_TOKEN);
     let path = request.uri().path().to_owned();
-    if path != DECIDE_PATH && path != CLEF_PATH {
+    if path != DECIDE_PATH && path != CLEF_PATH && path != JEV_PATH {
         return Ok(reply(StatusCode::NOT_FOUND, &json!({"error": "not found"})));
     }
     let Ok(collected) = request.into_body().collect().await else {
@@ -79,13 +81,16 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
     if path == DECIDE_PATH {
         return Ok(decide(&payload).await);
     }
-    if !clef_authorized {
+    if (path == CLEF_PATH || path == JEV_PATH) && !authorized {
         return Ok(reply(
             StatusCode::UNAUTHORIZED,
             &json!({"result": null, "success": false,
                     "errors": [{"code": 10000, "message": "Authentication error"}],
                     "messages": []}),
         ));
+    }
+    if path == JEV_PATH {
+        return Ok(jev(&payload).await);
     }
     Ok(clef(&payload).await)
 }
@@ -112,7 +117,37 @@ async fn clef(payload: &Value) -> Response<Full<Bytes>> {
         return reply(StatusCode::BAD_REQUEST, &json!({"error": "missing state"}));
     };
     let verdict = score(untrusted).await;
-    let answers = json!({
+    reply(
+        StatusCode::OK,
+        &json!({
+            // Estimated as one token per four bytes of request, which is enough for offline budget tests.
+            "result": {"model": "clef-flash", "answers": answers(&verdict),
+                       "usage": {"input_tokens": payload.to_string().len() / 4, "output_tokens": 0}},
+            "success": true,
+            "errors": [],
+            "messages": [],
+        }),
+    )
+}
+
+/// The Jev protocol: the same scoring, answered as a bare result without the envelope.
+async fn jev(payload: &Value) -> Response<Full<Bytes>> {
+    let Some(untrusted) = payload.pointer("/state/untrusted_http_request") else {
+        return reply(StatusCode::BAD_REQUEST, &json!({"error": "missing state"}));
+    };
+    let verdict = score(untrusted).await;
+    reply(
+        StatusCode::OK,
+        &json!({
+            "model": "jev-latest",
+            "answers": answers(&verdict),
+            "usage": {"input_tokens": payload.to_string().len() / 4, "output_tokens": 0},
+        }),
+    )
+}
+
+fn answers(verdict: &Verdict) -> Value {
+    json!({
         "attack": {"type": "noul", "noul": verdict.attack},
         "ai_instruction": {"type": "noul", "noul": verdict.ai_instruction},
         "category": {
@@ -121,18 +156,7 @@ async fn clef(payload: &Value) -> Response<Full<Bytes>> {
             "probabilities": {verdict.category: 0.9},
             "confidence": 0.9,
         },
-    });
-    reply(
-        StatusCode::OK,
-        &json!({
-            // Estimated as one token per four bytes of request, which is enough for offline budget tests.
-            "result": {"model": "clef-flash", "answers": answers,
-                       "usage": {"input_tokens": payload.to_string().len() / 4, "output_tokens": 0}},
-            "success": true,
-            "errors": [],
-            "messages": [],
-        }),
-    )
+    })
 }
 
 struct Verdict {

@@ -21,7 +21,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
-use crate::clef::ClefBackend;
 use crate::config::{BackendConfig, Config, DecisionConfig, SiteConfig};
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, decision_client};
 use crate::error::ServeError;
@@ -30,6 +29,7 @@ use crate::prefilter::{self, Screening};
 use crate::proxy::Proxy;
 use crate::router::{Router, normalize_host};
 use crate::sanitize::{self, EventInput};
+use crate::system_one::SystemOneBackend;
 
 /// Upper bound on connections served at the same time.
 const MAX_CONNECTIONS: usize = 1024;
@@ -56,10 +56,17 @@ impl AppState<Backend> {
         let timeout = config.decision.timeout;
         let backend = match &config.decision.backend {
             BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, timeout)),
-            BackendConfig::Clef { model, token } => Backend::Clef(ClefBackend::new(
+            BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
                 client,
                 url,
-                *model,
+                model.as_str().to_owned(),
+                token.clone(),
+                timeout,
+            )),
+            BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
+                client,
+                url,
+                model.clone(),
                 token.clone(),
                 timeout,
             )),

@@ -1,4 +1,5 @@
-//! Cloudflare Clef, the decision backend that runs on Workers AI.
+//! The System One decision backends: Cloudflare Clef on Workers AI and `TypeSafe`
+//! Jev. Both speak the same request and response shape.
 //!
 //! The router asks three questions about each sanitized event: whether it is an
 //! attack, whether it addresses an AI, and which kind of attack it is. The
@@ -86,19 +87,26 @@ pub(crate) fn is_known_category(value: &str) -> bool {
 }
 
 /// The Clef model that answers the questions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClefModel {
     /// `clef-flash`, with a 24,576-token context.
-    #[serde(rename = "clef-flash")]
     Flash,
     /// `clef`, with a 64K context.
-    #[serde(rename = "clef")]
     Full,
 }
 
 impl ClefModel {
+    /// Parses a Clef model name; only `clef-flash` and `clef` are accepted.
+    pub(crate) fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "clef-flash" => Some(Self::Flash),
+            "clef" => Some(Self::Full),
+            _ => None,
+        }
+    }
+
     /// Returns the model name used in the request body.
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Flash => "clef-flash",
             Self::Full => "clef",
@@ -137,19 +145,19 @@ impl fmt::Display for ApiToken {
     }
 }
 
-/// Builds the Clef request body for one event.
+/// Builds the System One request body for one event.
 ///
 /// `state` holds the sanitized request and its context. `questions` is fixed.
 pub(crate) fn build_request(
     event: &DecisionEvent,
-    model: ClefModel,
+    model: &str,
 ) -> Result<Value, serde_json::Error> {
     let state = json!({
         "untrusted_http_request": serde_json::to_value(&event.event.untrusted)?,
         "context": serde_json::to_value(&event.event.meta)?,
     });
     Ok(json!({
-        "model": model.as_str(),
+        "model": model,
         "state": state,
         "questions": questions(),
     }))
@@ -258,21 +266,21 @@ fn category_answer(answers: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Calls a Clef endpoint on Workers AI, or on a server that speaks the same protocol.
-pub(crate) struct ClefBackend {
+/// Calls a System One endpoint: Clef on Workers AI, Jev, or a server that speaks the same protocol.
+pub(crate) struct SystemOneBackend {
     client: DecisionClient,
     url: Uri,
-    model: ClefModel,
+    model: String,
     token: ApiToken,
     timeout: Duration,
 }
 
-impl ClefBackend {
-    /// Creates a backend that posts to `url` with `token` and gives up after `timeout`.
+impl SystemOneBackend {
+    /// Creates a backend that posts `model` to `url` with `token` and gives up after `timeout`.
     pub(crate) fn new(
         client: DecisionClient,
         url: Uri,
-        model: ClefModel,
+        model: String,
         token: ApiToken,
         timeout: Duration,
     ) -> Self {
@@ -286,9 +294,9 @@ impl ClefBackend {
     }
 }
 
-impl DecisionBackend for ClefBackend {
+impl DecisionBackend for SystemOneBackend {
     async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
-        let payload = serde_json::to_vec(&build_request(event, self.model)?)?;
+        let payload = serde_json::to_vec(&build_request(event, &self.model)?)?;
         let body = post_json(
             &self.client,
             &self.url,
@@ -343,7 +351,7 @@ mod tests {
 
     #[test]
     fn request_selects_the_model_and_asks_three_questions() -> Result<(), serde_json::Error> {
-        let request = build_request(&sample_event("/", b""), ClefModel::Flash)?;
+        let request = build_request(&sample_event("/", b""), "clef-flash")?;
         assert_eq!(request["model"], "clef-flash");
         let questions = request["questions"]
             .as_object()
@@ -362,15 +370,15 @@ mod tests {
     }
 
     #[test]
-    fn full_model_uses_the_clef_name() -> Result<(), serde_json::Error> {
-        let request = build_request(&sample_event("/", b""), ClefModel::Full)?;
-        assert_eq!(request["model"], "clef");
+    fn request_carries_the_model_name_it_is_given() -> Result<(), serde_json::Error> {
+        let request = build_request(&sample_event("/", b""), "jev-latest")?;
+        assert_eq!(request["model"], "jev-latest");
         Ok(())
     }
 
     #[test]
     fn state_has_exactly_the_request_and_context_keys() -> Result<(), serde_json::Error> {
-        let request = build_request(&sample_event("/a", b"x=1"), ClefModel::Flash)?;
+        let request = build_request(&sample_event("/a", b"x=1"), "clef-flash")?;
         let state = request["state"].as_object().cloned().unwrap_or_default();
         let mut keys: Vec<&str> = state.keys().map(String::as_str).collect();
         keys.sort_unstable();
@@ -382,10 +390,7 @@ mod tests {
 
     #[test]
     fn questions_contain_no_client_data() -> Result<(), serde_json::Error> {
-        let request = build_request(
-            &sample_event("/marker-path", b"marker-body"),
-            ClefModel::Flash,
-        )?;
+        let request = build_request(&sample_event("/marker-path", b"marker-body"), "clef-flash")?;
         let questions = request["questions"].to_string();
         assert!(!questions.contains("marker-path"));
         assert!(!questions.contains("marker-body"));
@@ -395,7 +400,7 @@ mod tests {
 
     #[test]
     fn attack_question_carries_the_judge_notice() -> Result<(), serde_json::Error> {
-        let request = build_request(&sample_event("/", b""), ClefModel::Flash)?;
+        let request = build_request(&sample_event("/", b""), "clef-flash")?;
         let text = request["questions"]["attack"]["instructions"]
             .as_str()
             .unwrap_or_default();
@@ -546,7 +551,7 @@ mod tests {
         fn attacker_text_stays_under_untrusted_http_request(marker in "zq[a-z0-9]{8,16}") {
             let path = format!("/{marker}");
             let body = format!("field={marker}");
-            let request = build_request(&sample_event(&path, body.as_bytes()), ClefModel::Flash);
+            let request = build_request(&sample_event(&path, body.as_bytes()), "clef-flash");
             let request = request.unwrap_or(Value::Null);
             let untrusted = request["state"]["untrusted_http_request"].to_string();
             prop_assert!(untrusted.contains(&marker));

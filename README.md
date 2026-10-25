@@ -67,8 +67,9 @@ docker build --target runtime -t vigilant-heron .
 ## Decision backends
 
 `decision.backend` selects the protocol. The default, `"http"`, is the JSON
-protocol below. `"clef"` calls Cloudflare Clef on Workers AI, or any server that
-implements the same API.
+protocol below. `"clef"` calls Cloudflare Clef on Workers AI, and `"jev"` calls
+TypeSafe Jev. Both use the same System One request and answer shapes, so they
+share one implementation.
 
 ### Clef (Cloudflare Workers AI)
 
@@ -85,10 +86,25 @@ the configuration loads. It is never written in the config file and is printed
 as `[REDACTED]` in logs and errors. The router asks three questions about each
 sanitized event: whether it is an attack (`attack`), whether it addresses an AI
 (`ai_instruction`), and which category of attack it is (`category`, logged
-only). The question wording lives in [`src/clef.rs`](src/clef.rs).
+only). The question wording lives in [`src/system_one.rs`](src/system_one.rs).
 
 Clef sends the sanitized event to Cloudflare. Read [SECURITY.md](SECURITY.md)
 before enabling it.
+
+### Jev (TypeSafe)
+
+```toml
+[decision]
+backend = "jev"
+model = "jev-latest"        # any identifier of 1 to 100 characters from [A-Za-z0-9._-]
+url = "https://api.typesafe.ai/v1/systemone"
+api_token_env = "TYPESAFE_API_KEY"
+```
+
+The token handling is the same as for Clef. The request is the System One shape
+described above, and the answer is the bare result (no envelope). The router
+does not request TypeSafe's long-context mode. Jev receives the sanitized event;
+see [SECURITY.md](SECURITY.md).
 
 ### HTTP protocol
 

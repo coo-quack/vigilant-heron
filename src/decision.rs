@@ -1,5 +1,5 @@
 //! The decision backends: the transport shared by all of them, the JSON HTTP
-//! protocol, the Clef protocol in [`crate::clef`], and the backend enum.
+//! protocol, the System One protocol in [`crate::system_one`], and the backend enum.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -17,9 +17,9 @@ use hyper_util::rt::TokioExecutor;
 use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
 
-use crate::clef::ClefBackend;
 use crate::error::{DecisionError, ProbabilityError, ServeError};
 use crate::sanitize::DecisionEvent;
+use crate::system_one::SystemOneBackend;
 
 /// Largest decision response body that is read.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
@@ -186,15 +186,15 @@ impl DecisionBackend for HttpDecisionBackend {
 pub(crate) enum Backend {
     /// The JSON protocol over HTTP.
     Http(HttpDecisionBackend),
-    /// Cloudflare Clef on Workers AI, or a server that speaks its protocol.
-    Clef(ClefBackend),
+    /// The System One protocol: Cloudflare Clef, `TypeSafe` Jev, or a server that speaks it.
+    SystemOne(SystemOneBackend),
 }
 
 impl DecisionBackend for Backend {
     async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         match self {
             Self::Http(backend) => backend.decide(event).await,
-            Self::Clef(backend) => backend.decide(event).await,
+            Self::SystemOne(backend) => backend.decide(event).await,
         }
     }
 }
