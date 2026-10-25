@@ -1,22 +1,16 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["github>coo-quack/renovate-config"],
-  "customManagers": [
-    {
-      "customType": "regex",
-      "description": "The toolchain channel in rust-toolchain.toml (no built-in Renovate manager reads it)",
-      "managerFilePatterns": ["/^rust-toolchain\\.toml$/"],
-      "matchStrings": ["channel\\s*=\\s*\"(?<currentValue>[^\"]+)\""],
-      "datasourceTemplate": "docker",
-      "depNameTemplate": "rust",
-      "packageNameTemplate": "rust"
-    }
-  ],
   "packageRules": [
     {
-      "description": "The rust image in the Dockerfile and the pinned toolchain move in one PR",
+      "description": "The rust image in the Dockerfile and the toolchain pinned in rust-toolchain.toml move in one PR",
       "groupName": "Rust toolchain",
-      "matchManagers": ["dockerfile", "custom.regex"],
+      "matchManagers": ["rust-toolchain"]
+    },
+    {
+      "description": "The rust image in the Dockerfile and the toolchain pinned in rust-toolchain.toml move in one PR",
+      "groupName": "Rust toolchain",
+      "matchManagers": ["dockerfile"],
       "matchPackageNames": ["rust"]
     }
   ]
