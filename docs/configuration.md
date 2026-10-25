@@ -474,6 +474,14 @@ Longest wait for a free concurrency slot. A request that finds no slot in that t
 
 Most backend calls in flight at the same time. At least 1.
 
+### `max_concurrency_per_client`
+
+- **Syntax:** `max_concurrency_per_client <number>;`
+- **Default:** `8`, or `max_concurrency` when that is smaller.
+- **Context:** decision.
+
+Most backend calls in flight for one client address, keyed by the client address that the realip settings choose. A request from a client that already holds its share is not queued: it is a rate limit for that client (`decision_error=client_busy`, in the `on_rate_limit` group), so other clients keep getting the model. It must be at least 1 and at most `max_concurrency`. This limits a denial-of-service (DoS) attack from one address, but not one from many addresses. See [How it works](/how-it-works#failure-behavior).
+
 ### `inspect_body`
 
 - **Syntax:** `inspect_body <size>;`
@@ -558,18 +566,18 @@ AI-instruction score, from 0 to 1, at or above which a request is blocked.
 ### `on_rate_limit`
 
 - **Syntax:** `on_rate_limit allow | block;`
-- **Default:** `block`.
+- **Default:** `allow`.
 - **Context:** site.
 
-What happens when the backend answers HTTP 429 or no slot is free within `queue_timeout`. Rules are not affected. Attackers can saturate the backend on purpose, so the default blocks; set `allow` only on a site that puts availability first, and limit each client with `limit_req` and `limit_conn`. See [How it works](/how-it-works#failure-behavior).
+What happens when the backend answers HTTP 429, when no slot is free within `queue_timeout`, or when a client already holds its `max_concurrency_per_client` share (`client_busy`). Rules are not affected. A denial-of-service (DoS) attack against the backend can use this to make requests skip the model, so a site that prefers safety over availability should set `block`, and limit each client with `limit_req` and `limit_conn`. See [How it works](/how-it-works#failure-behavior).
 
 ### `on_decision_error`
 
 - **Syntax:** `on_decision_error allow | block;`
-- **Default:** `block`.
+- **Default:** `allow`.
 - **Context:** site.
 
-What happens when the backend fails in any other way: a timeout, a connection error, a non-2xx status or an unusable answer. The default blocks, so a site that wants to forward while the backend is down must set `allow`.
+What happens when the backend fails in any other way: a timeout, a connection error, a non-2xx status or an unusable answer. The default allows; a site that prefers blocking while the backend is down sets `block`.
 
 ### `deny_path`
 

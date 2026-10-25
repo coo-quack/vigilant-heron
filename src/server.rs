@@ -41,7 +41,9 @@ use crate::config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, MAX_REQUEST_ID_BYTES, Mode,
     SiteConfig,
 };
-use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
+use crate::decision::{
+    Backend, ClientSlots, DecisionBackend, HttpDecisionBackend, Limits, decision_client,
+};
 use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
@@ -87,6 +89,8 @@ pub(crate) struct AppState<B> {
     backend_redact: Vec<String>,
     /// Body field names redacted before the event is sent to the backend (`redact_field`).
     backend_redact_fields: Vec<String>,
+    /// Decision calls in flight per client address (`max_concurrency_per_client`).
+    client_slots: Arc<ClientSlots>,
     backend: B,
     default_status: StatusCode,
     realip: RealIp,
@@ -171,6 +175,7 @@ impl AppState<Backend> {
             inspect_body_bytes: config.decision.inspect_body_bytes,
             backend_redact,
             backend_redact_fields: config.decision.redact_fields.clone(),
+            client_slots: ClientSlots::new(config.decision.max_concurrency_per_client),
             backend,
             default_status: config.default_status,
             realip: config.realip,
@@ -768,6 +773,7 @@ async fn pipeline<B: DecisionBackend>(
             parts,
             &sniffed,
             trace.client_ip,
+            trace.client_addr,
             site_name(site),
             &screening,
         )
@@ -1084,6 +1090,7 @@ async fn assess<B: DecisionBackend>(
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
+    client: IpAddr,
     site: &str,
     screening: &Screening,
 ) -> Assessment {
@@ -1092,6 +1099,14 @@ async fn assess<B: DecisionBackend>(
         Screening::SkipRule(_) => Assessment::SkipRule,
         Screening::Skip => Assessment::Skip,
         Screening::Inspect => {
+            // A client that holds its share of decision calls is refused without waiting,
+            // so its excess is a rate limit for that client alone (`client_busy`).
+            let Some(_client_slot) = state.client_slots.take(client) else {
+                return Assessment::RateLimited {
+                    cause: "client_busy",
+                    retry_after: None,
+                };
+            };
             // The event carries the name of the matched site, never the client's Host. The
             // Host the client sent stays in the untrusted headers.
             let event = sanitize::build_event(&EventInput {

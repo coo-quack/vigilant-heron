@@ -32,6 +32,8 @@ const DEFAULT_STATUS: u16 = 421;
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;
 /// Default number of concurrent decision-backend calls.
 const DEFAULT_MAX_CONCURRENCY: usize = 64;
+/// Default `max_concurrency_per_client`, capped at `max_concurrency` when that is smaller.
+const DEFAULT_MAX_CONCURRENCY_PER_CLIENT: usize = 8;
 /// Default decision timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(300);
 /// Default block threshold for a site.
@@ -191,6 +193,7 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
     "timeout",
     "queue_timeout",
     "max_concurrency",
+    "max_concurrency_per_client",
     "inspect_body",
     "max_body",
     "redact_header",
@@ -246,6 +249,9 @@ pub struct DecisionConfig {
     pub queue_timeout: Duration,
     /// Most decision-backend calls in flight at the same time.
     pub max_concurrency: usize,
+    /// Most decision-backend calls in flight for one client address, keyed by the
+    /// realip-resolved address. A request beyond it is `client_busy` without waiting.
+    pub max_concurrency_per_client: usize,
     /// Bytes of the request body that are sent to the backend.
     pub inspect_body_bytes: usize,
     /// Extra header names to drop before sending, lowercased.
@@ -1398,6 +1404,7 @@ where
     let mut timeout = DEFAULT_TIMEOUT;
     let mut queue_timeout = Duration::ZERO;
     let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
+    let mut max_concurrency_per_client: Option<usize> = None;
     let mut inspect_body = DEFAULT_INSPECT_BODY;
     let mut redact_headers = Vec::new();
     let mut redact_fields = Vec::new();
@@ -1452,6 +1459,10 @@ where
                 once(&mut seen, child)?;
                 max_concurrency = parse_usize(child, one_arg(child)?)?;
             }
+            "max_concurrency_per_client" => {
+                once(&mut seen, child)?;
+                max_concurrency_per_client = Some(parse_usize(child, one_arg(child)?)?);
+            }
             "inspect_body" => {
                 once(&mut seen, child)?;
                 inspect_body = parse_size(child, one_arg(child)?)?;
@@ -1501,6 +1512,22 @@ where
     if max_concurrency == 0 {
         return Err(invalid(directive, "\"max_concurrency\" must be at least 1"));
     }
+    let max_concurrency_per_client = match max_concurrency_per_client {
+        Some(0) => {
+            return Err(invalid(
+                directive,
+                "\"max_concurrency_per_client\" must be at least 1",
+            ));
+        }
+        Some(per_client) if per_client > max_concurrency => {
+            return Err(invalid(
+                directive,
+                "\"max_concurrency_per_client\" must not exceed \"max_concurrency\"",
+            ));
+        }
+        Some(per_client) => per_client,
+        None => DEFAULT_MAX_CONCURRENCY_PER_CLIENT.min(max_concurrency),
+    };
 
     let (url_text, url_line) = match url_text {
         Some((text, line)) => (text, line),
@@ -1581,6 +1608,7 @@ where
         timeout,
         queue_timeout,
         max_concurrency,
+        max_concurrency_per_client,
         inspect_body_bytes: inspect_body,
         redact_headers,
         redact_fields,
@@ -1690,8 +1718,8 @@ fn parse_site(
     let mut instruction_threshold = DEFAULT_INSTRUCTION_THRESHOLD;
     let mut deny_paths = Vec::new();
     let mut fail_closed_paths = Vec::new();
-    let mut on_rate_limit = FailureAction::Block;
-    let mut on_decision_error = FailureAction::Block;
+    let mut on_rate_limit = FailureAction::Allow;
+    let mut on_decision_error = FailureAction::Allow;
     let mut static_extensions: Option<Vec<String>> = None;
     let mut static_locations: Vec<String> = Vec::new();
     let mut debug_headers = false;
@@ -2044,8 +2072,9 @@ mod tests {
         let site = first_site(&config)?;
         assert_eq!(site.block_threshold, 0.87);
         assert_eq!(site.instruction_threshold, 0.8);
-        assert_eq!(site.on_rate_limit, FailureAction::Block);
-        assert_eq!(site.on_decision_error, FailureAction::Block);
+        // Restored to allow: the fail-closed default was reverted (see CHANGELOG).
+        assert_eq!(site.on_rate_limit, FailureAction::Allow);
+        assert_eq!(site.on_decision_error, FailureAction::Allow);
         assert_eq!(site.mode, Mode::Enforce);
         assert_eq!(site.action, SiteAction::Block);
         assert!(site.static_extensions.contains(&"woff2".to_owned()));
@@ -2530,6 +2559,40 @@ mod tests {
         assert!(
             message(parse(&with_site("    static_location;\n")))
                 .contains("\"static_location\" needs at least one path prefix")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn max_concurrency_per_client_defaults_to_eight_capped_at_the_global_cap()
+    -> Result<(), ConfigError> {
+        let config = parse(&with_decision("    backend http;\n"))?;
+        assert_eq!(config.decision.max_concurrency_per_client, 8);
+        let small = parse(&with_decision(
+            "    backend http;\n    max_concurrency 3;\n",
+        ))?;
+        assert_eq!(small.decision.max_concurrency_per_client, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn max_concurrency_per_client_must_be_between_one_and_the_global_cap() -> Result<(), ConfigError>
+    {
+        let set = parse(&with_decision(
+            "    backend http;\n    max_concurrency 10;\n    max_concurrency_per_client 4;\n",
+        ))?;
+        assert_eq!(set.decision.max_concurrency_per_client, 4);
+        assert!(
+            message(parse(&with_decision(
+                "    backend http;\n    max_concurrency_per_client 0;\n"
+            )))
+            .contains("\"max_concurrency_per_client\" must be at least 1")
+        );
+        assert!(
+            message(parse(&with_decision(
+                "    backend http;\n    max_concurrency 4;\n    max_concurrency_per_client 5;\n",
+            )))
+            .contains("\"max_concurrency_per_client\" must not exceed \"max_concurrency\"")
         );
         Ok(())
     }

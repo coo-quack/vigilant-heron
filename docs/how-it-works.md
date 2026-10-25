@@ -92,12 +92,7 @@ to `block` (fail closed).
 Set each to `allow` or `block`. A saturated backend is always in the rate-limit
 group, so `on_decision_error` never applies to it.
 
-Saturation can be caused on purpose: a client that keeps many requests in flight
-fills the concurrency slots, and every other request then fails in the rate-limit
-group. With the default `block`, those requests are blocked. Limit each client
-with `limit_req` and `limit_conn` so that one client cannot fill the slots. Set
-`allow` only on a site that must keep forwarding while the backend is saturated;
-on that site the attacker can avoid the model by saturating the backend.
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
 
 Two more rules apply to failures:
 

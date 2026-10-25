@@ -341,7 +341,7 @@ counts.
 
 A decision fails when the backend answers HTTP 429, when no concurrency slot is
 free within `timeout`, or when it fails in any other way. The two groups have
-their own site settings, both `"block"` by default (fail closed):
+their own site settings, both `"allow"` by default:
 
 - `on_rate_limit`: the 429 and "no slot in time" group
 - `on_decision_error`: timeouts, connection errors, other non-2xx statuses,
@@ -352,11 +352,7 @@ Saturation is always in the rate-limit group: a request that gets no
 concurrency slot within `decision` `queue_timeout` is `backend_busy`, and that
 never falls under `on_decision_error`.
 
-Blocking by default means that a backend outage, or a flood that saturates the
-backend, blocks ordinary requests too. Attackers can cause saturation on purpose,
-so a site that opts into `"allow"` for availability gives up that protection
-while the backend is saturated. Limit each client with `limit_req` and
-`limit_conn` (see "Limits") so that one client cannot fill the concurrency slots.
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
 
 `fail_closed_paths` wins over both: a failure on such a path is always blocked.
 A blocked failure uses the site's `action`. The decision log records the
@@ -373,6 +369,7 @@ outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
 | `worker_shutdown_timeout` | how long a shutdown waits for open connections and tunnels before closing them | unset (wait indefinitely) |
 | `decision` `max_concurrency` | decision-backend calls in flight at the same time | 64 |
 | `decision` `queue_timeout` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
+| `decision` `max_concurrency_per_client` | decision-backend calls in flight for one client address; a call beyond it is `client_busy` without waiting | 8, at most `max_concurrency` |
 
 Waiting for a slot is bounded by `queue_timeout` only. A call that gets a
 slot then has the rest of `timeout`. Saturation is therefore always a rate
@@ -380,7 +377,8 @@ limit, and it follows `on_rate_limit`, never `on_decision_error`.
 
 The defaults are: `backend jev` (its URL, model and token variable
 are set by default too), `timeout 300ms`, `block_threshold 0.87`,
-`instruction_threshold 0.8`, and both failure settings `"block"`. Configs that
+`instruction_threshold 0.8`, both failure settings `"allow"`, and
+`max_concurrency_per_client` 8 (at most `max_concurrency`). Configs that
 want the JSON protocol must set `backend http;`.
 
 ## Timeouts and limits

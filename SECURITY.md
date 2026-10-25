@@ -220,16 +220,13 @@ failure and on the site settings:
   rule block stays a block when the backend rate-limits, errors, is unreachable or
   is saturated. Shadow mode still forwards every request, rules included.
 
-The defaults block requests when the backend fails or is saturated. A failure
-therefore never opens the site to requests the model did not judge. The cost is
-that a provider outage, or a flood that fills the concurrency slots, blocks
-legitimate traffic too.
+The defaults allow requests when the backend fails or is saturated, so a provider
+outage does not block legitimate traffic. The cost is that an attacker who makes the
+backend unavailable on purpose can get requests past the model, and a site that
+keeps `on_rate_limit "allow"` or `on_decision_error "allow"` accepts that. Keep
+`fail_closed_paths` on sensitive paths, which block whatever the setting.
 
-Saturation is an attack the client can start on purpose: a client that keeps
-many requests in flight occupies the `max_concurrency` slots, and every other
-request then fails in the rate-limit group. Limit each client with `limit_req`
-and `limit_conn` so that one client cannot fill the slots. A site that puts
-availability first can set `on_rate_limit "allow"` and `on_decision_error
-"allow"` explicitly. On that site an attacker who saturates the backend gets
-requests past the model, so such a site should keep `fail_closed_paths` on its
-sensitive paths.
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
+
+The per-client cap also covers a single client that keeps many requests in flight
+on its own. A distributed DoS attack from many addresses is not prevented by it.

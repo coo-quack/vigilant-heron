@@ -241,6 +241,8 @@ async fn saturated_request_is_logged_as_backend_busy() -> TestResult {
 listen 127.0.0.1:0;
 request_id_header x-request-id;
 access_log {log} json;
+real_ip_from 127.0.0.0/8;
+real_ip_header x-real-ip;
 
 client_max_body_size 1024;
 decision {{
@@ -290,7 +292,16 @@ site example.com {{
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    let reply = get_with_id(&base, "/articles/queued", "log-busy-1").await?;
+    // Another client, so that the per-client share does not apply: the global slot is full.
+    let reply = send(
+        &base,
+        Method::GET,
+        "/articles/queued",
+        "example.com",
+        &[("x-real-ip", "203.0.113.9"), ("x-request-id", "log-busy-1")],
+        Bytes::new(),
+    )
+    .await?;
     holder.await??;
 
     assert_eq!(

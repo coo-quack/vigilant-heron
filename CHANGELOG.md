@@ -143,13 +143,16 @@
   line was read, so a trusted proxy that appended its own line (HAProxy's
   `option forwardfor`) could not stop a client from choosing its address. A
   malformed line makes the whole header ignored, as before.
-- Security (F6): `on_rate_limit` and `on_decision_error` now default to `block`
-  (fail closed). Saturation of the decision backend can be caused on purpose, so
-  with the old `allow` default an attacker who filled the concurrency slots got
-  requests past the model. **Breaking for sites that relied on the default:**
-  set `on_rate_limit allow;` and `on_decision_error allow;` to keep forwarding
-  while the backend fails or is saturated, and limit each client with `limit_req`
-  and `limit_conn`. Shadow sites still forward everything.
+- Security (F6): a denial-of-service (DoS) attack against the decision backend,
+  which keeps the concurrency slots full, could make requests skip the model. The
+  defaults of `on_rate_limit` and `on_decision_error` stay `allow`; an earlier
+  change that made them `block` is reverted. The new `decision`
+  `max_concurrency_per_client` directive (default 8, at most `max_concurrency`)
+  limits the calls in flight for one client address, keyed by the realip address.
+  A client beyond its share is refused at once with `decision_error=client_busy`,
+  in the rate-limit group, so only that client follows `on_rate_limit`, and other
+  clients keep being judged. A DoS attack from many addresses is not prevented.
+  Sites that prefer safety over availability can set `on_rate_limit block`.
 - Security (F8): the lexical redaction of JSON-like bodies computed the end of
   every value, including the end of an unclosed container, for every key. A body
   of `"":{` repeated filled the inspected prefix and took time quadratic in its
