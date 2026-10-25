@@ -109,6 +109,17 @@ configs:
 
       server {
         listen 80;
+        server_name langflow.test;
+
+        location / {
+          proxy_pass http://vigilant-heron:8080;
+          proxy_set_header Host $$host;
+          proxy_set_header X-Real-IP $$remote_addr;
+        }
+      }
+
+      server {
+        listen 80;
         server_name jev.test;
 
         location / {

@@ -585,3 +585,96 @@ async fn attack_shaped_websocket_handshake_is_refused_through_nginx() -> TestRes
     assert!(!head.contains(" 101 "), "{head}");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn langflow_auto_login_is_blocked_on_the_site_that_enables_the_patch() -> TestResult {
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/api/v1/login/auto_login",
+        "langflow.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn langflow_validate_code_post_is_blocked_on_the_site_that_enables_the_patch() -> TestResult {
+    let reply = send(
+        &base(),
+        Method::POST,
+        "/api/v1/validate/code",
+        "langflow.test",
+        &[("content-type", "application/json")],
+        Bytes::from_static(b"{\"code\": \"import os\"}"),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn langflow_validate_code_get_is_not_blocked_by_the_post_patch() -> TestResult {
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/api/v1/validate/code",
+        "langflow.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.text().contains("upstream ok"));
+    Ok(())
+}
+
+/// Attempts to reach `/api/v1/login/auto_login` under a different spelling. Each must be blocked.
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn langflow_auto_login_spelling_variants_are_blocked() -> TestResult {
+    // The `;x` spelling is already covered by the prefix match. The path-normalisation
+    // hardening on another branch may change how this spelling is normalised, so re-run
+    // this case after both branches are merged.
+    for path in [
+        "/api/v1/login/auto_login;x",
+        "//api/v1/login/auto_login",
+        "/api/v1/login/%61uto_login",
+        "/api/v1/login/../login/auto_login",
+    ] {
+        let reply = send(
+            &base(),
+            Method::GET,
+            path,
+            "langflow.test",
+            &[],
+            Bytes::new(),
+        )
+        .await?;
+        assert_eq!(reply.status, StatusCode::FORBIDDEN, "path {path}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn auto_login_on_a_site_without_the_patch_is_not_blocked_by_it() -> TestResult {
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/api/v1/login/auto_login",
+        "enforce.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.text().contains("upstream ok"));
+    Ok(())
+}

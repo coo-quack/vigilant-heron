@@ -138,6 +138,7 @@ signatures of these classes, with ids `vh-<category>-<nnn>`:
 | SSRF | `vh-ssrf-001`, `002` | the cloud metadata address `169.254.169.254`; `file`, `gopher`, `dict`, `ldap` or `tftp` URLs in a query |
 | Template and expression | `vh-expr-001` to `003` | the JNDI lookup `${jndi:`; the `{{7*7}}` probe; the Spring class loader path |
 | XML external entities | `vh-xxe-001` | an entity declared with `SYSTEM` in a body |
+| Opt-in CVE patches (off by default) | `vh-cve-2026-9103`, `vh-cve-2026-8481` | IBM Langflow OSS endpoints: `/api/v1/login/auto_login` and a `POST` to `/api/v1/validate/code`; each runs only where `enable_rule` names it |
 | Scanners | `vh-scanner-001` | the user agent of a known scanner (sqlmap, nikto, nuclei, masscan, zgrab and others) |
 
 The built-in rules are kept to patterns that do not occur in ordinary text. A
@@ -148,10 +149,13 @@ or to a user rule. [SECURITY.md](SECURITY.md) lists what they do not cover.
 ```
 builtin_rules on;           # top level or site; default on. off turns the set off
 disable_rule vh-scanner-001 vh-xss-003;   # top level or site; only built-in ids
+enable_rule vh-cve-2026-9103;             # top level or site; turns on a rule that is off by default
 ```
 
 A `site` setting replaces the top-level `builtin_rules`. `disable_rule` adds to
-the top-level list for that site. An unknown id is a configuration error.
+the top-level list for that site. `enable_rule` turns on a rule that is off by
+default, and the nearest level that names a rule decides; see
+[`enable_rule`](docs/configuration.md#enable_rule). An unknown id is a configuration error.
 
 ### Order of evaluation
 
@@ -751,6 +755,13 @@ and expects `{"attack": 0.02, "ai_instruction": 0.01}`, both in `0..=1`. A
 
 See [SECURITY.md](SECURITY.md) for what is sent to the backend and how the
 router limits the effect of a misled model.
+
+### Security advisories
+
+The shipped `vh-cve-*` rules and the advice on writing a rule for a CVE are in
+[From CVE advisories to rules](docs/cve-rules.md). A rule that blocks a whole
+endpoint is off by default, and an operator enables it on the sites that run the
+affected product.
 
 ## Development
 

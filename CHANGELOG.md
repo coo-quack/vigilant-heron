@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `enable_rule <id> ...;` at the top level and in a `site` turns on built-in rules
+  that are off by default. A built-in rule written with `default off;` runs only
+  where it is enabled. The nearest level that names a rule decides, a site's lists
+  before the top level's, and `disable_rule` wins over `enable_rule` within one level.
+  `default off;` is valid only in the built-in rules.
+- Opt-in virtual patches `vh-cve-2026-9103` (IBM Langflow OSS
+  `/api/v1/login/auto_login`, CVE-2026-9103) and `vh-cve-2026-8481` (IBM Langflow OSS
+  `POST /api/v1/validate/code`, CVE-2026-8481). Both are off by default. IBM's fix
+  for CVE-2026-9103 is Langflow 1.10.1; for CVE-2026-8481, upgrade past 1.10.0 and
+  check the bulletin. The docs page "From CVE advisories to rules" describes how
+  to write, roll out and remove such rules, and the policy for shipped ones.
 - Host matching as in nginx `server_name`: exact names, `*.example.com`,
   `example.*`, `.example.com` and `~regex` names in a `site`, with exact, then
   leading wildcard, then trailing wildcard, then regex precedence. `default_server;`

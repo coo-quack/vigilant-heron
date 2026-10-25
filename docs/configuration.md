@@ -286,6 +286,32 @@ Turns the built-in rules on or off. A site setting replaces the top-level one. S
 
 Turns off built-in rules by id. Repeatable. The top-level list is extended by a site's own list. An unknown id is a configuration error.
 
+A site's `disable_rule` turns off a rule that the top level enabled with `enable_rule`. The order between the two is described under `enable_rule`.
+
+### `enable_rule`
+
+- **Syntax:** `enable_rule <id> ...;`
+- **Default:** none.
+- **Context:** top level, site.
+
+Turns on built-in rules by id that are off by default (a rule with `default off;` in `builtin.conf`). Repeatable. An unknown id is a configuration error. Enabling a rule that is on by default is allowed and does nothing. The shipped rules that are off are the [opt-in CVE rules](/builtin-rules#opt-in-rules).
+
+For each rule id, the nearest level that names the id decides, in this order:
+
+1. the site's `disable_rule`, then the site's `enable_rule`;
+2. the top-level `disable_rule`, then the top-level `enable_rule`.
+
+Inside one level, `disable_rule` wins over `enable_rule`. A rule that no list names runs when `builtin_rules` is on at the site and the rule is on by default. So a rule that the site enables runs even when `builtin_rules off;` applies to the site, and a site's `enable_rule` overrides a top-level `disable_rule` for the same id.
+
+```nginx
+enable_rule vh-cve-2026-9103;   # top level: every site runs it
+
+site langflow.example.com {
+    upstream http://langflow:7860;
+    enable_rule vh-cve-2026-8481;   # this site only, in addition to the top level
+}
+```
+
 ### `rule`
 
 - **Syntax:** `rule <id> { ... }`
@@ -649,7 +675,7 @@ These are the top-level timers described above. A site can override them. Their
 syntax and defaults are the same, and see [Timeouts and limits](/timeouts) for the
 table of what each one bounds.
 
-### `block_status`, `block_page`, `allow`, `deny`, `builtin_rules`, `disable_rule`, `rule`, `access_log`, `proxy_set_header`
+### `block_status`, `block_page`, `allow`, `deny`, `builtin_rules`, `disable_rule`, `enable_rule`, `rule`, `access_log`, `proxy_set_header`
 
 These are the same directives as at the top level. A site setting replaces the
 inherited one, as described in each entry above. The `access_log` of a site

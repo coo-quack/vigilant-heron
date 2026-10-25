@@ -23,7 +23,7 @@ use crate::logsink::Destination;
 use crate::proxy::HeaderOp;
 use crate::realip::{IpNet, RealIp};
 use crate::router::HostPattern;
-use crate::rules::{self, ParsedRule, Rule, Scope, SiteRules};
+use crate::rules::{self, ParsedRule, Rule, RuleSwitches, Scope, SiteRules};
 use crate::system_one::{ApiToken, ClefModel};
 
 /// Default HTTP status for hosts that match no site.
@@ -115,6 +115,7 @@ pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
     "block_page",
     "builtin_rules",
     "disable_rule",
+    "enable_rule",
     "rule",
     "site",
     "error_log",
@@ -152,6 +153,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "deny",
     "builtin_rules",
     "disable_rule",
+    "enable_rule",
     "rule",
     "proxy_websocket",
     "proxy_set_header",
@@ -823,7 +825,7 @@ where
         .map(|rule| (rule.id.to_string(), "the built-in rules".to_owned()))
         .collect();
     let mut builtin_top = true;
-    let mut disabled_top: Vec<String> = Vec::new();
+    let mut switches_top = RuleSwitches::default();
     let mut top_access: Vec<AccessEntry> = Vec::new();
     let mut top_block = BlockOverrides::default();
     let mut top_headers: Option<Vec<HeaderOp>> = None;
@@ -1039,7 +1041,12 @@ where
                 once(&mut seen, directive)?;
                 builtin_top = parse_bool(directive, one_arg(directive)?)?;
             }
-            "disable_rule" => disabled_top.extend(rules::disabled_ids(directive, builtin)?),
+            "disable_rule" => switches_top
+                .disabled
+                .extend(rules::builtin_ids(directive, builtin)?),
+            "enable_rule" => switches_top
+                .enabled
+                .extend(rules::builtin_ids(directive, builtin)?),
             "rule" => {
                 let parsed = rules::parse_rule(directive, Scope::Top)?;
                 rules::claim_id(&mut claimed, &parsed)?;
@@ -1087,7 +1094,7 @@ where
         access: &top_access,
         builtin,
         builtin_enabled: builtin_top,
-        disabled: &disabled_top,
+        switches: &switches_top,
         rules: &top_rules,
         zones: &zones,
         limits: &top_limits,
@@ -1646,8 +1653,8 @@ struct Top<'a> {
     builtin: &'a [Arc<Rule>],
     /// Whether the built-in rules are on at the top level.
     builtin_enabled: bool,
-    /// Built-in rule ids disabled at the top level.
-    disabled: &'a [String],
+    /// The `disable_rule` and `enable_rule` ids of the top level.
+    switches: &'a RuleSwitches,
     /// Top-level rules, each with the sites it applies to.
     rules: &'a [ParsedRule],
     /// The limit zones.
@@ -1728,7 +1735,7 @@ fn parse_site(
     let mut timeouts = top.timeouts;
     let mut own_access: Vec<AccessEntry> = Vec::new();
     let mut builtin_enabled: Option<bool> = None;
-    let mut own_disabled: Vec<String> = Vec::new();
+    let mut own_switches = RuleSwitches::default();
     let mut own_rules: Vec<ParsedRule> = Vec::new();
     let mut site_limits = LimitOverrides::default();
     let mut pending_locations = Vec::new();
@@ -1864,7 +1871,12 @@ fn parse_site(
                 once(&mut seen, child)?;
                 builtin_enabled = Some(parse_bool(child, one_arg(child)?)?);
             }
-            "disable_rule" => own_disabled.extend(rules::disabled_ids(child, top.builtin)?),
+            "disable_rule" => own_switches
+                .disabled
+                .extend(rules::builtin_ids(child, top.builtin)?),
+            "enable_rule" => own_switches
+                .enabled
+                .extend(rules::builtin_ids(child, top.builtin)?),
             "rule" => {
                 let parsed = rules::parse_rule(child, Scope::Site)?;
                 rules::claim_id(claimed, &parsed)?;
@@ -1948,17 +1960,12 @@ fn parse_site(
     } else {
         own_access
     };
-    let disabled: Vec<String> = top
-        .disabled
-        .iter()
-        .chain(own_disabled.iter())
-        .cloned()
-        .collect();
     let rules = rules::site_rules(
         &hosts,
         top.builtin,
         builtin_enabled.unwrap_or(top.builtin_enabled),
-        &disabled,
+        top.switches,
+        &own_switches,
         top.rules,
         &own_rules,
     );

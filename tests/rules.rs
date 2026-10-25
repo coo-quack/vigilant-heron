@@ -760,3 +760,75 @@ async fn a_denied_client_on_a_shadow_site_is_forwarded_and_recorded_as_a_block()
     assert_eq!(decider.calls(), 0);
     proxy.stop().await
 }
+
+#[tokio::test]
+async fn an_enabled_virtual_patch_blocks_only_on_the_site_that_enables_it() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path("cve-enable");
+    let _ = std::fs::remove_file(&log);
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+request_id_header x-request-id;
+access_log "{log}" json;
+decision {{
+    backend http;
+    url "{decide}";
+    timeout 2000ms;
+    inspect_body 512;
+}}
+default_status 421;
+
+site langflow.test {{
+    upstream "{upstream}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    enable_rule vh-cve-2026-9103;
+}}
+
+site plain.test {{
+    upstream "{upstream}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        log = log.display(),
+        decide = decider.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let enabled = send(
+        &proxy.base(),
+        Method::GET,
+        "/api/v1/login/auto_login",
+        "langflow.test",
+        &[("x-request-id", "cve-on-1")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(enabled.status, StatusCode::FORBIDDEN);
+    assert_eq!(decider.calls(), 0, "the rule blocks before the backend");
+    let line = wait_for_line(&log, "cve-on-1").await?;
+    assert_eq!(line["rule_id"], "vh-cve-2026-9103");
+
+    let plain = send(
+        &proxy.base(),
+        Method::GET,
+        "/api/v1/login/auto_login",
+        "plain.test",
+        &[("x-request-id", "cve-off-1")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(plain.status, StatusCode::OK);
+    assert_eq!(decider.calls(), 1, "the same request reaches the backend");
+    let line = wait_for_line(&log, "cve-off-1").await?;
+    assert_eq!(line["rule_id"], "");
+    proxy.stop().await
+}
