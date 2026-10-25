@@ -54,6 +54,19 @@ Socket address that the router binds, such as `0.0.0.0:8080`.
 
 Runtime worker threads that run the proxy. At least 1 when set. Read at startup only.
 
+### `worker_shutdown_timeout`
+
+- **Syntax:** `worker_shutdown_timeout <time>;`
+- **Default:** none (wait until every connection has closed).
+- **Context:** top level.
+
+On `SIGINT` or `SIGTERM` the router stops accepting connections and waits for
+requests in flight, open WebSocket tunnels and lingering closes to finish. When
+this time is set and expires, every remaining connection and tunnel is closed and
+the process exits, as nginx's directive of the same name does. Without it a
+WebSocket client that never disconnects keeps the router from exiting, so set it
+when `proxy_websocket` is on. Read at startup only.
+
 ### `max_connections`
 
 - **Syntax:** `max_connections <number>;`
@@ -291,7 +304,7 @@ A virtual host. It is chosen by the request's `Host`. Its directives are listed 
 - **Default:** `stderr info`.
 - **Context:** top level.
 
-Destination and level of operational messages. A file is reopened on `SIGUSR1` and on `SIGHUP`. Syslog is not available for the error log.
+Destination and level of operational messages. A `SIGHUP` reload applies a new destination and level; if the new destination cannot be opened, the reload fails and the old configuration, error log included, stays. `SIGUSR1` reopens the file. Syslog is not available for the error log.
 
 ### `access_log`
 
@@ -646,15 +659,15 @@ error at its line.
   with its includes is read and validated again. A valid file replaces the
   configuration for every request that starts after the reload. An invalid file
   is logged at error level with its file and line, and the previous configuration
-  keeps serving. `SIGHUP` also reopens the error log file. Zones keep their counts
+  keeps serving. The `error_log` destination and level follow the new file. Zones keep their counts
   when a zone with the same name and size exists in the new file.
 - **`SIGUSR1`** reopens the file destinations of the access logs and the error log,
   so logrotate can move them away without a reload.
 
 These settings take effect at startup only. A reload that changes one of them
 logs a warning, and the change applies at the next restart: `listen`,
-`worker_threads`, `max_connections`, the connection timers and header limits, and
-the `error_log` destination and level.
+`worker_threads`, `worker_shutdown_timeout`, `max_connections`, and the connection
+timers and header limits.
 
 ## Checking the configuration
 

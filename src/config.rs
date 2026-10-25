@@ -84,6 +84,7 @@ const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
 pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
     "listen",
     "worker_threads",
+    "worker_shutdown_timeout",
     "max_connections",
     "default_status",
     "request_id_header",
