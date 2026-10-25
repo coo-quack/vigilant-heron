@@ -10,6 +10,7 @@
 //! The configuration uses nginx-style directives. [`serve`] runs the proxy on a
 //! listener that the caller binds.
 
+mod access;
 mod accesslog;
 mod body;
 mod conf;
@@ -22,6 +23,7 @@ mod prefilter;
 mod proxy;
 mod realip;
 mod router;
+mod rules;
 mod sanitize;
 mod server;
 mod system_one;

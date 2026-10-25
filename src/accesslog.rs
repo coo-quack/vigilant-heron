@@ -34,6 +34,7 @@ pub(crate) enum Field {
     TimeLocal,
     Msec,
     RequestId,
+    RuleId,
     ClientIp,
     RemoteAddr,
     Site,
@@ -62,6 +63,7 @@ impl Field {
             "time_local" => Self::TimeLocal,
             "msec" => Self::Msec,
             "request_id" => Self::RequestId,
+            "rule_id" => Self::RuleId,
             "client_ip" => Self::ClientIp,
             "remote_addr" => Self::RemoteAddr,
             "site" => Self::Site,
@@ -190,7 +192,7 @@ impl LogFormat {
 const JSON_TEMPLATE: &str = concat!(
     r#"{"time":"$time_iso8601","request_id":"$request_id","client_ip":"$client_ip","#,
     r#""site":"$site","host":"$host","method":"$method","path":"$path","status":"$status","#,
-    r#""action":"$action","reason":"$reason","would_have":"$would_have","attack":"$attack","#,
+    r#""action":"$action","reason":"$reason","rule_id":"$rule_id","would_have":"$would_have","attack":"$attack","#,
     r#""ai_instruction":"$ai_instruction","category":"$category","#,
     r#""decision_error":"$decision_error","retry_after":"$retry_after","#,
     r#""input_tokens":"$input_tokens","latency_ms":"$latency_ms"}"#
@@ -284,6 +286,8 @@ pub(crate) struct AccessRecord<'a> {
     pub(crate) action: &'a str,
     /// Why the action was chosen.
     pub(crate) reason: &'a str,
+    /// The id of the rule that decided the request, empty when no rule did.
+    pub(crate) rule_id: &'a str,
     /// In shadow mode, the action that would have been taken.
     pub(crate) would_have: Option<&'a str>,
     /// Attack score, when a backend answered.
@@ -315,6 +319,7 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::TimeLocal => Some(time_local(record.time)),
         Field::Msec => Some(msec(record.time)),
         Field::RequestId => record.request_id.and_then(text),
+        Field::RuleId => text(record.rule_id),
         Field::ClientIp => text(record.client_ip),
         Field::RemoteAddr => text(record.remote_addr),
         Field::Site => text(record.site),
@@ -490,6 +495,7 @@ mod tests {
             status: 200,
             action: "allow",
             reason: "model",
+            rule_id: "",
             would_have: None,
             attack: Some(0.97),
             ai_instruction: None,

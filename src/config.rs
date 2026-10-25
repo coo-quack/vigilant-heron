@@ -5,19 +5,22 @@
 //! the header names the decision block redacts. Every error names the file and
 //! line of the directive that caused it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue, StatusCode, Uri};
 
+use crate::access::AccessEntry;
 use crate::accesslog::{Escape, LogFormat};
 use crate::conf::{self, Directive};
 use crate::error::ConfigError;
 use crate::logsink::Destination;
 use crate::realip::{IpNet, RealIp};
 use crate::router::normalize_host;
+use crate::rules::{self, ParsedRule, Rule, Scope, SiteRules};
 use crate::system_one::{ApiToken, ClefModel};
 
 /// Default HTTP status for hosts that match no site.
@@ -94,6 +97,8 @@ pub struct Config {
     pub access_logs: Vec<AccessLogConfig>,
     /// Where operational messages go.
     pub error_log: ErrorLogConfig,
+    /// The top-level access list, used for every site that has none of its own.
+    pub access: Vec<AccessEntry>,
 }
 
 /// Settings for the decision backend and the body it receives.
@@ -212,6 +217,10 @@ pub struct SiteConfig {
     pub access_logs: Option<Vec<AccessLogConfig>>,
     /// Body and upstream timers and the body size limit of this site.
     pub timeouts: SiteTimeouts,
+    /// The access list in force for this site: its own, or the top-level one when it has none.
+    pub access: Vec<AccessEntry>,
+    /// The rules this site runs, in evaluation order.
+    pub(crate) rules: SiteRules,
 }
 
 /// One access-log destination with its format.
@@ -319,7 +328,7 @@ fn at(directive: &Directive) -> (String, usize) {
     (directive.file.to_string(), directive.line)
 }
 
-fn invalid(directive: &Directive, message: impl Into<String>) -> ConfigError {
+pub(crate) fn invalid(directive: &Directive, message: impl Into<String>) -> ConfigError {
     let (file, line) = at(directive);
     ConfigError::Invalid {
         file,
@@ -340,7 +349,7 @@ fn invalid_at_top(directives: &[Directive], message: &str) -> ConfigError {
     }
 }
 
-fn one_arg(directive: &Directive) -> Result<&str, ConfigError> {
+pub(crate) fn one_arg(directive: &Directive) -> Result<&str, ConfigError> {
     match directive.args.as_slice() {
         [value] => Ok(value.as_str()),
         _ => Err(invalid(
@@ -350,7 +359,7 @@ fn one_arg(directive: &Directive) -> Result<&str, ConfigError> {
     }
 }
 
-fn block(directive: &Directive) -> Result<&[Directive], ConfigError> {
+pub(crate) fn block(directive: &Directive) -> Result<&[Directive], ConfigError> {
     directive.children.as_deref().ok_or_else(|| {
         invalid(
             directive,
@@ -606,6 +615,16 @@ where
     F: Fn(&str) -> Option<String>,
 {
     let mut seen = HashSet::new();
+    let builtin = rules::builtin_rules()?;
+    // Every rule id in use, built-in ids included, with the place it was written.
+    let mut claimed: HashMap<String, String> = builtin
+        .iter()
+        .map(|rule| (rule.id.to_string(), "the built-in rules".to_owned()))
+        .collect();
+    let mut builtin_top = true;
+    let mut disabled_top: Vec<String> = Vec::new();
+    let mut top_access: Vec<AccessEntry> = Vec::new();
+    let mut top_rules: Vec<ParsedRule> = Vec::new();
     let mut listen = None;
     let mut worker_threads = None;
     let mut max_connections = DEFAULT_MAX_CONNECTIONS;
@@ -774,6 +793,17 @@ where
                     "\"max_body\" was replaced by \"client_max_body_size\", which is set at the top level",
                 ));
             }
+            "allow" | "deny" => top_access.push(access_entry(directive)?),
+            "builtin_rules" => {
+                once(&mut seen, directive)?;
+                builtin_top = parse_bool(directive, one_arg(directive)?)?;
+            }
+            "disable_rule" => disabled_top.extend(rules::disabled_ids(directive, builtin)?),
+            "rule" => {
+                let parsed = rules::parse_rule(directive, Scope::Top)?;
+                rules::claim_id(&mut claimed, &parsed)?;
+                top_rules.push(parsed);
+            }
             "site" => site_directives.push(directive),
             "error_log" => {
                 once(&mut seen, directive)?;
@@ -803,10 +833,18 @@ where
             "at least one \"site\" block is required",
         ));
     }
+    let top = Top {
+        timeouts: site_timeouts,
+        access: &top_access,
+        builtin,
+        builtin_enabled: builtin_top,
+        disabled: &disabled_top,
+        rules: &top_rules,
+    };
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
     for site in site_directives {
-        let parsed = parse_site(site, &formats, &site_timeouts)?;
+        let parsed = parse_site(site, &formats, &top, &mut claimed)?;
         for host in &parsed.hosts {
             if !hosts_seen.insert(host.clone()) {
                 return Err(invalid(
@@ -816,6 +854,17 @@ where
             }
         }
         sites.push(parsed);
+    }
+    for parsed in &top_rules {
+        for name in parsed.sites.iter().flatten() {
+            if !sites.iter().any(|site| site.hosts.contains(name)) {
+                return Err(ConfigError::Invalid {
+                    file: parsed.file.to_string(),
+                    line: parsed.line,
+                    message: format!("rule names no configured site: {name}"),
+                });
+            }
+        }
     }
 
     Ok(Config {
@@ -835,6 +884,7 @@ where
         access_logs,
         error_log,
         connection,
+        access: top_access,
     })
 }
 
@@ -1279,6 +1329,45 @@ where
     Ok(ApiToken::new(token.to_owned()))
 }
 
+/// The top-level settings that a site inherits, or extends with its own rules.
+struct Top<'a> {
+    /// Timers and body limit that a site starts from.
+    timeouts: SiteTimeouts,
+    /// The top-level access list.
+    access: &'a [AccessEntry],
+    /// The built-in rules.
+    builtin: &'a [Arc<Rule>],
+    /// Whether the built-in rules are on at the top level.
+    builtin_enabled: bool,
+    /// Built-in rule ids disabled at the top level.
+    disabled: &'a [String],
+    /// Top-level rules, each with the sites it applies to.
+    rules: &'a [ParsedRule],
+}
+
+/// Reads one `allow` or `deny` directive.
+fn access_entry(directive: &Directive) -> Result<AccessEntry, ConfigError> {
+    let text = one_arg(directive)?;
+    let net = if text == "all" {
+        None
+    } else {
+        let net = IpNet::parse(text).ok_or_else(|| {
+            invalid(
+                directive,
+                format!(
+                    "\"{}\" must be an address, a network or all, got {text}",
+                    directive.name
+                ),
+            )
+        })?;
+        Some(net)
+    };
+    Ok(AccessEntry {
+        allow: directive.name == "allow",
+        net,
+    })
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "one arm per directive keeps each name and its check together"
@@ -1286,7 +1375,8 @@ where
 fn parse_site(
     directive: &Directive,
     formats: &Formats,
-    defaults: &SiteTimeouts,
+    top: &Top<'_>,
+    claimed: &mut HashMap<String, String>,
 ) -> Result<SiteConfig, ConfigError> {
     if directive.args.is_empty() {
         return Err(invalid(directive, "\"site\" needs at least one host name"));
@@ -1318,7 +1408,11 @@ fn parse_site(
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
-    let mut timeouts = *defaults;
+    let mut timeouts = top.timeouts;
+    let mut own_access: Vec<AccessEntry> = Vec::new();
+    let mut builtin_enabled: Option<bool> = None;
+    let mut own_disabled: Vec<String> = Vec::new();
+    let mut own_rules: Vec<ParsedRule> = Vec::new();
 
     for child in block(directive)? {
         match child.name.as_str() {
@@ -1420,6 +1514,17 @@ fn parse_site(
                 Some(log) => access_logs.get_or_insert_with(Vec::new).push(log),
                 None => access_off = true,
             },
+            "allow" | "deny" => own_access.push(access_entry(child)?),
+            "builtin_rules" => {
+                once(&mut seen, child)?;
+                builtin_enabled = Some(parse_bool(child, one_arg(child)?)?);
+            }
+            "disable_rule" => own_disabled.extend(rules::disabled_ids(child, top.builtin)?),
+            "rule" => {
+                let parsed = rules::parse_rule(child, Scope::Site)?;
+                rules::claim_id(claimed, &parsed)?;
+                own_rules.push(parsed);
+            }
             other => {
                 return Err(invalid(
                     child,
@@ -1441,6 +1546,27 @@ fn parse_site(
     let upstream =
         upstream.ok_or_else(|| invalid(directive, "\"upstream\" is required in a site"))?;
 
+    // A site with its own access list ignores the top-level one.
+    let access = if own_access.is_empty() {
+        top.access.to_vec()
+    } else {
+        own_access
+    };
+    let disabled: Vec<String> = top
+        .disabled
+        .iter()
+        .chain(own_disabled.iter())
+        .cloned()
+        .collect();
+    let rules = rules::site_rules(
+        &hosts,
+        top.builtin,
+        builtin_enabled.unwrap_or(top.builtin_enabled),
+        &disabled,
+        top.rules,
+        &own_rules,
+    );
+
     Ok(SiteConfig {
         hosts,
         upstream,
@@ -1461,6 +1587,8 @@ fn parse_site(
         debug_headers,
         access_logs,
         timeouts,
+        access,
+        rules,
     })
 }
 
