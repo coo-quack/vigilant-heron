@@ -1,8 +1,8 @@
 # Command line
 
-The `vigilant-heron` command checks a configuration, runs the router, and sends
-signals to a router that is already running. The options follow nginx's, so
-`-t`, `-T` and `-s` do what they do in nginx.
+The `vigilant-heron` command checks a configuration, runs the router, runs it in
+the background, and sends signals to a router that is already running. The options
+follow nginx's, so `-t`, `-T` and `-s` do what they do in nginx.
 
 ## Options
 
@@ -13,17 +13,86 @@ signals to a router that is already running. The options follow nginx's, so
 | `-c <path>`, `--config <path>`, `--config=<path>` | Use this configuration file. |
 | `-t` | Check the configuration and exit. Nothing is bound or started. |
 | `-T` | Check the configuration, print it with every `include` expanded, and exit. |
-| `-s <signal>` | Send a signal to the running router. See below. |
+| `-s <signal>` | Send a signal to the running router. See [Signal the running router with -s](#signal-the-running-router-with-s). |
+| `start` | Check the configuration, then run the router in the background. See [Run in the background](#run-in-the-background-start-stop-restart). |
+| `stop` | Stop the background router and wait until it has exited. |
+| `restart` | Check the configuration, then stop and start the background router. |
 
 An unknown option, a missing value, or an invalid `-s` word prints the reason and
 the usage to stderr, and exits 1. `-h` and `-v` win over the other options. `-s`
-cannot be combined with `-t` or `-T`.
+cannot be combined with `-t`, `-T`, `start`, `stop` or `restart`. Only one of
+`start`, `stop` and `restart` may be given. The words `start`, `stop` and
+`restart` may come before or after `-c`.
 
-With no option, the router starts. The configuration file is chosen in this order:
+With no option, the router runs in the foreground. The configuration file is
+chosen in this order:
 
 1. `-c` or `--config`.
 2. The `VIGILANT_HERON_CONFIG` environment variable.
 3. `/etc/vigilant-heron/vigilant-heron.conf`.
+
+## Run in the background: start, stop, restart
+
+Use these three commands to run the router on a host that you manage yourself.
+Under Docker or systemd, run the router in the foreground instead, and let the
+container runtime or systemd watch the process.
+
+- **`start`** checks the configuration first, as `-t` does. An invalid file prints
+  the error and starts nothing. If the pid file names a running router, `start`
+  prints `already running (pid N)` and exits 1. Otherwise it starts a new router
+  in its own process group, with its standard input and output not kept. It waits
+  up to 10 seconds for the router to write its pid file, then prints
+  `started (pid N)` and exits 0. If the router exits while it starts, `start` exits
+  1 and prints the router's startup message. A stale pid file, one that names no
+  process, does not stop `start`.
+- **`stop`** sends the graceful shutdown that `-s quit` sends, then waits until the
+  router has exited. It prints `stopped (pid N)`. The wait is the
+  [worker_shutdown_timeout](/configuration#worker_shutdown_timeout) plus 5 seconds,
+  or 30 seconds when that directive is not set. If the router is still running after
+  the wait, `stop` exits 1 and says so. It does not kill the process. With no pid
+  file, or with a stale one, `stop` prints `not running` and exits 0, as
+  `systemctl stop` does.
+- **`restart`** checks the configuration first. An invalid file exits 1, and the
+  running router keeps its pid and keeps serving. Otherwise it stops the running
+  router, if there is one, and starts a new one.
+
+```console
+$ vigilant-heron start -c vigilant-heron.conf
+vigilant-heron: warning: error_log writes to a standard stream, which a background router does not keep; set error_log to a file
+started (pid 48211)
+$ vigilant-heron stop -c vigilant-heron.conf
+stopped (pid 48211)
+```
+
+A router started with `start` is not restarted if it crashes. Nothing watches it.
+Use systemd for that, as [Installation](/install#run-as-a-service-with-systemd) shows.
+
+### Standard streams and logs
+
+A background router keeps no standard input or output. If `error_log` or
+`access_log` writes to `stdout` or `stderr`, those messages are lost, and `start`
+prints a warning. Set both to files for a background router:
+
+```nginx
+error_log /var/log/vigilant-heron/error.log warn;
+access_log /var/log/vigilant-heron/access.log json;
+```
+
+### Reload or restart?
+
+For a change to the configuration, use `-s reload`. It reads the file again and
+keeps every connection open, as [Configuration](/configuration#reload-and-log-reopen)
+describes. Use `restart` only for a setting that is read at startup. Those are
+`listen`, `pid`, `worker_threads`, `worker_shutdown_timeout`, `max_connections`,
+and the connection timers and header limits: `client_header_timeout`,
+`keepalive_timeout`, `keepalive_requests`, `send_timeout`,
+`large_client_header_buffers`, `lingering_close`, `lingering_time` and
+`lingering_timeout`. A reload that changes one of them logs a warning, and the
+change applies at the next restart.
+
+`restart` stops the old router gracefully, as `stop` does, so requests in flight
+finish before the new router starts. A new binary also needs a restart, because a
+reload does not load a new program.
 
 ## Check the configuration with -t
 
@@ -124,6 +193,7 @@ docker exec <container> /usr/local/bin/vigilant-heron -s reload -c /etc/vigilant
 
 If the pid file cannot be written at startup, the router logs a warning and runs
 anyway, so `-s` reports the missing file instead of the router refusing to start.
+
 
 ## Run from source
 

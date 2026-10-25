@@ -1,8 +1,10 @@
 //! Command-line entry point for the vigilant-heron proxy.
 
 mod cli;
+mod lifecycle;
 mod pidfile;
 
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -57,6 +59,9 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Test { dump } => Ok(test_configuration(&resolve_config(config), dump)),
+        Command::Start => lifecycle::start(&resolve_config(config)),
+        Command::Stop => lifecycle::stop(&resolve_config(config)),
+        Command::Restart => lifecycle::restart(&resolve_config(config)),
         Command::Serve => {
             let config_path = resolve_config(config);
             // The configuration is loaded before the runtime exists, because `worker_threads` sizes the runtime.
@@ -160,6 +165,8 @@ async fn run(
             tracing::warn!(%error, "cannot listen for SIGUSR1; the error log cannot be reopened");
         }
     }
+    // Registered before the listener is bound, so a stop sent once the pid file exists is handled.
+    let shutdown = shutdown_signal();
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
@@ -186,7 +193,7 @@ async fn run(
     serve_reloadable(
         listener,
         config,
-        shutdown_signal(),
+        shutdown,
         reload_rx,
         move || {
             let config = Config::load(&config_path)?;
@@ -200,38 +207,35 @@ async fn run(
     Ok(())
 }
 
-/// Resolves when SIGINT, SIGTERM or SIGQUIT arrives. All three shut down gracefully in
-/// this version, so `-s stop` (SIGTERM) and `-s quit` (SIGQUIT) behave alike.
-async fn shutdown_signal() {
-    let interrupt = async {
-        // A failed signal registration leaves the server running until SIGTERM.
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    let terminate = async {
-        match signal(SignalKind::terminate()) {
-            Ok(mut stream) => {
-                stream.recv().await;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "cannot listen for SIGTERM; only SIGINT stops the server");
-                std::future::pending::<()>().await;
-            }
+/// Registers the signals that stop the router, and returns the future that resolves on
+/// the first of them. Registration happens here, before the pid file is written: a
+/// signal that arrives before the handlers exist would end the process without the
+/// cleanup that removes the pid file.
+///
+/// SIGINT, SIGTERM and SIGQUIT all shut down gracefully in this version.
+fn shutdown_signal() -> impl Future<Output = ()> {
+    let interrupt = signal(SignalKind::interrupt());
+    let terminate = signal(SignalKind::terminate());
+    let quit = signal(SignalKind::quit());
+    async move {
+        tokio::select! {
+            () = wait_for(interrupt, "SIGINT") => {}
+            () = wait_for(terminate, "SIGTERM") => {}
+            () = wait_for(quit, "SIGQUIT") => {}
         }
-    };
-    let quit = async {
-        match signal(SignalKind::quit()) {
-            Ok(mut stream) => {
-                stream.recv().await;
-            }
-            Err(error) => {
-                tracing::warn!(%error, "cannot listen for SIGQUIT");
-                std::future::pending::<()>().await;
-            }
+    }
+}
+
+/// Resolves when the registered signal arrives. A failed registration never resolves, so the
+/// other signals still stop the router.
+async fn wait_for(registered: std::io::Result<tokio::signal::unix::Signal>, name: &str) {
+    match registered {
+        Ok(mut stream) => {
+            stream.recv().await;
         }
-    };
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-        () = quit => {}
+        Err(error) => {
+            tracing::warn!(%error, signal = name, "cannot listen for this signal");
+            std::future::pending::<()>().await;
+        }
     }
 }

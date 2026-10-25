@@ -211,6 +211,7 @@ struct ConnectionSettings {
 
 /// The settings that a reload cannot change. A reload that changes one logs a warning.
 struct Startup {
+    pid_file: std::path::PathBuf,
     listen: String,
     worker_threads: Option<usize>,
     max_connections: usize,
@@ -221,6 +222,7 @@ struct Startup {
 impl Startup {
     fn of(config: &Config) -> Self {
         Self {
+            pid_file: config.pid_file.clone(),
             listen: config.listen.clone(),
             worker_threads: config.worker_threads,
             max_connections: config.max_connections,
@@ -231,6 +233,9 @@ impl Startup {
 
     /// Warns about each setting of `config` that differs from the startup value.
     fn report_changes(&self, config: &Config) {
+        if config.pid_file != self.pid_file {
+            tracing::warn!(path = %config.pid_file.display(), "pid changed; a restart is needed for it to take effect");
+        }
         if config.listen != self.listen {
             tracing::warn!(listen = %config.listen, "listen changed; a restart is needed for it to take effect");
         }

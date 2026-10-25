@@ -38,8 +38,8 @@ pub use accesslog::LogFormat;
 pub use block::{BlockResponse, BlockStatus};
 pub use config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, DecisionConfig, ErrorLogConfig,
-    FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, SiteAction, SiteConfig,
-    SiteTimeouts, dump_configuration, pid_file_path,
+    FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, ProcessSettings, SiteAction,
+    SiteConfig, SiteTimeouts, dump_configuration, process_settings,
 };
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
@@ -50,5 +50,7 @@ pub use system_one::{ApiToken, ClefModel};
 /// The directive names the parser accepts, read by the documentation drift check in `tests/docs.rs`.
 #[doc(hidden)]
 pub mod directives {
-    pub use crate::config::{DECISION_DIRECTIVES, SITE_DIRECTIVES, TOP_LEVEL_DIRECTIVES};
+    pub use crate::config::{
+        DECISION_DIRECTIVES, SITE_DIRECTIVES, STARTUP_ONLY_DIRECTIVES, TOP_LEVEL_DIRECTIVES,
+    };
 }

@@ -258,4 +258,23 @@ echo "e2e-cli: reload with no running router"
 expect_exit 1 "$VH" -s reload -c "$CONF"
 require_contains "$TMP/last.err" "cannot read the pid file"
 
+echo "e2e-cli: start, start again, restart and stop in the background"
+expect_exit 0 "$VH" start -c "$CONF"
+require_contains "$TMP/last.out" "started (pid "
+first_pid="$(sed -n 's/^started (pid \([0-9]*\))$/\1/p' "$TMP/last.out")"
+[ -n "$first_pid" ] || fail "start did not print the pid"
+wait_for_status example.com / 200
+expect_exit 1 "$VH" start -c "$CONF"
+require_contains "$TMP/last.err" "already running (pid $first_pid)"
+wait_for_status example.com / 200
+expect_exit 0 "$VH" restart -c "$CONF"
+second_pid="$(sed -n 's/^started (pid \([0-9]*\))$/\1/p' "$TMP/last.out")"
+[ -n "$second_pid" ] && [ "$second_pid" != "$first_pid" ] || fail "restart did not start a new process"
+wait_for_status example.com / 200
+expect_exit 0 "$VH" stop -c "$CONF"
+require_contains "$TMP/last.out" "stopped (pid $second_pid)"
+[ ! -e "$TMP/vigilant-heron.pid" ] || fail "the pid file remains after stop"
+expect_exit 0 "$VH" stop -c "$CONF"
+require_contains "$TMP/last.out" "not running"
+
 echo "e2e-cli: all binary checks passed"

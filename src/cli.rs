@@ -58,6 +58,12 @@ pub(crate) enum Command {
     },
     /// `-s`: signal the running router.
     Signal(SignalCommand),
+    /// `start`: check the configuration, then run the router in the background.
+    Start,
+    /// `stop`: stop the background router gracefully and wait for it to exit.
+    Stop,
+    /// `restart`: check the configuration, stop the background router, then start it.
+    Restart,
     /// `-h`, `--help`.
     Help,
     /// `-v`, `--version`.
@@ -76,6 +82,7 @@ pub(crate) struct Options {
 /// The usage text, printed for `-h` and after a bad command line.
 pub(crate) const USAGE: &str = "\
 Usage: vigilant-heron [-h] [-v] [-t] [-T] [-c <path>] [-s <signal>]
+       vigilant-heron start|stop|restart [-c <path>]
 
 Options:
   -h, --help            show this help and exit
@@ -86,6 +93,10 @@ Options:
   -T                    check the configuration, print it with includes expanded, and exit
   -s <signal>           signal the running router: reload, reopen, stop or quit
                         (the pid comes from the `pid` directive)
+  start                 run the router in the background (checks the file first)
+  stop                  stop the background router and wait for it to exit
+  restart               stop, then start, after checking the file
+                        use -s reload for configuration changes: it keeps connections
 ";
 
 /// Reads the command line. The first error is returned as text for the usage message.
@@ -95,10 +106,17 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut test = false;
     let mut dump = false;
     let mut signal: Option<SignalCommand> = None;
+    let mut lifecycle: Option<&str> = None;
     let mut config = None;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
+            "start" | "stop" | "restart" => {
+                if lifecycle.is_some() {
+                    return Err("give only one of start, stop and restart".to_owned());
+                }
+                lifecycle = Some(arg.as_str());
+            }
             "-h" | "--help" => help = true,
             "-v" | "--version" => version = true,
             "-t" => test = true,
@@ -127,6 +145,18 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
         Command::Help
     } else if version {
         Command::Version
+    } else if let Some(word) = lifecycle {
+        if test {
+            return Err(format!("{word} cannot be combined with -t or -T"));
+        }
+        if signal.is_some() {
+            return Err(format!("{word} cannot be combined with -s"));
+        }
+        match word {
+            "start" => Command::Start,
+            "stop" => Command::Stop,
+            _ => Command::Restart,
+        }
     } else if let Some(command) = signal {
         if test {
             return Err("-s cannot be combined with -t or -T".to_owned());
@@ -167,8 +197,9 @@ pub(crate) fn send_signal(
     config_path: &std::path::Path,
     command: SignalCommand,
 ) -> anyhow::Result<()> {
-    let pid_path = vigilant_heron::pid_file_path(config_path)
-        .with_context(|| format!("loading {}", config_path.display()))?;
+    let pid_path = vigilant_heron::process_settings(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?
+        .pid_file;
     let text = std::fs::read_to_string(&pid_path).with_context(|| {
         format!(
             "cannot read the pid file {}; is the router running with this configuration?",
@@ -225,6 +256,12 @@ mod tests {
     #[case::signal_stop(&["-s", "stop"], Options { config: None, command: Command::Signal(SignalCommand::Stop) })]
     #[case::signal_quit(&["-s", "quit"], Options { config: None, command: Command::Signal(SignalCommand::Quit) })]
     #[case::signal_with_config(&["-c", "/a.conf", "-s", "reload"], Options { config: Some(PathBuf::from("/a.conf")), command: Command::Signal(SignalCommand::Reload) })]
+    #[case::start_plain(&["start"], Options { config: None, command: Command::Start })]
+    #[case::start_with_config(&["start", "-c", "/a.conf"], Options { config: Some(PathBuf::from("/a.conf")), command: Command::Start })]
+    #[case::config_before_start(&["-c", "/a.conf", "start"], Options { config: Some(PathBuf::from("/a.conf")), command: Command::Start })]
+    #[case::stop_with_config_equals(&["stop", "--config=/a.conf"], Options { config: Some(PathBuf::from("/a.conf")), command: Command::Stop })]
+    #[case::restart_with_config(&["restart", "-c", "/a.conf"], Options { config: Some(PathBuf::from("/a.conf")), command: Command::Restart })]
+    #[case::help_wins_over_start(&["start", "-h"], Options { config: None, command: Command::Help })]
     #[case::help_wins_over_version(&["-v", "-h"], Options { config: None, command: Command::Help })]
     #[case::help_wins_over_test(&["-t", "-h"], Options { config: None, command: Command::Help })]
     #[case::version_wins_over_signal(&["-s", "stop", "-v"], Options { config: None, command: Command::Version })]
@@ -244,6 +281,11 @@ mod tests {
     #[case::signal_twice(&["-s", "reload", "-s", "stop"], "-s is given more than once")]
     #[case::signal_with_test(&["-s", "reload", "-t"], "-s cannot be combined with -t or -T")]
     #[case::signal_with_dump(&["-T", "-s", "stop"], "-s cannot be combined with -t or -T")]
+    #[case::start_with_test(&["start", "-t"], "start cannot be combined with -t or -T")]
+    #[case::stop_with_dump(&["stop", "-T"], "stop cannot be combined with -t or -T")]
+    #[case::restart_with_signal(&["restart", "-s", "reload"], "restart cannot be combined with -s")]
+    #[case::start_with_stop(&["start", "stop"], "give only one of start, stop and restart")]
+    #[case::restart_twice(&["restart", "restart"], "give only one of start, stop and restart")]
     fn a_bad_command_line_is_rejected(#[case] input: &[&str], #[case] message: &str) {
         assert_eq!(parse_args(&args(input)), Err(message.to_owned()));
     }

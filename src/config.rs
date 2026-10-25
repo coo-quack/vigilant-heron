@@ -83,6 +83,25 @@ const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
     "css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "woff", "woff2", "ttf", "map",
 ];
 
+/// Top-level directives that are read at startup only. A reload that changes one of
+/// them logs a warning, and the change takes effect at the next start. `tests/docs.rs`
+/// checks the list in `docs/cli.md` against this one.
+pub const STARTUP_ONLY_DIRECTIVES: &[&str] = &[
+    "listen",
+    "pid",
+    "worker_threads",
+    "worker_shutdown_timeout",
+    "max_connections",
+    "client_header_timeout",
+    "keepalive_timeout",
+    "keepalive_requests",
+    "send_timeout",
+    "large_client_header_buffers",
+    "lingering_close",
+    "lingering_time",
+    "lingering_timeout",
+];
+
 /// Every directive name the top level accepts. The parser rejects any other name,
 /// and `docs/configuration.md` must document each one (checked by `tests/docs.rs`).
 pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
@@ -510,22 +529,42 @@ impl Config {
     }
 }
 
-/// Returns the `pid` path of the configuration at `path`, or the default when the file sets none.
+/// The settings a process command needs, read without validating the whole file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessSettings {
+    /// Where the router writes its process id. The `pid` directive, or the default.
+    pub pid_file: PathBuf,
+    /// The `worker_shutdown_timeout` directive, when one is set.
+    pub worker_shutdown_timeout: Option<Duration>,
+}
+
+/// Reads the `pid` and `worker_shutdown_timeout` settings of the configuration at `path`.
 ///
 /// Only the file and its includes are read: the rest of the configuration is not
-/// validated, so `-s` works even when the token variables are not set in its shell.
+/// validated, so `-s`, `stop` and `restart` work even when the token variables are
+/// not set in their shell.
 ///
 /// # Errors
 ///
-/// Returns the read, syntax and include errors of the file.
-pub fn pid_file_path(path: &Path) -> Result<PathBuf, ConfigError> {
+/// Returns the read, syntax and include errors of the file, and an error for a
+/// `worker_shutdown_timeout` value that is not a positive time.
+pub fn process_settings(path: &Path) -> Result<ProcessSettings, ConfigError> {
     let directives = conf::load_file(path)?;
-    let configured = directives
-        .iter()
-        .rev()
-        .find(|directive| directive.name == "pid")
-        .and_then(|directive| directive.args.first());
-    Ok(configured.map_or_else(|| PathBuf::from(DEFAULT_PID_FILE), PathBuf::from))
+    let mut settings = ProcessSettings {
+        pid_file: PathBuf::from(DEFAULT_PID_FILE),
+        worker_shutdown_timeout: None,
+    };
+    for directive in &directives {
+        match directive.name.as_str() {
+            "pid" => settings.pid_file = PathBuf::from(one_arg(directive)?),
+            "worker_shutdown_timeout" => {
+                settings.worker_shutdown_timeout =
+                    Some(parse_positive_time(directive, one_arg(directive)?)?);
+            }
+            _ => {}
+        }
+    }
+    Ok(settings)
 }
 
 /// Returns the configuration at `path` as text, with each top-level include
