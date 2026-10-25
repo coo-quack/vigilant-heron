@@ -189,6 +189,10 @@ fn push_token(out: &mut String, token: &str) {
     }
 }
 
+/// Redacts `"key": value` pairs in text that is not valid JSON.
+///
+/// Single pass: every key is read once, and a value is scanned only when it is
+/// replaced or copied, so the work is linear in the length of the text.
 fn redact_json_like(text: &str) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
@@ -210,25 +214,29 @@ fn redact_json_like(text: &str) -> String {
             continue;
         }
         let value_start = skip_whitespace(&chars, colon + 1);
-        let value_stop = value_end(&chars, value_start);
         let key = collect_range(&chars, i + 1, key_end - 1);
         copy_range(&chars, i, value_start, &mut out);
-        let value_is_string = chars.get(value_start) == Some(&'"');
-        let value_is_container = matches!(chars.get(value_start), Some('{' | '['));
-        if is_sensitive_key(&key) {
+        let sensitive = is_sensitive_key(&key);
+        if !sensitive && matches!(chars.get(value_start), Some('{' | '[')) {
+            // Keep scanning inside the container, where nested keys are checked. The
+            // container's end is not needed, so it is not searched for: each character
+            // is then visited a bounded number of times.
+            i = value_start;
+            continue;
+        }
+        // Only a value that is copied or replaced needs its end, and the scan resumes after it.
+        let value_stop = value_end(&chars, value_start);
+        if sensitive {
+            let value_is_string = chars.get(value_start) == Some(&'"');
             out.push_str(if value_is_string {
                 "\"[REDACTED]\""
             } else {
                 "[REDACTED]"
             });
-            i = value_stop;
-        } else if value_is_container {
-            // Keep scanning inside the container, where nested keys are checked.
-            i = value_start;
         } else {
             copy_range(&chars, value_start, value_stop, &mut out);
-            i = value_stop;
         }
+        i = value_stop;
     }
     out
 }
@@ -361,6 +369,8 @@ pub(crate) fn truncate_utf8(mut text: String, limit: usize) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use http::HeaderValue;
     use http::header::{AUTHORIZATION, COOKIE, HeaderMap, HeaderName};
 
@@ -553,7 +563,132 @@ mod tests {
         );
     }
 
+    /// Random JSON values whose keys include sensitive and ordinary names.
+    fn arbitrary_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            "[a-z0-9 ]{0,8}".prop_map(Value::String),
+            any::<i32>().prop_map(Value::from),
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+        ];
+        leaf.prop_recursive(4, 32, 4, |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                proptest::collection::vec(
+                    (prop_oneof!["password", "name", "token", "note"], inner),
+                    0..4,
+                )
+                .prop_map(|pairs| { Value::Object(pairs.into_iter().collect()) }),
+            ]
+        })
+    }
+
+    /// The JSON-like redaction as it was before the value end was computed lazily.
+    /// The value end was computed for every key, so a nested container was scanned
+    /// to its end once per key. Kept as the reference for the output.
+    fn redact_json_like_eager(text: &str) -> String {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while let Some(&c) = chars.get(i) {
+            if c != '"' {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            let Some(key_end) = string_end(&chars, i) else {
+                copy_range(&chars, i, chars.len(), &mut out);
+                break;
+            };
+            let colon = skip_whitespace(&chars, key_end);
+            if chars.get(colon) != Some(&':') {
+                copy_range(&chars, i, key_end, &mut out);
+                i = key_end;
+                continue;
+            }
+            let value_start = skip_whitespace(&chars, colon + 1);
+            let value_stop = value_end(&chars, value_start);
+            let key = collect_range(&chars, i + 1, key_end - 1);
+            copy_range(&chars, i, value_start, &mut out);
+            let value_is_string = chars.get(value_start) == Some(&'"');
+            let value_is_container = matches!(chars.get(value_start), Some('{' | '['));
+            if is_sensitive_key(&key) {
+                out.push_str(if value_is_string {
+                    "\"[REDACTED]\""
+                } else {
+                    "[REDACTED]"
+                });
+                i = value_stop;
+            } else if value_is_container {
+                i = value_start;
+            } else {
+                copy_range(&chars, value_start, value_stop, &mut out);
+                i = value_stop;
+            }
+        }
+        out
+    }
+
+    /// Runs `work` on another thread and fails when it does not finish within `limit`.
+    fn finishes_within<T: Send + 'static>(
+        limit: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(work());
+        });
+        match receiver.recv_timeout(limit) {
+            Ok(value) => value,
+            Err(error) => panic!("the work did not finish within {limit:?}: {error}"),
+        }
+    }
+
+    #[test]
+    fn nested_unclosed_containers_are_redacted_in_linear_time() {
+        // Every key opens a container that never closes: the old code scanned the rest of the body for each key.
+        let body = "\"\":{".repeat(1024 * 1024 / 5);
+        let started = std::time::Instant::now();
+        let redacted = finishes_within(Duration::from_secs(2), move || {
+            redact_body(None, body.as_bytes())
+        });
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(redacted.starts_with("\"\":{\"\":{"));
+    }
+
     proptest! {
+        #[test]
+        fn lazy_value_end_redacts_exactly_what_the_eager_version_did(
+            tokens in proptest::collection::vec(
+                prop_oneof![
+                    Just("\"".to_owned()),
+                    Just(":".to_owned()),
+                    Just("{".to_owned()),
+                    Just("}".to_owned()),
+                    Just("[".to_owned()),
+                    Just("]".to_owned()),
+                    Just(",".to_owned()),
+                    Just(" ".to_owned()),
+                    Just("\\".to_owned()),
+                    Just("password".to_owned()),
+                    Just("name".to_owned()),
+                    Just("1".to_owned()),
+                ],
+                0..80,
+            ),
+        ) {
+            let text: String = tokens.concat();
+            prop_assert_eq!(redact_json_like(&text), redact_json_like_eager(&text));
+        }
+
+        #[test]
+        fn well_formed_json_is_redacted_the_same_as_before(
+            value in arbitrary_json(),
+        ) {
+            let text = value.to_string();
+            prop_assert_eq!(redact_json_like(&text), redact_json_like_eager(&text));
+        }
+
         #[test]
         fn lexical_key_value_redaction_never_keeps_the_secret(value in "zq[a-z0-9]{8,16}") {
             let redacted = redact_lexical(&format!("name=alice&password={value}"));

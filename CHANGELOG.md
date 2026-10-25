@@ -150,3 +150,9 @@
   set `on_rate_limit allow;` and `on_decision_error allow;` to keep forwarding
   while the backend fails or is saturated, and limit each client with `limit_req`
   and `limit_conn`. Shadow sites still forward everything.
+- Security (F8): the lexical redaction of JSON-like bodies computed the end of
+  every value, including the end of an unclosed container, for every key. A body
+  of `"":{` repeated filled the inspected prefix and took time quadratic in its
+  length. The end is now computed only for a value that is replaced or copied, so
+  the scan is linear. The output is unchanged; a property test compares it with
+  the previous implementation.
