@@ -28,6 +28,7 @@ use http::{HeaderMap, HeaderName, StatusCode};
 use tokio::time::Instant;
 
 use crate::accesslog::FORBIDDEN_HEADERS;
+use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::Directive;
 use crate::config::{block, invalid, once, one_arg, parse_size};
 use crate::error::ConfigError;
@@ -673,6 +674,8 @@ pub(crate) struct PendingLocation<'a> {
     pub(crate) matcher: Matcher,
     /// The limit directives written in the block.
     pub(crate) overrides: LimitOverrides,
+    /// The block response directives written in the block.
+    pub(crate) block: BlockOverrides,
 }
 
 /// Parses `location [=|~|~*|^~] <path> { ... }`, with only limit directives inside.
@@ -730,20 +733,26 @@ pub(crate) fn parse_location<'a>(
         }
     };
     let mut overrides = LimitOverrides::default();
+    let mut block_overrides = BlockOverrides::default();
     let mut seen = HashSet::new();
     for child in block(directive)? {
-        if !LIMIT_NAMES.contains(&child.name.as_str()) {
+        let name = child.name.as_str();
+        if BLOCK_NAMES.contains(&name) {
+            block_overrides.apply(child, &mut seen)?;
+        } else if LIMIT_NAMES.contains(&name) {
+            overrides.apply(child, zones, &mut seen)?;
+        } else {
             return Err(invalid(
                 child,
                 format!("unknown directive \"{}\" in location", child.name),
             ));
         }
-        overrides.apply(child, zones, &mut seen)?;
     }
     Ok(PendingLocation {
         directive,
         matcher,
         overrides,
+        block: block_overrides,
     })
 }
 
@@ -764,6 +773,8 @@ pub(crate) struct LocationConfig {
     pub(crate) matcher: Matcher,
     /// The limits that apply to requests this location selects.
     pub(crate) limits: LimitSet,
+    /// The block response for requests this location selects.
+    pub(crate) block: BlockResponse,
 }
 
 /// Chooses the location for a request path, with nginx's precedence.

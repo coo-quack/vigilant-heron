@@ -449,6 +449,38 @@ duplicate is a configuration error.
 site. Without it, such a request gets `default_status` (421 by default). At most
 one site may be marked, and the request is judged by that site's settings.
 
+### Block responses
+
+A request that a rule or the decision backend blocks gets 403 with the body
+`Forbidden`. Two directives change that. They are valid at the top level, in a
+`site`, and in a `location` (which inherits from its site, which inherits from
+the top level):
+
+- `block_status <code>;` sets the status: any 4xx or 5xx code, or `444`. With
+  `444` the connection is closed without a response, as nginx does. The access
+  log still records the request with status 444. The connection closes at once
+  and does not linger, because no response is written for it.
+- `block_page <file>;` serves an HTML file for block responses, with
+  `Content-Type: text/html; charset=utf-8`. The file is read when the
+  configuration loads, must be at most 64 KiB, and a relative path is relative to
+  the file that holds the directive.
+
+Two responses keep their own status. A limit refusal keeps the status of its
+`limit_req_status` or `limit_conn_status`. An access-list denial stays 403, as
+nginx's `deny` does, whatever `block_status` says. Redirect sites
+(`action redirect`) are unchanged.
+
+```
+site example.com {
+    upstream http://app:8080;
+    block_status 404;
+    block_page /etc/vigilant-heron/blocked.html;
+    location /api/ {
+        block_status 429;
+    }
+}
+```
+
 Times take `ms`, `s`, `m` or `h` (a bare number is seconds, as in nginx). Sizes
 take `k`, `m` or `g`. Every error names the file and line, for example
 `vigilant-heron.conf:12: "block_threshold" must be between 0 and 1`.

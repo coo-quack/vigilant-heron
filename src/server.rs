@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use http::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue, LOCATION};
+use http::header::{
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION,
+};
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::Body;
@@ -32,6 +34,7 @@ use tokio::task::JoinSet;
 
 use crate::access::{self, AccessEntry};
 use crate::accesslog::{AccessRecord, LogFormat};
+use crate::block::{BlockResponse, BlockStatus};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
 use crate::config::{
     AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, Mode, SiteConfig,
@@ -53,6 +56,10 @@ use crate::transport::{
 };
 
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
+
+/// Marks a response whose connection must close without the response being written (`block_status 444`).
+#[derive(Debug, Clone, Copy)]
+struct CloseWithoutResponse;
 
 type ResponseBody = BoxBody<Bytes, BoxError>;
 
@@ -259,7 +266,7 @@ async fn serve_connection<B: DecisionBackend>(
     let service = service_fn(move |request| {
         let state = Arc::clone(&service_state);
         let connection = Arc::clone(&connection);
-        async move { Ok::<_, Infallible>(handle(&state, &connection, peer, request).await) }
+        async move { handle(&state, &connection, peer, request).await }
     });
     let connection_future = builder.serve_connection(io, service);
     let mut connection_future = pin!(connection_future);
@@ -296,12 +303,15 @@ struct Trace<'a> {
 }
 
 /// Answers one request on a connection and records it.
+///
+/// An error ends the connection without a response. It is returned for a block
+/// with `block_status 444`, after the request has been logged.
 async fn handle<B: DecisionBackend>(
     state: &AppState<B>,
     connection: &Connection,
     peer: SocketAddr,
     request: Request<Incoming>,
-) -> Response<ResponseBody> {
+) -> Result<Response<ResponseBody>, std::io::Error> {
     let started = Instant::now();
     connection.phase.set(Phase::Busy);
     let served = connection
@@ -325,18 +335,27 @@ async fn handle<B: DecisionBackend>(
     };
     let mut held = Vec::new();
     let mut response = pipeline(state, &parts, body, &done, &trace, peer, &mut held).await;
+    if response
+        .extensions()
+        .get::<CloseWithoutResponse>()
+        .is_some()
+    {
+        return Err(std::io::Error::other(
+            "blocked with block_status 444: closed without a response",
+        ));
+    }
     if served >= state.keepalive_requests {
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
     }
     let (parts, body) = response.into_parts();
-    Response::from_parts(
+    Ok(Response::from_parts(
         parts,
         Finish::new(body, Arc::clone(&connection.phase), done)
             .holding(held)
             .boxed(),
-    )
+    ))
 }
 
 #[expect(
@@ -371,6 +390,9 @@ async fn pipeline<B: DecisionBackend>(
         path: &decoded,
         headers: &parts.headers,
     };
+    // The block response of the location that was selected, else of the site.
+    let site_block = matched.map(|site| &site.block);
+    let block = location.map(|location| &location.block).or(site_block);
     let shadow = matched.is_some_and(|site| site.mode == Mode::Shadow);
     let screened = limits::screen(&state.zones, limit_set, shadow, &key_vars, held).await;
     *lock(&trace.limit_req) = screened.req_status.map(ReqStatus::name);
@@ -496,7 +518,14 @@ async fn pipeline<B: DecisionBackend>(
     if decision.would_have.is_none() {
         decision.would_have = screened.would_have.map(Action::Reject);
     }
-    let outcome = respond(proxy, site, parts, body, peer, &decision).await;
+    // Access-list denials keep 403 as nginx's `deny` does, whatever block_status says.
+    let access_block = BlockResponse::default();
+    let block = if access_denied {
+        &access_block
+    } else {
+        block.unwrap_or(&access_block)
+    };
+    let outcome = respond(proxy, site, parts, body, peer, &decision, block).await;
     let mut response = outcome.response;
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
@@ -592,6 +621,7 @@ async fn respond(
     body: ClientBody,
     peer: SocketAddr,
     decision: &Decision,
+    block: &BlockResponse,
 ) -> Outcome {
     let complete = body.is_complete();
     match &decision.action {
@@ -626,7 +656,15 @@ async fn respond(
             }
         }
         Action::Block => {
-            let mut response = status_response(StatusCode::FORBIDDEN, "Forbidden\n");
+            let mut response = match block.status {
+                BlockStatus::Respond(status) => block_response(status, block.page.as_ref()),
+                BlockStatus::Close => {
+                    // The status is only logged: the connection closes without writing it.
+                    let mut response = status_response(close_status(), "");
+                    response.extensions_mut().insert(CloseWithoutResponse);
+                    response
+                }
+            };
             if !complete {
                 close(&mut response);
             }
@@ -913,6 +951,32 @@ fn add_debug_header(headers: &mut HeaderMap, decision: &Decision) {
     );
     if let Ok(value) = HeaderValue::from_str(&value) {
         headers.insert(DEBUG_HEADER, value);
+    }
+}
+
+/// The status of a 444 block, which is logged and never sent.
+fn close_status() -> StatusCode {
+    StatusCode::from_u16(444).unwrap_or(StatusCode::FORBIDDEN)
+}
+
+/// A block response: the configured page as HTML when there is one, else the short text of nginx's 403.
+fn block_response(status: StatusCode, page: Option<&Bytes>) -> Response<ResponseBody> {
+    match page {
+        Some(page) => {
+            let mut response = Response::new(
+                Full::new(page.clone())
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            );
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            response
+        }
+        None if status == StatusCode::FORBIDDEN => status_response(status, "Forbidden\n"),
+        None => status_response(status, ""),
     }
 }
 

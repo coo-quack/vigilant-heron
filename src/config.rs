@@ -15,6 +15,7 @@ use http::{HeaderName, HeaderValue, StatusCode, Uri};
 
 use crate::access::AccessEntry;
 use crate::accesslog::{Escape, LogFormat};
+use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::{self, Directive};
 use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig};
@@ -227,6 +228,8 @@ pub struct SiteConfig {
     pub hosts: Vec<String>,
     /// Whether this site takes the requests whose host matches no site.
     pub default_server: bool,
+    /// The response to a blocked request, unless a location overrides it.
+    pub block: BlockResponse,
     /// The parsed host names, in configuration order.
     pub(crate) host_patterns: Vec<HostPattern>,
     /// Absolute `http://` URI requests are forwarded to.
@@ -685,6 +688,7 @@ where
     let mut builtin_top = true;
     let mut disabled_top: Vec<String> = Vec::new();
     let mut top_access: Vec<AccessEntry> = Vec::new();
+    let mut top_block = BlockOverrides::default();
     let mut top_rules: Vec<ParsedRule> = Vec::new();
     let mut listen = None;
     let mut worker_threads = None;
@@ -877,6 +881,7 @@ where
                 ));
             }
             "allow" | "deny" => top_access.push(access_entry(directive)?),
+            name if BLOCK_NAMES.contains(&name) => top_block.apply(directive, &mut seen)?,
             "builtin_rules" => {
                 once(&mut seen, directive)?;
                 builtin_top = parse_bool(directive, one_arg(directive)?)?;
@@ -914,6 +919,7 @@ where
         top_overrides.apply(directive, &zones, &mut seen)?;
     }
     let top_limits = top_overrides.resolve(&LimitSet::default());
+    let top_block = top_block.resolve(&BlockResponse::default());
     let access_logs = resolve_top_access(&access_directives, &formats)?;
 
     if site_directives.is_empty() {
@@ -931,6 +937,7 @@ where
         rules: &top_rules,
         zones: &zones,
         limits: &top_limits,
+        block: &top_block,
     };
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
@@ -1452,6 +1459,8 @@ struct Top<'a> {
     zones: &'a [LimitZone],
     /// The limits of the top level.
     limits: &'a LimitSet,
+    /// The top-level block response, inherited by every site.
+    block: &'a BlockResponse,
 }
 
 /// Reads one `allow` or `deny` directive.
@@ -1525,6 +1534,7 @@ fn parse_site(
     let mut own_rules: Vec<ParsedRule> = Vec::new();
     let mut site_limits = LimitOverrides::default();
     let mut pending_locations = Vec::new();
+    let mut site_block = BlockOverrides::default();
 
     for child in block(directive)? {
         match child.name.as_str() {
@@ -1648,6 +1658,7 @@ fn parse_site(
             name if limits::LIMIT_NAMES.contains(&name) => {
                 site_limits.apply(child, top.zones, &mut seen)?;
             }
+            name if BLOCK_NAMES.contains(&name) => site_block.apply(child, &mut seen)?,
             "location" => pending_locations.push(limits::parse_location(child, top.zones)?),
             "default_server" => {
                 if !child.args.is_empty() {
@@ -1665,6 +1676,7 @@ fn parse_site(
         }
     }
     let site_limit_set = site_limits.resolve(top.limits);
+    let block_response = site_block.resolve(top.block);
     let mut locations: Vec<LocationConfig> = Vec::new();
     for pending in pending_locations {
         let duplicate = locations.iter().any(|earlier| {
@@ -1680,6 +1692,7 @@ fn parse_site(
         locations.push(LocationConfig {
             matcher: pending.matcher,
             limits: pending.overrides.resolve(&site_limit_set),
+            block: pending.block.resolve(&block_response),
         });
     }
 
@@ -1720,6 +1733,7 @@ fn parse_site(
         hosts,
         default_server,
         host_patterns,
+        block: block_response,
         upstream,
         mode,
         action,

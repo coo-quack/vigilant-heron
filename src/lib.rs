@@ -12,6 +12,7 @@
 
 mod access;
 mod accesslog;
+mod block;
 mod body;
 mod conf;
 mod config;
@@ -33,6 +34,7 @@ mod test_support;
 mod transport;
 
 pub use accesslog::LogFormat;
+pub use block::{BlockResponse, BlockStatus};
 pub use config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, DecisionConfig, ErrorLogConfig,
     FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, SiteAction, SiteConfig,

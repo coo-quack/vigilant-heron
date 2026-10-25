@@ -7,6 +7,10 @@
   leading wildcard, then trailing wildcard, then regex precedence. `default_server;`
   marks the one site that takes hosts matching no site (at most one per
   configuration). A name claimed by two sites is still a configuration error.
+- `block_status <code>;` (4xx or 5xx, or 444 to close the connection without a
+  response) and `block_page <file>;` (HTML, at most 64 KiB, read at load time) for
+  blocked requests, at the top level, in a `site` and in a `location`. Limit
+  refusals and access-list denials (403) keep their statuses.
 - Request-rate and connection limits, with nginx's `limit_req` and `limit_conn`
   semantics: `limit_req_zone` and `limit_conn_zone` at the top level, `limit_req`,
   `limit_conn`, their status, dry-run and log-level directives at the top level,
