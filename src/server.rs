@@ -1,23 +1,27 @@
 //! The accept loop and the per-request pipeline.
 //!
-//! The order is fixed: site lookup, body limit, deterministic rules, backend
-//! call, policy. Rules are decided before the backend is called, so no failure
-//! setting can turn a rule block into an allow.
+//! The order is fixed: site lookup, body limit, body sniff, deterministic rules,
+//! backend call, policy, forwarding. Rules are decided before the backend is
+//! called, so no failure setting can turn a rule block into an allow. Only the
+//! first `inspect_body` bytes of a body reach the backend; the rest is streamed
+//! to the upstream after the decision.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::pin;
-use std::sync::Arc;
-use std::time::{Instant, SystemTime};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use http::header::{HOST, HeaderName, HeaderValue, LOCATION};
+use http::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue, LOCATION};
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
+use http_body::Body;
 use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -27,11 +31,10 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 
 use crate::accesslog::{AccessRecord, LogFormat};
-use crate::config::{
-    AccessLogConfig, BackendConfig, Config, DecisionConfig, MAX_REQUEST_ID_BYTES, SiteConfig,
-};
+use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
+use crate::config::{AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, SiteConfig};
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
-use crate::error::{DecisionError, ServeError};
+use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::logsink::{Writer, spawn_writer};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
@@ -40,10 +43,13 @@ use crate::realip::RealIp;
 use crate::router::{Router, normalize_host};
 use crate::sanitize::{self, EventInput, truncate_utf8};
 use crate::system_one::SystemOneBackend;
+use crate::transport::{
+    ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Phase, PhaseCell, Rejection, RejectionSlot, lock,
+};
 
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
 
-type ResponseBody = BoxBody<Bytes, hyper::Error>;
+type ResponseBody = BoxBody<Bytes, BoxError>;
 
 /// A destination's writer with the format its lines use.
 struct Sink {
@@ -55,17 +61,23 @@ struct Sink {
 pub(crate) struct AppState<B> {
     router: Router,
     sites: Vec<SiteConfig>,
-    decision: DecisionConfig,
+    /// Upstream client of each site, in site order.
+    proxies: Vec<Proxy>,
+    /// Bytes of the request body read for the decision.
+    inspect_body_bytes: usize,
+    /// Connection timers and header limits.
+    timers: ClientTimers,
+    /// Requests per connection before it is closed.
+    keepalive_requests: usize,
     /// Header names dropped before the event is sent to the backend.
     backend_redact: Vec<String>,
     backend: B,
-    proxy: Proxy,
     default_status: StatusCode,
     realip: RealIp,
     request_id_header: Option<HeaderName>,
     /// Access logs of each site, in site order.
     site_sinks: Vec<Vec<Sink>>,
-    /// Access logs of requests that match no site.
+    /// Access logs of requests that match no site, and of connections closed by the transport.
     global_sinks: Vec<Sink>,
 }
 
@@ -124,13 +136,20 @@ impl AppState<Backend> {
                 sinks_for(logs)
             })
             .collect();
+        let proxies = config
+            .sites
+            .iter()
+            .map(|site| Proxy::new(&site.timeouts))
+            .collect();
         Ok(Self {
             router: Router::new(&config.sites),
             sites: config.sites,
-            decision: config.decision,
+            proxies,
+            inspect_body_bytes: config.decision.inspect_body_bytes,
+            timers: ClientTimers::from_config(&config.connection),
+            keepalive_requests: config.connection.keepalive_requests,
             backend_redact,
             backend,
-            proxy: Proxy::new(),
             default_status: config.default_status,
             realip: config.realip,
             request_id_header: config.request_id_header,
@@ -186,6 +205,13 @@ pub async fn serve(
     Ok(())
 }
 
+/// State of one connection that its requests share.
+struct Connection {
+    phase: Arc<PhaseCell>,
+    /// Requests started on this connection.
+    served: AtomicUsize,
+}
+
 async fn serve_connection<B: DecisionBackend>(
     state: Arc<AppState<B>>,
     stream: TcpStream,
@@ -193,24 +219,48 @@ async fn serve_connection<B: DecisionBackend>(
     mut stop: watch::Receiver<bool>,
     _permit: OwnedSemaphorePermit,
 ) {
-    let service = service_fn(move |request| {
-        let state = Arc::clone(&state);
-        async move { Ok::<_, Infallible>(handle(&state, peer, request).await) }
+    let started = Instant::now();
+    let phase = Arc::new(PhaseCell::new());
+    let rejection: RejectionSlot = Arc::new(Mutex::new(None));
+    let io = TokioIo::new(ClientIo::new(
+        stream,
+        Arc::clone(&phase),
+        state.timers,
+        Arc::clone(&rejection),
+    ));
+    let connection = Arc::new(Connection {
+        phase,
+        served: AtomicUsize::new(0),
     });
-    let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
-    let mut connection = pin!(connection);
+    let mut builder = http1::Builder::new();
+    builder.keep_alive(state.timers.keep_alive > Duration::ZERO);
+    if state.timers.head.total > HYPER_DEFAULT_BUFFER {
+        builder.max_buf_size(state.timers.head.total);
+    }
+    let service_state = Arc::clone(&state);
+    let service = service_fn(move |request| {
+        let state = Arc::clone(&service_state);
+        let connection = Arc::clone(&connection);
+        async move { Ok::<_, Infallible>(handle(&state, &connection, peer, request).await) }
+    });
+    let connection_future = builder.serve_connection(io, service);
+    let mut connection_future = pin!(connection_future);
     tokio::select! {
-        result = connection.as_mut() => {
+        result = connection_future.as_mut() => {
             if let Err(error) = result {
                 tracing::debug!(%error, %peer, "connection closed with an error");
             }
         }
         _ = stop.changed() => {
-            connection.as_mut().graceful_shutdown();
-            if let Err(error) = connection.as_mut().await {
+            connection_future.as_mut().graceful_shutdown();
+            if let Err(error) = connection_future.as_mut().await {
                 tracing::debug!(%error, %peer, "connection closed with an error during shutdown");
             }
         }
+    }
+    let rejected = lock(&rejection).take();
+    if let Some(rejection) = rejected {
+        write_rejection(&state.global_sinks, rejection, peer, started);
     }
 }
 
@@ -222,26 +272,55 @@ struct Trace<'a> {
     started: Instant,
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the per-request pipeline reads top to bottom; splitting it would scatter the rule-first order"
-)]
+/// Answers one request on a connection and records it.
 async fn handle<B: DecisionBackend>(
     state: &AppState<B>,
+    connection: &Connection,
     peer: SocketAddr,
     request: Request<Incoming>,
 ) -> Response<ResponseBody> {
     let started = Instant::now();
+    connection.phase.set(Phase::Busy);
+    let served = connection
+        .served
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     let client = client_ip(state, request.headers(), peer);
     let request_id = request_id(state, request.headers());
     let remote = peer.ip().to_string();
     let (parts, body) = request.into_parts();
+    let done = Arc::new(AtomicBool::new(body.is_end_stream()));
     let trace = Trace {
         client_ip: &client,
         remote_addr: &remote,
         request_id: request_id.as_deref(),
         started,
     };
+    let mut response = pipeline(state, &parts, body, &done, &trace, peer).await;
+    if served >= state.keepalive_requests {
+        response
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+    }
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        Finish::new(body, Arc::clone(&connection.phase), done).boxed(),
+    )
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the per-request pipeline reads top to bottom; splitting it would scatter the rule-first order"
+)]
+async fn pipeline<B: DecisionBackend>(
+    state: &AppState<B>,
+    parts: &Parts,
+    body: Incoming,
+    done: &Arc<AtomicBool>,
+    trace: &Trace<'_>,
+    peer: SocketAddr,
+) -> Response<ResponseBody> {
     let Some(index) = state.router.lookup(parts.headers.get(HOST)) else {
         let host = parts
             .headers
@@ -250,45 +329,53 @@ async fn handle<B: DecisionBackend>(
             .map(normalize_host)
             .unwrap_or_default();
         return reject(
-            &parts,
-            &trace,
+            parts,
+            trace,
             &host,
             state.default_status,
             "unknown_host",
             &state.global_sinks,
+            !done.load(Ordering::Acquire),
         );
     };
     let Some(site) = state.sites.get(index) else {
+        return status_response(state.default_status, "");
+    };
+    let Some(proxy) = state.proxies.get(index) else {
         return status_response(state.default_status, "");
     };
     let sinks = state
         .site_sinks
         .get(index)
         .map_or(&state.global_sinks[..], Vec::as_slice);
-    let body = match Limited::new(body, state.decision.max_body_bytes)
-        .collect()
-        .await
+    let timeouts = site.timeouts;
+
+    // A Content-Length over the limit is refused before any of the body is read.
+    if let (Some(max), Some(length)) = (timeouts.max_body_bytes, content_length(&parts.headers))
+        && length > u64::try_from(max).unwrap_or(u64::MAX)
     {
-        Ok(collected) => collected.to_bytes(),
-        Err(error) if error.is::<LengthLimitError>() => {
-            return reject(
-                &parts,
-                &trace,
-                site_name(site),
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "body_too_large",
-                sinks,
-            );
-        }
-        Err(_) => {
-            return reject(
-                &parts,
-                &trace,
-                site_name(site),
-                StatusCode::BAD_REQUEST,
-                "unreadable_body",
-                sinks,
-            );
+        return reject(
+            parts,
+            trace,
+            site_name(site),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            sinks,
+            true,
+        );
+    }
+
+    let mut body = ClientBody::new(
+        body,
+        timeouts.client_body_timeout,
+        timeouts.max_body_bytes,
+        Arc::clone(done),
+    );
+    let sniffed = match body.sniff(state.inspect_body_bytes).await {
+        Ok(sniffed) => sniffed,
+        Err(error) => {
+            let (status, reason) = body_failure(error.as_ref());
+            return reject(parts, trace, site_name(site), status, reason, sinks, true);
         }
     };
 
@@ -299,15 +386,20 @@ async fn handle<B: DecisionBackend>(
         &parts.method,
         &path,
         parts.uri.query().is_some(),
-        body.is_empty(),
+        sniffed.is_empty_body(),
     );
-    let assessment = assess(state, site, &parts, &body, &client, screening).await;
+    let assessment = assess(state, site, parts, &sniffed, trace.client_ip, screening).await;
     let decision = policy::decide(site, &path, &assessment);
-    let mut response = respond(state, site, &parts, body, peer, &decision).await;
+    let outcome = respond(proxy, site, parts, body, peer, &decision).await;
+    let mut response = outcome.response;
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
     }
     let fields = verdict_fields(&assessment);
+    let (action, reason) = match outcome.rejected {
+        Some(reason) => ("reject", reason),
+        None => (decision.action.name(), decision.reason.name()),
+    };
     let record = AccessRecord {
         time: SystemTime::now(),
         request_id: trace.request_id,
@@ -322,8 +414,8 @@ async fn handle<B: DecisionBackend>(
         method: parts.method.as_str(),
         path: raw_path,
         status: response.status().as_u16(),
-        action: decision.action.name(),
-        reason: decision.reason.name(),
+        action,
+        reason,
         would_have: decision.would_have.as_ref().map(Action::name),
         attack: fields.attack,
         ai_instruction: fields.ai_instruction,
@@ -331,10 +423,34 @@ async fn handle<B: DecisionBackend>(
         decision_error: fields.decision_error,
         retry_after: fields.retry_after,
         input_tokens: fields.input_tokens,
-        latency_ms: latency(started),
+        upstream_status: outcome.upstream_status,
+        upstream_error: outcome.upstream_error,
+        latency_ms: latency(trace.started),
     };
     write_access(sinks, &record, &parts.headers);
     response
+}
+
+/// What a request was answered with, for the access log.
+struct Outcome {
+    response: Response<ResponseBody>,
+    /// Status the upstream answered with, when it answered.
+    upstream_status: Option<u16>,
+    /// Why the upstream gave no response.
+    upstream_error: Option<&'static str>,
+    /// Set when the request body caused the answer, which then replaces the decision's reason.
+    rejected: Option<&'static str>,
+}
+
+impl Outcome {
+    fn answered(response: Response<ResponseBody>) -> Self {
+        Self {
+            response,
+            upstream_status: None,
+            upstream_error: None,
+            rejected: None,
+        }
+    }
 }
 
 fn latency(started: Instant) -> u64 {
@@ -348,22 +464,34 @@ fn write_access(sinks: &[Sink], record: &AccessRecord<'_>, headers: &HeaderMap) 
     }
 }
 
-async fn respond<B>(
-    state: &AppState<B>,
+/// Adds `Connection: close` to a response that ends the connection.
+fn close(response: &mut Response<ResponseBody>) {
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("close"));
+}
+
+/// Forwards an allowed request, or answers a block or redirect.
+///
+/// `complete` says whether the request body was read in full. When it was not,
+/// the response closes the connection, because the rest of the body would
+/// otherwise be read as the next request.
+async fn respond(
+    proxy: &Proxy,
     site: &SiteConfig,
     parts: &Parts,
-    body: Bytes,
+    body: ClientBody,
     peer: SocketAddr,
     decision: &Decision,
-) -> Response<ResponseBody> {
+) -> Outcome {
+    let complete = body.is_complete();
     match &decision.action {
         Action::Allow => {
             let path_and_query = parts
                 .uri
                 .path_and_query()
                 .map_or("/", |value| value.as_str());
-            match state
-                .proxy
+            match proxy
                 .forward(
                     parts.method.clone(),
                     &parts.headers,
@@ -375,19 +503,85 @@ async fn respond<B>(
                 .await
             {
                 Ok(upstream) => {
+                    let status = upstream.status().as_u16();
                     let (mut upstream_parts, upstream_body) = upstream.into_parts();
                     crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
-                    Response::from_parts(upstream_parts, upstream_body.boxed())
+                    Outcome {
+                        response: Response::from_parts(upstream_parts, upstream_body.boxed()),
+                        upstream_status: Some(status),
+                        upstream_error: None,
+                        rejected: None,
+                    }
                 }
-                Err(_) => status_response(StatusCode::BAD_GATEWAY, ""),
+                Err(error) => failure(&error, complete),
             }
         }
-        Action::Block => status_response(StatusCode::FORBIDDEN, "Forbidden\n"),
+        Action::Block => {
+            let mut response = status_response(StatusCode::FORBIDDEN, "Forbidden\n");
+            if !complete {
+                close(&mut response);
+            }
+            Outcome::answered(response)
+        }
         Action::Redirect(location) => {
             let mut response = status_response(StatusCode::FOUND, "");
             response.headers_mut().insert(LOCATION, location.clone());
-            response
+            if !complete {
+                close(&mut response);
+            }
+            Outcome::answered(response)
         }
+    }
+}
+
+/// Maps a failed forward to the status nginx would send. Upstream timeouts are 504,
+/// connection errors 502, and a client body that failed answers 413, 408 or 400.
+fn failure(error: &ProxyError, complete: bool) -> Outcome {
+    let (status, upstream_error, rejected) = match error {
+        ProxyError::Target(_) | ProxyError::Request(_) => {
+            (StatusCode::BAD_GATEWAY, Some("upstream_failed"), None)
+        }
+        ProxyError::Connect(_) => (StatusCode::BAD_GATEWAY, Some("connect_failed"), None),
+        ProxyError::ReadTimeout => (StatusCode::GATEWAY_TIMEOUT, Some("read_timeout"), None),
+        ProxyError::ConnectTimeout => (StatusCode::GATEWAY_TIMEOUT, Some("connect_timeout"), None),
+        ProxyError::SendTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, Some("send_timeout"), None),
+        ProxyError::Body(BodyFault::TooLarge) => {
+            (StatusCode::PAYLOAD_TOO_LARGE, None, Some("body_too_large"))
+        }
+        ProxyError::Body(BodyFault::TimedOut) => {
+            (StatusCode::REQUEST_TIMEOUT, None, Some("body_timeout"))
+        }
+        ProxyError::Body(BodyFault::Failed) => {
+            (StatusCode::BAD_REQUEST, None, Some("unreadable_body"))
+        }
+    };
+    let mut response = status_response(status, "");
+    // A request body that did not arrive in full cannot be followed by another request.
+    if !complete || rejected.is_some() {
+        close(&mut response);
+    }
+    Outcome {
+        response,
+        upstream_status: None,
+        upstream_error,
+        rejected,
+    }
+}
+
+/// The status and reason for a request body that could not be read.
+fn body_failure(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> (StatusCode, &'static str) {
+    if error.downcast_ref::<BodyTooLarge>().is_some() {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "body_too_large");
+    }
+    let timed_out = error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut);
+    if timed_out {
+        (StatusCode::REQUEST_TIMEOUT, "body_timeout")
+    } else {
+        (StatusCode::BAD_REQUEST, "unreadable_body")
     }
 }
 
@@ -395,7 +589,7 @@ async fn assess<B: DecisionBackend>(
     state: &AppState<B>,
     site: &SiteConfig,
     parts: &Parts,
-    body: &Bytes,
+    sniffed: &Sniffed,
     client_ip: &str,
     screening: Screening,
 ) -> Assessment {
@@ -409,11 +603,12 @@ async fn assess<B: DecisionBackend>(
                 path: parts.uri.path(),
                 query: parts.uri.query(),
                 headers: &parts.headers,
-                body,
+                body: &sniffed.prefix,
+                body_continues: sniffed.truncated,
                 host,
                 client_ip,
                 redact_headers: &state.backend_redact,
-                inspect_body_bytes: state.decision.inspect_body_bytes,
+                inspect_body_bytes: state.inspect_body_bytes,
             });
             match state.backend.decide(&event).await {
                 Ok(verdict) => Assessment::Model(verdict),
@@ -446,6 +641,17 @@ fn request_id<B>(state: &AppState<B>, headers: &HeaderMap) -> Option<String> {
     let value = String::from_utf8_lossy(headers.get(name)?.as_bytes()).into_owned();
     let (value, _cut) = truncate_utf8(value, MAX_REQUEST_ID_BYTES);
     (!value.is_empty()).then_some(value)
+}
+
+/// The value of a valid `Content-Length` header.
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn site_name(site: &SiteConfig) -> &str {
@@ -489,6 +695,8 @@ fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
 }
 
 /// Answers a request that never reached a decision, and logs it as a rejection.
+///
+/// `closing` adds `Connection: close`, for a request whose body was not read in full.
 fn reject(
     parts: &Parts,
     trace: &Trace<'_>,
@@ -496,6 +704,7 @@ fn reject(
     status: StatusCode,
     reason: &str,
     sinks: &[Sink],
+    closing: bool,
 ) -> Response<ResponseBody> {
     let record = AccessRecord {
         time: SystemTime::now(),
@@ -520,10 +729,45 @@ fn reject(
         decision_error: None,
         retry_after: None,
         input_tokens: None,
+        upstream_status: None,
+        upstream_error: None,
         latency_ms: latency(trace.started),
     };
     write_access(sinks, &record, &parts.headers);
-    status_response(status, "")
+    let mut response = status_response(status, "");
+    if closing {
+        close(&mut response);
+    }
+    response
+}
+
+/// Logs a response the transport sent on its own, such as a 408 or a 414.
+fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, started: Instant) {
+    let remote = peer.ip().to_string();
+    let record = AccessRecord {
+        time: SystemTime::now(),
+        request_id: None,
+        client_ip: &remote,
+        remote_addr: &remote,
+        site: "",
+        host: "",
+        method: "",
+        path: "",
+        status: rejection.status,
+        action: "reject",
+        reason: rejection.reason,
+        would_have: None,
+        attack: None,
+        ai_instruction: None,
+        category: None,
+        decision_error: None,
+        retry_after: None,
+        input_tokens: None,
+        upstream_status: None,
+        upstream_error: None,
+        latency_ms: latency(started),
+    };
+    write_access(sinks, &record, &HeaderMap::new());
 }
 
 fn add_debug_header(headers: &mut HeaderMap, decision: &Decision) {
@@ -567,10 +811,11 @@ decision {
     url http://127.0.0.1:9/decide;
     timeout 150ms;
     inspect_body 512;
-    max_body 1024;
 }
 
 default_status 421;
+
+client_max_body_size 1024;
 
 site example.com {
     upstream http://127.0.0.1:9;

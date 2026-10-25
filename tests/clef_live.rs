@@ -41,6 +41,7 @@ async fn live_proxy(
         r#"
 listen 127.0.0.1:0;
 
+client_max_body_size 10485760;
 decision {{
     backend clef;
     model clef-flash;
@@ -48,7 +49,6 @@ decision {{
     api_token_env "{TOKEN_ENV}";
     timeout 10000ms;
     inspect_body 8192;
-    max_body 10485760;
 }}
 
 default_status 421;

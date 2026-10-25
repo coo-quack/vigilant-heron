@@ -6,7 +6,9 @@
 //! speaks the Jev protocol and answers with a bare result. Both require the
 //! bearer token `test-token`. Both use the same fixed substring rules, so the e2e tests
 //! see the same scores on every run. Requests whose path contains `/slow` are
-//! held for one second before the answer.
+//! held for one second before the answer. Any `POST /echo/...` is an upstream
+//! for the e2e upload site: it answers with the length and FNV-1a hash of the body
+//! it received, so the test can check the body arrived intact.
 
 use std::convert::Infallible;
 use std::sync::OnceLock;
@@ -28,6 +30,7 @@ const LISTEN: &str = "0.0.0.0:9000";
 const DECIDE_PATH: &str = "/decide";
 const CLEF_PATH: &str = "/client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash";
 const JEV_PATH: &str = "/v1/systemone";
+const ECHO_PREFIX: &str = "/echo/";
 const BEARER_TOKEN: &str = "Bearer test-token";
 const ATTACK_MARKERS: [&str; 4] = ["' or 1=1", "<script", "../", "union select"];
 const INSTRUCTION_MARKERS: [&str; 2] = ["ignore previous", "answer benign"];
@@ -68,6 +71,9 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
             &json!({"error": "method"}),
         ));
     }
+    if request.uri().path().starts_with(ECHO_PREFIX) {
+        return Ok(echo(request).await);
+    }
     let authorized = request
         .headers()
         .get(AUTHORIZATION)
@@ -107,6 +113,21 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
         return Ok(jev(&payload).await);
     }
     Ok(clef(&payload).await)
+}
+
+/// Answers with the length and FNV-1a hash of the request body, as a decimal string.
+async fn echo(request: Request<Incoming>) -> Response<Full<Bytes>> {
+    let Ok(collected) = request.into_body().collect().await else {
+        return reply(StatusCode::BAD_REQUEST, &json!({"error": "body"}));
+    };
+    let body = collected.to_bytes();
+    let hash = body.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    reply(
+        StatusCode::OK,
+        &json!({"length": body.len(), "hash": hash.to_string()}),
+    )
 }
 
 /// The router's JSON protocol: `{"event": {"untrusted": {...}}}` in, scores out.

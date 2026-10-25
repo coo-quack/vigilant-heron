@@ -60,8 +60,10 @@ pub(crate) struct EventInput<'a> {
     pub(crate) query: Option<&'a str>,
     /// Request headers.
     pub(crate) headers: &'a HeaderMap,
-    /// Request body, already read in full.
+    /// The start of the request body. Shorter than the whole body when `body_continues` is set.
     pub(crate) body: &'a [u8],
+    /// Whether the request body continues past `body`.
+    pub(crate) body_continues: bool,
     /// Normalized host of the matched site.
     pub(crate) host: &'a str,
     /// Client address for logs and the backend.
@@ -79,7 +81,8 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     let redacted = redact_body(content_type, input.body);
-    let (body, body_truncated) = truncate_utf8(redacted, input.inspect_body_bytes);
+    let (body, cut) = truncate_utf8(redacted, input.inspect_body_bytes);
+    let body_truncated = cut || input.body_continues;
     DecisionEvent {
         event: Event {
             untrusted: Untrusted {
@@ -597,6 +600,7 @@ mod tests {
             query: Some("a=1"),
             headers: &headers,
             body: b"0123456789",
+            body_continues: false,
             host: "example.com",
             client_ip: "203.0.113.7",
             redact_headers: &[],
@@ -618,6 +622,7 @@ mod tests {
             query: None,
             headers: &headers,
             body: b"",
+            body_continues: false,
             host: "example.com",
             client_ip: "203.0.113.7",
             redact_headers: &[],

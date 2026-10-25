@@ -137,13 +137,28 @@ impl DecisionError {
     }
 }
 
-/// Why an upstream request could not be sent.
+/// Why an upstream request could not be sent or answered.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProxyError {
     /// The request target built from the upstream is not a valid URI.
     #[error("upstream request target is invalid")]
     Target(#[from] http::uri::InvalidUri),
-    /// The upstream could not be reached or did not answer.
+    /// No response head arrived within `proxy_read_timeout`.
+    #[error("upstream did not answer within proxy_read_timeout")]
+    ReadTimeout,
+    /// The connection to the upstream was not made within `proxy_connect_timeout`.
+    #[error("upstream connection timed out within proxy_connect_timeout")]
+    ConnectTimeout,
+    /// The connection to the upstream failed.
+    #[error("upstream connection failed")]
+    Connect(#[source] hyper_util::client::legacy::Error),
+    /// The upstream stopped accepting the request within `proxy_send_timeout`.
+    #[error("upstream write timed out within proxy_send_timeout")]
+    SendTimeout(#[source] hyper_util::client::legacy::Error),
+    /// The request failed after the connection was made.
     #[error("upstream request failed")]
     Request(#[source] hyper_util::client::legacy::Error),
+    /// The client's request body could not be forwarded in full.
+    #[error("client request body could not be forwarded")]
+    Body(crate::body::BodyFault),
 }

@@ -34,6 +34,7 @@ fn jev_config(fake_url: &str, upstream_url: &str, token: &'static str) -> Result
         r#"
 listen 127.0.0.1:0;
 
+client_max_body_size 1024;
 decision {{
     backend jev;
     model jev-latest;
@@ -41,7 +42,6 @@ decision {{
     api_token_env "{TOKEN_ENV}";
     timeout 2000ms;
     inspect_body 512;
-    max_body 1024;
 }}
 
 default_status 421;

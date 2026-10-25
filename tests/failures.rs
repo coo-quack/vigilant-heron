@@ -55,6 +55,7 @@ impl Setup {
             r#"
 listen 127.0.0.1:0;
 
+client_max_body_size 1024;
 decision {{
     backend jev;
     model jev-latest;
@@ -64,7 +65,6 @@ decision {{
     max_concurrency {concurrency};
     queue_timeout {queue}ms;
     inspect_body 512;
-    max_body 1024;
 }}
 
 default_status 421;

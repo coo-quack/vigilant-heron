@@ -60,11 +60,11 @@ listen 127.0.0.1:0;
 request_id_header x-request-id;
 access_log {log} json;
 
+client_max_body_size 1024;
 decision {{
         {backend_lines}
         timeout 300ms;
         inspect_body 512;
-        max_body 1024;
 }}
 
 site example.com {{
@@ -224,6 +224,7 @@ listen 127.0.0.1:0;
 request_id_header x-request-id;
 access_log {log} json;
 
+client_max_body_size 1024;
 decision {{
         backend jev;
         api_token_env {TOKEN_ENV};
@@ -231,7 +232,6 @@ decision {{
         timeout 300ms;
         max_concurrency 1;
         inspect_body 512;
-        max_body 1024;
 }}
 
 site example.com {{

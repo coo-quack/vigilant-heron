@@ -325,6 +325,7 @@ mod tests {
             query: Some("q=1"),
             headers: &headers,
             body,
+            body_continues: false,
             host: "example.com",
             client_ip: "203.0.113.7",
             redact_headers: &[],
