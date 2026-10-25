@@ -1,0 +1,466 @@
+//! The accept loop and the per-request pipeline.
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::pin;
+use std::sync::Arc;
+use std::time::Instant;
+
+use bytes::Bytes;
+use http::header::{HOST, HeaderName, HeaderValue, LOCATION};
+use http::request::Parts;
+use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http_body_util::combinators::BoxBody;
+use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::task::JoinSet;
+
+use crate::config::{Config, DecisionConfig, SiteConfig};
+use crate::decision::{DecisionBackend, HttpDecisionBackend};
+use crate::error::ServeError;
+use crate::policy::{self, Action, Assessment, Decision};
+use crate::prefilter::{self, Screening};
+use crate::proxy::Proxy;
+use crate::router::{Router, normalize_host};
+use crate::sanitize::{self, EventInput};
+
+/// Upper bound on connections served at the same time.
+const MAX_CONNECTIONS: usize = 1024;
+
+const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
+
+type ResponseBody = BoxBody<Bytes, hyper::Error>;
+
+/// Shared state for every connection.
+pub(crate) struct AppState<B> {
+    router: Router,
+    sites: Vec<SiteConfig>,
+    decision: DecisionConfig,
+    backend: B,
+    proxy: Proxy,
+    default_status: StatusCode,
+    client_ip_header: Option<HeaderName>,
+}
+
+impl AppState<HttpDecisionBackend> {
+    fn from_config(config: Config) -> Self {
+        let backend =
+            HttpDecisionBackend::new(config.decision.url.clone(), config.decision.timeout);
+        Self {
+            router: Router::new(&config.sites),
+            sites: config.sites,
+            decision: config.decision,
+            backend,
+            proxy: Proxy::new(),
+            default_status: config.default_status,
+            client_ip_header: config.client_ip_header,
+        }
+    }
+}
+
+/// Serves requests on `listener` until `shutdown` completes.
+///
+/// Requests in flight when `shutdown` completes are finished before this returns.
+///
+/// # Errors
+///
+/// Returns [`ServeError::Accept`] when the listener fails to accept a connection.
+pub async fn serve(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServeError> {
+    serve_with_limit(listener, config, shutdown, MAX_CONNECTIONS).await
+}
+
+/// Runs [`serve`] with at most `max_connections` connections open at once.
+pub(crate) async fn serve_with_limit(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+    max_connections: usize,
+) -> Result<(), ServeError> {
+    let state = Arc::new(AppState::from_config(config));
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let slots = Arc::new(Semaphore::new(max_connections));
+    let mut shutdown = pin!(shutdown);
+    let mut connections = JoinSet::new();
+    loop {
+        // Both waits race with shutdown, so a full connection limit cannot block the stop.
+        let permit = tokio::select! {
+            () = &mut shutdown => break,
+            permit = Arc::clone(&slots).acquire_owned() => {
+                permit.map_err(|_| ServeError::Accept(std::io::Error::other("connection limiter closed")))?
+            }
+        };
+        let (stream, peer) = tokio::select! {
+            () = &mut shutdown => break,
+            accepted = listener.accept() => accepted.map_err(ServeError::Accept)?,
+        };
+        connections.spawn(serve_connection(
+            Arc::clone(&state),
+            stream,
+            peer,
+            stop_rx.clone(),
+            permit,
+        ));
+        while connections.try_join_next().is_some() {}
+    }
+    // Ignoring the send result is fine: it only fails when no connection is listening.
+    let _ = stop_tx.send(true);
+    while connections.join_next().await.is_some() {}
+    Ok(())
+}
+
+async fn serve_connection<B: DecisionBackend>(
+    state: Arc<AppState<B>>,
+    stream: TcpStream,
+    peer: SocketAddr,
+    mut stop: watch::Receiver<bool>,
+    _permit: OwnedSemaphorePermit,
+) {
+    let service = service_fn(move |request| {
+        let state = Arc::clone(&state);
+        async move { Ok::<_, Infallible>(handle(&state, peer, request).await) }
+    });
+    let connection = http1::Builder::new().serve_connection(TokioIo::new(stream), service);
+    let mut connection = pin!(connection);
+    tokio::select! {
+        result = connection.as_mut() => {
+            if let Err(error) = result {
+                tracing::debug!(%error, %peer, "connection closed with an error");
+            }
+        }
+        _ = stop.changed() => {
+            connection.as_mut().graceful_shutdown();
+            if let Err(error) = connection.as_mut().await {
+                tracing::debug!(%error, %peer, "connection closed with an error during shutdown");
+            }
+        }
+    }
+}
+
+async fn handle<B: DecisionBackend>(
+    state: &AppState<B>,
+    peer: SocketAddr,
+    request: Request<Incoming>,
+) -> Response<ResponseBody> {
+    let started = Instant::now();
+    let client_ip = client_ip(state, request.headers(), peer);
+    let (parts, body) = request.into_parts();
+    let Some(site) = state
+        .router
+        .lookup(parts.headers.get(HOST))
+        .and_then(|index| state.sites.get(index))
+    else {
+        let host = parts
+            .headers
+            .get(HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(normalize_host)
+            .unwrap_or_default();
+        return reject(
+            &parts,
+            &client_ip,
+            &host,
+            state.default_status,
+            "unknown_host",
+            started,
+        );
+    };
+    let body = match Limited::new(body, state.decision.max_body_bytes)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) if error.is::<LengthLimitError>() => {
+            return reject(
+                &parts,
+                &client_ip,
+                site_name(site),
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                started,
+            );
+        }
+        Err(_) => {
+            return reject(
+                &parts,
+                &client_ip,
+                site_name(site),
+                StatusCode::BAD_REQUEST,
+                "unreadable_body",
+                started,
+            );
+        }
+    };
+
+    let raw_path = parts.uri.path();
+    let path = prefilter::normalized_path(raw_path);
+    let screening = prefilter::screen(
+        site,
+        &parts.method,
+        &path,
+        parts.uri.query().is_some(),
+        body.is_empty(),
+    );
+    let assessment = assess(state, site, &parts, &body, &client_ip, screening).await;
+    let decision = policy::decide(site, &path, &assessment);
+    let mut response = respond(state, site, &parts, body, peer, &decision).await;
+    if site.debug_headers {
+        add_debug_header(response.headers_mut(), &decision);
+    }
+    let (attack, ai_instruction) = scores(&assessment);
+    emit(&LogRecord {
+        site: site_name(site),
+        method: &parts.method,
+        path: raw_path,
+        action: decision.action.name(),
+        reason: decision.reason.name(),
+        would_have: decision.would_have.as_ref().map_or("none", Action::name),
+        attack,
+        ai_instruction,
+        client_ip: &client_ip,
+        started,
+    });
+    response
+}
+
+async fn respond<B>(
+    state: &AppState<B>,
+    site: &SiteConfig,
+    parts: &Parts,
+    body: Bytes,
+    peer: SocketAddr,
+    decision: &Decision,
+) -> Response<ResponseBody> {
+    match &decision.action {
+        Action::Allow => {
+            let path_and_query = parts
+                .uri
+                .path_and_query()
+                .map_or("/", |value| value.as_str());
+            match state
+                .proxy
+                .forward(
+                    parts.method.clone(),
+                    &parts.headers,
+                    path_and_query,
+                    body,
+                    &site.upstream,
+                    peer.ip(),
+                )
+                .await
+            {
+                Ok(upstream) => {
+                    let (mut upstream_parts, upstream_body) = upstream.into_parts();
+                    crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
+                    Response::from_parts(upstream_parts, upstream_body.boxed())
+                }
+                Err(_) => status_response(StatusCode::BAD_GATEWAY, ""),
+            }
+        }
+        Action::Block => status_response(StatusCode::FORBIDDEN, "Forbidden\n"),
+        Action::Redirect(location) => {
+            let mut response = status_response(StatusCode::FOUND, "");
+            response.headers_mut().insert(LOCATION, location.clone());
+            response
+        }
+    }
+}
+
+async fn assess<B: DecisionBackend>(
+    state: &AppState<B>,
+    site: &SiteConfig,
+    parts: &Parts,
+    body: &Bytes,
+    client_ip: &str,
+    screening: Screening,
+) -> Assessment {
+    match screening {
+        Screening::Rule => Assessment::Rule,
+        Screening::Skip => Assessment::Skip,
+        Screening::Inspect => {
+            let host = site.hosts.first().map_or("", String::as_str);
+            let event = sanitize::build_event(&EventInput {
+                method: &parts.method,
+                path: parts.uri.path(),
+                query: parts.uri.query(),
+                headers: &parts.headers,
+                body,
+                host,
+                client_ip,
+                redact_headers: &state.decision.redact_headers,
+                inspect_body_bytes: state.decision.inspect_body_bytes,
+            });
+            match state.backend.decide(&event).await {
+                Ok(verdict) => Assessment::Model(verdict),
+                Err(_) => Assessment::ModelFailed,
+            }
+        }
+    }
+}
+
+fn client_ip<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> String {
+    state
+        .client_ip_header
+        .as_ref()
+        .and_then(|name| headers.get(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map_or_else(|| peer.ip().to_string(), str::to_owned)
+}
+
+fn site_name(site: &SiteConfig) -> &str {
+    site.hosts.first().map_or("", String::as_str)
+}
+
+fn scores(assessment: &Assessment) -> (Option<f64>, Option<f64>) {
+    match assessment {
+        Assessment::Model(verdict) => (
+            Some(verdict.attack.value()),
+            Some(verdict.ai_instruction.value()),
+        ),
+        _ => (None, None),
+    }
+}
+
+/// Answers a request that never reached a decision, and logs it as a rejection.
+fn reject(
+    parts: &Parts,
+    client_ip: &str,
+    site: &str,
+    status: StatusCode,
+    reason: &str,
+    started: Instant,
+) -> Response<ResponseBody> {
+    emit(&LogRecord {
+        site,
+        method: &parts.method,
+        path: parts.uri.path(),
+        action: "reject",
+        reason,
+        would_have: "none",
+        attack: None,
+        ai_instruction: None,
+        client_ip,
+        started,
+    });
+    status_response(status, "")
+}
+
+fn add_debug_header(headers: &mut HeaderMap, decision: &Decision) {
+    let would_have = decision.would_have.as_ref().map_or("none", Action::name);
+    let value = format!(
+        "action={}; reason={}; would_have={would_have}",
+        decision.action.name(),
+        decision.reason.name()
+    );
+    if let Ok(value) = HeaderValue::from_str(&value) {
+        headers.insert(DEBUG_HEADER, value);
+    }
+}
+
+/// The fields of the one `vigilant_heron::decision` event written per request.
+struct LogRecord<'a> {
+    site: &'a str,
+    method: &'a Method,
+    path: &'a str,
+    action: &'a str,
+    reason: &'a str,
+    would_have: &'a str,
+    attack: Option<f64>,
+    ai_instruction: Option<f64>,
+    client_ip: &'a str,
+    started: Instant,
+}
+
+fn emit(record: &LogRecord<'_>) {
+    let latency_ms = u64::try_from(record.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        target: "vigilant_heron::decision",
+        site = record.site,
+        method = %record.method,
+        path = record.path,
+        action = record.action,
+        reason = record.reason,
+        would_have = record.would_have,
+        attack = record.attack,
+        ai_instruction = record.ai_instruction,
+        latency_ms,
+        client_ip = record.client_ip,
+    );
+}
+
+fn status_response(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
+    let mut response = Response::new(
+        Full::new(Bytes::from_static(body.as_bytes()))
+            .map_err(|never: Infallible| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = status;
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::time::Duration;
+
+    use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    const CONFIG: &str = r#"
+listen = "127.0.0.1:0"
+
+[decision]
+url = "http://127.0.0.1:9/decide"
+timeout_ms = 150
+inspect_body_bytes = 512
+max_body_bytes = 1024
+
+[default]
+status = 421
+
+[[sites]]
+hosts = ["example.com"]
+upstream = "http://127.0.0.1:9"
+mode = "enforce"
+action = "block"
+block_threshold = 0.9
+instruction_threshold = 0.5
+"#;
+
+    #[tokio::test]
+    async fn shutdown_returns_promptly_while_every_connection_slot_is_busy()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let config = Config::from_toml_str(CONFIG)?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        // An idle connection takes the only slot and never sends a request.
+        let _idle = TcpStream::connect(addr).await?;
+        let (stop, stop_rx) = oneshot::channel::<()>();
+        let task = tokio::spawn(serve_with_limit(
+            listener,
+            config,
+            async {
+                let _ = stop_rx.await;
+            },
+            1,
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = stop.send(());
+        let joined = tokio::time::timeout(Duration::from_secs(5), task).await?;
+        joined??;
+        Ok(())
+    }
+}

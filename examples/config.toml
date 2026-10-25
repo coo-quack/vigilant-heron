@@ -1,0 +1,78 @@
+# Sample configuration for vigilant-heron. Every key below is documented;
+# values shown are the defaults unless noted otherwise.
+
+# Address the proxy binds to. Put nginx or Cloudflare in front of it.
+listen = "0.0.0.0:8080"
+
+# Format of the log output: "json" (one object per line) or "pretty".
+log_format = "json"
+
+# Optional. Header that carries the real client address set by a trusted
+# proxy, such as nginx's X-Real-IP. Used for logs only. When the header is
+# absent, the peer address is used.
+client_ip_header = "x-real-ip"
+
+[decision]
+# Absolute http:// URI of the decision backend. The proxy posts one JSON
+# request per inspected request and expects {"attack": f64, "ai_instruction": f64}.
+url = "http://stub-decider:9000/decide"
+
+# Time allowed for the whole decision exchange. A timeout counts as a
+# backend failure and follows each site's fail-open or fail-closed rules.
+timeout_ms = 150
+
+# Bytes of the request body that are sent to the backend. The rest is cut
+# on a UTF-8 character boundary and body_truncated is set.
+inspect_body_bytes = 8192
+
+# Largest request body the proxy reads. Larger bodies get 413.
+max_body_bytes = 10485760
+
+# Extra header names to drop before the event is sent to the backend.
+# Matching is case-insensitive. cookie, authorization, proxy-authorization,
+# x-api-key and x-auth-token are always dropped.
+redact_headers = []
+
+[default]
+# Status for requests whose Host matches no site. Must be 4xx or 5xx.
+status = 421
+
+[[sites]]
+# Host names that select this site. Case, port and a trailing dot are ignored.
+hosts = ["example.com", "www.example.com"]
+
+# Absolute http:// URI that allowed requests are forwarded to.
+upstream = "http://upstream:80"
+
+# "enforce" applies the verdict. "shadow" forwards everything and only
+# records what would have happened.
+mode = "enforce"
+
+# What an attack gets: "block" (403) or "redirect" (302 to redirect_to).
+action = "block"
+
+# Required only with action = "redirect"; must be a valid header value.
+# redirect_to = "https://example.com/blocked"
+
+# Attack score at or above which the request counts as an attack (0..=1).
+block_threshold = 0.9
+
+# AI instruction score at or above which the request counts as an attack (0..=1).
+instruction_threshold = 0.5
+
+# Path prefixes that are always blocked, without calling the backend.
+# Matched against the normalized path: one percent-decode, dot segments
+# resolved, repeated slashes merged, then lowercased.
+deny_paths = ["/xmlrpc.php"]
+
+# Path prefixes that are blocked when the backend fails or times out,
+# matched against the normalized path like deny_paths.
+# All other paths are forwarded in that case (fail open).
+fail_closed_paths = ["/wp-login.php", "/wp-admin"]
+
+# File extensions of GET or HEAD requests with no query and no body that
+# skip the backend. The default list is shown here.
+static_extensions = ["css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "woff", "woff2", "ttf", "map"]
+
+# When true, responses carry x-vigilant-heron with action, reason and would_have.
+debug_headers = false

@@ -1,0 +1,20 @@
+# build output
+/target/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editor
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# worktrees
+.worktrees/
+
+# env
+*.local
+.env
+.env.*
