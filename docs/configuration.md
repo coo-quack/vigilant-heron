@@ -105,7 +105,11 @@ Peers whose real-IP header is believed. Repeatable.
 - **Default:** `X-Real-IP`.
 - **Context:** top level.
 
-Header that holds the client address when the peer is in `real_ip_from`.
+Header that holds the client address when the peer is in `real_ip_from`. When the
+header comes in several lines, all of them are read in the order received and
+joined with commas, as nginx does. A proxy that appends its own line is therefore
+seen last. If any line is not valid text, the header is ignored and the peer is
+the client.
 
 ### `real_ip_recursive`
 

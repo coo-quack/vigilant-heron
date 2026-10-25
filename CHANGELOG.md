@@ -138,3 +138,8 @@
   built-in `main` format quotes `category`, `retry_after` and `request_id`, so a
   client-chosen request id with spaces and `=` cannot add fields. Log lines in the
   `main` format change for those three values (their values are now quoted).
+- Security (F3): every line of `real_ip_header` is read, in order, and the lines are
+  joined with commas before the right-to-left choice. Previously only the first
+  line was read, so a trusted proxy that appended its own line (HAProxy's
+  `option forwardfor`) could not stop a client from choosing its address. A
+  malformed line makes the whole header ignored, as before.

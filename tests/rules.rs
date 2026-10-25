@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::{BoxError, StubBehavior, StubDecider, TestResult, Upstream, send, start_proxy};
 use http::{Method, StatusCode};
+use rstest::rstest;
 use serde_json::Value;
 
 /// A unique file path under the temp directory.
@@ -192,6 +193,54 @@ async fn the_access_list_uses_the_realip_client_address() -> TestResult {
     .await?;
     assert_eq!(inside.status, StatusCode::OK);
     proxy.stop().await
+}
+
+/// Sends a request from the loopback test client with the given `X-Real-IP` lines, and returns the status.
+async fn realip_status(top: &str, lines: &[&str], name: &str) -> Result<StatusCode, BoxError> {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path(name);
+    let _ = std::fs::remove_file(&log);
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        top,
+        "    allow 192.0.2.0/24;\n    deny all;",
+    ))
+    .await?;
+    let headers: Vec<(&str, &str)> = lines.iter().map(|value| ("x-real-ip", *value)).collect();
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "example.com",
+        &headers,
+        Bytes::new(),
+    )
+    .await?;
+    proxy.stop().await?;
+    Ok(reply.status)
+}
+
+#[rstest]
+// The edge (127.0.0.1, trusted) appended its line after the client's own line.
+#[case::edge_appended_line_wins("", &["192.0.2.5", "203.0.113.9"], StatusCode::FORBIDDEN)]
+// A single line is read as before.
+#[case::single_line("", &["192.0.2.5"], StatusCode::OK)]
+// Recursive: the right-most address that is not a trusted proxy is the client.
+#[case::recursive_skips_trusted_hops("real_ip_recursive on;", &["192.0.2.5", "203.0.113.9, 127.0.0.2"], StatusCode::FORBIDDEN)]
+// One malformed line makes the whole header untrusted, so the peer is the client.
+#[case::malformed_line_uses_the_peer("", &["192.0.2.5", "not-an-address"], StatusCode::FORBIDDEN)]
+#[tokio::test]
+async fn every_real_ip_header_line_is_read(
+    #[case] top: &str,
+    #[case] lines: &[&str],
+    #[case] expected: StatusCode,
+) -> TestResult {
+    let name = format!("realip-lines-{}", lines.len());
+    assert_eq!(realip_status(top, lines, &name).await?, expected);
+    Ok(())
 }
 
 #[tokio::test]

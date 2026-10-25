@@ -1093,11 +1093,18 @@ async fn assess<B: DecisionBackend>(
 }
 
 /// The client address chosen by the realip settings.
+///
+/// Every line of the realip header is read, in the order received, and joined with
+/// commas, so a trusted proxy that appends its own line is seen after the client's
+/// lines. A line that is not valid text makes the whole header untrusted.
 fn client_addr<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
-    let header = headers
-        .get(&state.realip.header)
-        .and_then(|value| value.to_str().ok());
-    state.realip.client_ip(peer.ip(), header)
+    let lines: Option<Vec<&str>> = headers
+        .get_all(&state.realip.header)
+        .iter()
+        .map(|value| value.to_str().ok())
+        .collect();
+    let joined = lines.map(|lines| lines.join(", "));
+    state.realip.client_ip(peer.ip(), joined.as_deref())
 }
 
 /// The host of the request, normalized, or an empty string when it has none.
