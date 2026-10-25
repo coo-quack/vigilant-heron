@@ -17,19 +17,56 @@ For every request, the router:
 
 1. Selects a site by `Host`. Unknown hosts get the configured status (421).
 2. Applies deterministic rules on the normalized path: `deny_paths` are
-   blocked without calling the model; plain GET/HEAD requests for static
+   blocked without calling the backend; plain GET/HEAD requests for static
    assets skip it.
 3. Sends a sanitized copy of the request to the decision backend: credential
    headers are dropped, password- and token-like fields are redacted, the body
    is truncated, and all client data sits under an `untrusted` field.
 4. Applies the site's policy to the returned scores (`attack`,
    `ai_instruction`): block (403), redirect (302), or forward. When the
-   backend fails, `fail_closed_paths` are blocked and other paths are
-   forwarded.
+   backend fails, the failure settings decide (see [Failure behavior](#failure-behavior)).
 5. Logs one `vigilant_heron::decision` event per request.
 
-In `shadow` mode every request is forwarded, and the log and optional debug
-header record what would have happened.
+Every deterministic rule runs in step 2, before the backend is called, and no
+failure setting changes its result: a rule block stays a block when the backend
+rate-limits, errors, is unreachable or is saturated. New rule types must follow
+the same rule. In `shadow` mode every request is forwarded, rules included, and
+the log and optional debug header record what would have happened.
+
+## Failure behavior
+
+A decision fails when the backend answers HTTP 429, when no concurrency slot is
+free within `timeout_ms`, or when it fails in any other way. The two groups have
+their own site settings, both `"allow"` by default:
+
+- `on_rate_limit`: the 429 and "no slot in time" group
+- `on_decision_error`: timeouts, connection errors, other non-2xx statuses,
+  malformed or out-of-range answers
+
+`fail_closed_paths` wins over both: a failure on such a path is always blocked.
+A blocked failure uses the site's `action`. The decision log records the
+outcome in `reason` (`rate_limited_allowed`, `decision_error_blocked`,
+`fail_closed_path`, ...) and the specific cause in `decision_error` (`rate_limited`,
+`backend_busy`, `timeout`, `http_status`, `parse`, ...).
+
+## Concurrency
+
+| Setting | Limits | Default |
+|---|---|---|
+| `max_connections` | client connections open at the same time | 1024 |
+| `worker_threads` | runtime threads that run the proxy | one per CPU core |
+| `decision.max_concurrency` | decision-backend calls in flight at the same time; waiting counts against `timeout_ms` | 64 |
+
+The defaults are: `decision.backend = "jev"` (its URL, model and token variable
+are set by default too), `timeout_ms = 300`, `block_threshold = 0.87`,
+`instruction_threshold = 0.8`, and both failure settings `"allow"`. Configs that
+want the JSON protocol must set `backend = "http"`.
+
+## Evaluation
+
+The first measurement of Clef-flash and Jev on the labelled dataset is in
+[`eval/reports/2026-10-25-clef-flash-vs-jev.md`](eval/reports/2026-10-25-clef-flash-vs-jev.md).
+The harness is described in [`eval/README.md`](eval/README.md).
 
 ## Configuration
 

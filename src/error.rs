@@ -130,6 +130,21 @@ pub enum ConfigError {
         /// Value that was rejected.
         value: String,
     },
+    /// `worker_threads` is zero.
+    #[error("worker_threads must be at least 1 when set")]
+    ZeroWorkerThreads,
+    /// `max_connections` is zero.
+    #[error("max_connections must be at least 1")]
+    ZeroMaxConnections,
+    /// `decision.max_concurrency` is zero.
+    #[error("decision.max_concurrency must be at least 1")]
+    ZeroMaxConcurrency,
+    /// `request_id_header` is not a valid header name.
+    #[error("request_id_header is not a valid header name: {value:?}")]
+    InvalidRequestIdHeader {
+        /// Value that was rejected.
+        value: String,
+    },
     /// `decision.timeout_ms` is zero.
     #[error("decision.timeout_ms must be greater than 0")]
     ZeroTimeout,
@@ -176,6 +191,15 @@ pub(crate) enum DecisionError {
     /// The backend did not answer in time.
     #[error("decision backend did not answer within the timeout")]
     Timeout,
+    /// No local concurrency slot became free within the timeout.
+    #[error("no decision slot became free within the timeout")]
+    Busy,
+    /// The backend answered HTTP 429. `Retry-After` is kept for the log only.
+    #[error("decision backend rate-limited the request")]
+    RateLimited {
+        /// Raw `Retry-After` header, when the backend sent one.
+        retry_after: Option<String>,
+    },
     /// The HTTP exchange failed before a response arrived.
     #[error("decision backend request failed")]
     Transport(#[source] hyper_util::client::legacy::Error),
@@ -209,6 +233,25 @@ pub(crate) enum DecisionError {
         /// Question id whose answer was malformed.
         id: &'static str,
     },
+}
+
+impl DecisionError {
+    /// Returns the specific cause written to the decision log.
+    pub(crate) fn cause(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Busy => "backend_busy",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Transport(_) => "connection",
+            Self::Status(_) => "http_status",
+            Self::Body(_) => "body",
+            Self::Json(_) => "parse",
+            Self::Request(_) => "request",
+            Self::Probability(_) => "invalid_score",
+            Self::Rejected => "rejected",
+            Self::MissingAnswer { .. } | Self::AnswerType { .. } => "invalid_response",
+        }
+    }
 }
 
 /// Why an upstream request could not be sent.

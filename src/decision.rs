@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::{AUTHORIZATION, CONTENT_TYPE};
-use http::{Method, Request, Uri};
+use http::header::{AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER};
+use http::{Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_rustls::HttpsConnector;
 use hyper_rustls::HttpsConnectorBuilder;
@@ -16,6 +16,7 @@ use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
+use tokio::sync::Semaphore;
 
 use crate::error::{DecisionError, ProbabilityError, ServeError};
 use crate::sanitize::DecisionEvent;
@@ -106,15 +107,23 @@ pub(crate) fn decision_client() -> Result<DecisionClient, ServeError> {
 
 /// Posts a JSON payload and returns the response body, bounded in size and time.
 ///
-/// `bearer` is sent as an `Authorization: Bearer` header when given.
+/// `bearer` is sent as an `Authorization: Bearer` header when given. Waiting for a
+/// slot in `slots` counts against the same `timeout`; running out of time while
+/// waiting is [`DecisionError::Busy`], and running out during the exchange is
+/// [`DecisionError::Timeout`].
 pub(crate) async fn post_json(
     client: &DecisionClient,
     url: &Uri,
     bearer: Option<&str>,
     payload: Vec<u8>,
     timeout: Duration,
+    slots: &Semaphore,
 ) -> Result<Bytes, DecisionError> {
-    match tokio::time::timeout(timeout, exchange(client, url, bearer, payload)).await {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let Ok(Ok(_slot)) = tokio::time::timeout_at(deadline, slots.acquire()).await else {
+        return Err(DecisionError::Busy);
+    };
+    match tokio::time::timeout_at(deadline, exchange(client, url, bearer, payload)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(DecisionError::Timeout),
     }
@@ -139,6 +148,14 @@ async fn exchange(
         .await
         .map_err(DecisionError::Transport)?;
     let status = response.status();
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.chars().take(64).collect());
+        return Err(DecisionError::RateLimited { retry_after });
+    }
     if !status.is_success() {
         return Err(DecisionError::Status(status));
     }
@@ -155,15 +172,23 @@ pub(crate) struct HttpDecisionBackend {
     client: DecisionClient,
     url: Uri,
     timeout: Duration,
+    slots: Arc<Semaphore>,
 }
 
 impl HttpDecisionBackend {
-    /// Creates a backend that posts to `url` and gives up after `timeout`.
-    pub(crate) fn new(client: DecisionClient, url: Uri, timeout: Duration) -> Self {
+    /// Creates a backend that posts to `url`, gives up after `timeout`, and takes
+    /// a slot from `slots` for each call.
+    pub(crate) fn new(
+        client: DecisionClient,
+        url: Uri,
+        timeout: Duration,
+        slots: Arc<Semaphore>,
+    ) -> Self {
         Self {
             client,
             url,
             timeout,
+            slots,
         }
     }
 }
@@ -171,7 +196,15 @@ impl HttpDecisionBackend {
 impl DecisionBackend for HttpDecisionBackend {
     async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         let payload = serde_json::to_vec(event)?;
-        let body = post_json(&self.client, &self.url, None, payload, self.timeout).await?;
+        let body = post_json(
+            &self.client,
+            &self.url,
+            None,
+            payload,
+            self.timeout,
+            &self.slots,
+        )
+        .await?;
         let raw: RawVerdict = serde_json::from_slice(&body)?;
         Ok(Verdict {
             attack: Probability::new(raw.attack)?,
@@ -214,6 +247,27 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[tokio::test]
+    async fn post_json_reports_busy_when_no_slot_frees_within_the_timeout()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let client = decision_client()?;
+        let url: Uri = "http://127.0.0.1:9/decide".parse()?;
+        let slots = Semaphore::new(1);
+        // Hold the only slot for the whole test, so the call can only wait.
+        let _held = slots.acquire().await?;
+        let result = post_json(
+            &client,
+            &url,
+            None,
+            Vec::new(),
+            Duration::from_millis(50),
+            &slots,
+        )
+        .await;
+        assert!(matches!(result, Err(DecisionError::Busy)));
+        Ok(())
+    }
 
     #[rstest]
     #[case::lower_bound(0.0)]

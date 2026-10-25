@@ -1,5 +1,5 @@
-# Sample configuration for vigilant-heron. Every key below is documented;
-# values shown are the defaults unless noted otherwise.
+# Sample configuration for vigilant-heron. Every key below is documented.
+# Values shown are the defaults unless the comment says the key is required.
 
 # Address the proxy binds to. Put nginx or Cloudflare in front of it.
 listen = "0.0.0.0:8080"
@@ -12,33 +12,48 @@ log_format = "json"
 # absent, the peer address is used.
 client_ip_header = "x-real-ip"
 
+# Optional. Header whose value is logged as `request_id` in the decision event
+# (cut to 128 bytes). It is not sent to the decision backend. Unset by default.
+# request_id_header = "x-request-id"
+
+# Most connections served at the same time. At least 1.
+max_connections = 1024
+
+# Optional. Runtime worker threads. Unset means one per CPU core (tokio's
+# default). At least 1 when set.
+# worker_threads = 4
+
 [decision]
-# Protocol spoken to the decision backend:
-#   "http"  the JSON protocol described in the README (default)
+# Protocol spoken to the decision backend. Defaults to "jev".
+#   "http"  the JSON protocol described in the README
 #   "clef"  Cloudflare Clef on Workers AI, or a server that speaks its protocol
 #   "jev"   TypeSafe Jev, or a server that speaks the same System One protocol
 backend = "http"
 
-# Absolute http:// or https:// URI of the decision backend. For "http" the proxy
-# posts one JSON request per inspected request and expects
-# {"attack": f64, "ai_instruction": f64}. For "clef", use the Workers AI endpoint:
-# https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash
+# Absolute http:// or https:// URI of the decision backend. Defaults to the Jev
+# endpoint with backend = "jev"; required otherwise. For "http" the proxy posts
+# one JSON request per inspected request and expects
+# {"attack": f64, "ai_instruction": f64}.
+# Clef: https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash
 url = "http://stub-decider:9000/decide"
 
-# Required with backend = "clef" or "jev", rejected with "http". For "clef" it is
-# "clef-flash" (24,576-token context) or "clef" (64K). For "jev" it is a model
-# identifier such as "jev-latest": 1 to 100 characters from [A-Za-z0-9._-].
+# Clef and Jev only; rejected with "http". Clef: "clef-flash" (24,576-token
+# context) or "clef" (64K); required with "clef". Jev: a model identifier of 1 to
+# 100 characters from [A-Za-z0-9._-]; defaults to "jev-latest".
 # model = "clef-flash"
 
-# Required with backend = "clef" or "jev", rejected with "http": the NAME of an
-# environment variable that holds the bearer token. The token itself is never
-# written in this file. The process fails to start when the variable is unset or
-# blank. Logs and errors print the token as [REDACTED].
+# Clef and Jev only; rejected with "http". The NAME of an environment variable
+# that holds the bearer token. The token itself is never written in this file.
+# Defaults to "TYPESAFE_API_KEY" with "jev"; required with "clef". The process
+# fails to start when the variable is unset or blank. Logs print [REDACTED].
 # api_token_env = "CLOUDFLARE_AI_TOKEN"
 
-# Time allowed for the whole decision exchange. A timeout counts as a
-# backend failure and follows each site's fail-open or fail-closed rules.
+# Time allowed for the whole decision exchange, including waiting for a
+# concurrency slot. Running out is a decision failure (see the failure settings).
 timeout_ms = 150
+
+# Most decision-backend calls in flight at the same time. At least 1.
+max_concurrency = 64
 
 # Bytes of the request body that are sent to the backend. The rest is cut
 # on a UTF-8 character boundary and body_truncated is set.
@@ -64,7 +79,7 @@ hosts = ["example.com", "www.example.com"]
 upstream = "http://upstream:80"
 
 # "enforce" applies the verdict. "shadow" forwards everything and only
-# records what would have happened.
+# records what would have happened. Rules are applied in both modes.
 mode = "enforce"
 
 # What an attack gets: "block" (403) or "redirect" (302 to redirect_to).
@@ -74,19 +89,49 @@ action = "block"
 # redirect_to = "https://example.com/blocked"
 
 # Attack score at or above which the request counts as an attack (0..=1).
+# Defaults to 0.87.
 block_threshold = 0.9
 
 # AI instruction score at or above which the request counts as an attack (0..=1).
+# Defaults to 0.8.
 instruction_threshold = 0.5
 
-# Path prefixes that are always blocked, without calling the backend.
-# Matched against the normalized path: one percent-decode, dot segments
-# resolved, repeated slashes merged, then lowercased.
-deny_paths = ["/xmlrpc.php"]
+# Path prefixes that are always blocked, without calling the backend. They are
+# matched as a prefix of the normalized path (one percent-decode, dot segments
+# resolved, repeated slashes merged, then lowercased). So "/wp-config.php" also
+# covers backups such as "/wp-config.php.bak". Review the list for each site:
+# some applications expose these paths on purpose, such as Spring Boot apps
+# that serve "/actuator".
+deny_paths = [
+  "/.env",
+  "/.git",
+  "/.svn/",
+  "/.hg/",
+  "/.ds_store",
+  "/.aws/",
+  "/.ssh/",
+  "/.htpasswd",
+  "/.htaccess",
+  "/wp-config.php",
+  "/phpmyadmin",
+  "/server-status",
+  "/actuator",
+  "/vendor/phpunit",
+]
 
-# Path prefixes that are blocked when the backend fails or times out,
-# matched against the normalized path like deny_paths.
-# All other paths are forwarded in that case (fail open).
+# What happens when the backend rate-limits the request (HTTP 429), or when no
+# concurrency slot is free within timeout_ms. "allow" (default) forwards the
+# request; "block" applies the site's action. Rules are not affected.
+on_rate_limit = "allow"
+
+# What happens when the backend fails in any other way: timeout, connection
+# error, other non-2xx status, malformed or out-of-range answers. "allow"
+# (default) forwards the request; "block" applies the site's action.
+on_decision_error = "allow"
+
+# Path prefixes that are blocked whenever the decision fails, whatever the
+# failure and its setting above. They are matched like deny_paths.
+# Requests on other paths follow on_rate_limit or on_decision_error.
 fail_closed_paths = ["/wp-login.php", "/wp-admin"]
 
 # File extensions of GET or HEAD requests with no query and no body that

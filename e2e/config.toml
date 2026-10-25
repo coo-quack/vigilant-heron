@@ -3,6 +3,7 @@ log_format = "json"
 client_ip_header = "x-real-ip"
 
 [decision]
+backend = "http"
 url = "http://stub-decider:9000/decide"
 timeout_ms = 300
 inspect_body_bytes = 8192
@@ -19,7 +20,7 @@ mode = "enforce"
 action = "block"
 block_threshold = 0.9
 instruction_threshold = 0.5
-deny_paths = ["/xmlrpc.php"]
+deny_paths = ["/xmlrpc.php", "/.env"]
 fail_closed_paths = ["/wp-login.php"]
 debug_headers = false
 
@@ -41,3 +42,13 @@ action = "block"
 block_threshold = 0.9
 instruction_threshold = 0.5
 debug_headers = true
+
+[[sites]]
+hosts = ["ratelimit.test"]
+upstream = "http://upstream:80"
+mode = "enforce"
+action = "block"
+block_threshold = 0.9
+instruction_threshold = 0.5
+# The stub answers 429 for paths containing /ratelimited. This site blocks on that.
+on_rate_limit = "block"

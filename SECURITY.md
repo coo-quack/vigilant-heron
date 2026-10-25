@@ -49,5 +49,24 @@ positives on real traffic.
 
 ## Failure behavior
 
-When the backend times out or fails, requests are forwarded (fail-open),
-except on `fail_closed_paths`, where they are blocked.
+When the decision backend cannot judge a request, the outcome depends on the
+failure and on the site settings:
+
+- A decision fails in one of two groups. `rate_limited` covers HTTP 429 and "no
+  concurrency slot free within `timeout_ms`" (`backend_busy`). `error` covers
+  timeouts, connection failures, other non-2xx statuses, `success: false`, and
+  malformed or out-of-range answers.
+- `on_rate_limit` and `on_decision_error` set the outcome for each group:
+  `"allow"` (the default) forwards the request, `"block"` applies the site's
+  `action`.
+- `fail_closed_paths` always blocks a failure on a matching path, whatever the
+  group or setting.
+- Deterministic rules (`deny_paths`) are decided before the backend is called.
+  The failure settings do not affect them, so a rule block stays a block when the
+  backend rate-limits, errors, is unreachable or is saturated. Shadow mode still
+  forwards every request, rules included.
+
+The defaults allow requests when the backend fails. A site that depends on the
+backend to block attacks should set `on_decision_error = "block"` and, for
+paths that must never open, `fail_closed_paths`. Each setting is a trade-off:
+blocking on errors turns a provider outage into a block of legitimate traffic.
