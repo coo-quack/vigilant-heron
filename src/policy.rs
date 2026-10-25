@@ -7,6 +7,7 @@ use http::{HeaderValue, StatusCode};
 
 use crate::config::{FailureAction, Mode, SiteAction, SiteConfig};
 use crate::decision::Verdict;
+use crate::prefilter::fails_closed;
 
 /// What the proxy does with a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,8 +120,8 @@ pub(crate) struct Decision {
 
 /// Applies the decision table to one request.
 ///
-/// `path` must come from [`crate::prefilter::normalized_path`].
-pub(crate) fn decide(site: &SiteConfig, path: &str, assessment: &Assessment) -> Decision {
+/// `views` are the lowercase path views of the request, see [`crate::prefilter::path_views`].
+pub(crate) fn decide(site: &SiteConfig, views: &[String], assessment: &Assessment) -> Decision {
     let (intended, reason) = match assessment {
         Assessment::Rule => (site_action(site), Reason::Rule),
         Assessment::Skip => (Action::Allow, Reason::Skip),
@@ -131,7 +132,7 @@ pub(crate) fn decide(site: &SiteConfig, path: &str, assessment: &Assessment) -> 
         }
         Assessment::Model(_) => (Action::Allow, Reason::BelowThreshold),
         Assessment::RateLimited { .. } | Assessment::DecisionFailed { .. } => {
-            failure_outcome(site, path, assessment)
+            failure_outcome(site, views, assessment)
         }
     };
     match site.mode {
@@ -153,9 +154,13 @@ pub(crate) fn decide(site: &SiteConfig, path: &str, assessment: &Assessment) -> 
 
 /// Decides a request whose backend failed: `fail_closed_paths` always blocks, and
 /// otherwise the setting for the failure group decides.
-fn failure_outcome(site: &SiteConfig, path: &str, assessment: &Assessment) -> (Action, Reason) {
+fn failure_outcome(
+    site: &SiteConfig,
+    views: &[String],
+    assessment: &Assessment,
+) -> (Action, Reason) {
     let rate_limited = matches!(assessment, Assessment::RateLimited { .. });
-    if fails_closed(site, path) {
+    if fails_closed(site, views) {
         return (site_action(site), Reason::FailClosedPath);
     }
     let setting = if rate_limited {
@@ -183,12 +188,6 @@ fn exceeds_thresholds(site: &SiteConfig, verdict: &Verdict) -> bool {
         || verdict.ai_instruction.value() >= site.instruction_threshold
 }
 
-fn fails_closed(site: &SiteConfig, path: &str) -> bool {
-    site.fail_closed_paths
-        .iter()
-        .any(|prefix| path.starts_with(prefix.to_lowercase().as_str()))
-}
-
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
@@ -196,12 +195,20 @@ mod tests {
     use super::*;
     use crate::decision::verdict;
     use crate::error::ConfigError;
-    use crate::prefilter::normalized_path;
+    use crate::prefilter::path_views;
     use crate::test_support::site;
 
     const REDIRECT: &str = "action redirect https://example.com/blocked;";
     const FAIL_CLOSED: &str = "fail_closed_path /WP-LOGIN.php;";
     const SHADOW: &str = "mode shadow;";
+
+    /// The lowercase path views of a raw path, as the pipeline passes them to `decide`.
+    fn views_of(raw: &str) -> Vec<String> {
+        path_views(raw)
+            .iter()
+            .map(|view| view.to_lowercase())
+            .collect()
+    }
 
     fn fields(parts: &[&str]) -> String {
         parts.join("\n")
@@ -241,7 +248,7 @@ mod tests {
         #[case] expected_would_have: Option<&str>,
     ) -> Result<(), ConfigError> {
         let config = site(&site_fields)?;
-        let decision = decide(&config, path, &assessment);
+        let decision = decide(&config, &views_of(path), &assessment);
         assert_eq!(decision.action.name(), expected_action);
         assert_eq!(decision.reason, expected_reason);
         assert_eq!(
@@ -426,7 +433,7 @@ mod tests {
         } else {
             decision_failed()
         };
-        let decision = decide(&config, path, &assessment);
+        let decision = decide(&config, &views_of(path), &assessment);
         assert_eq!(decision.action.name(), expected_action);
         assert_eq!(decision.reason, expected_reason);
         assert_eq!(
@@ -444,7 +451,7 @@ mod tests {
                 &format!("on_rate_limit {setting};"),
                 &format!("on_decision_error {setting};"),
             ]))?;
-            let decision = decide(&config, &normalized_path("/.env"), &Assessment::Rule);
+            let decision = decide(&config, &views_of("/.env"), &Assessment::Rule);
             assert_eq!(decision.action, Action::Block);
             assert_eq!(decision.reason, Reason::Rule);
         }
@@ -454,7 +461,7 @@ mod tests {
     #[test]
     fn redirect_action_carries_the_location() -> Result<(), ConfigError> {
         let config = site(&fields(&[REDIRECT]))?;
-        let decision = decide(&config, "/x", &Assessment::Rule);
+        let decision = decide(&config, &views_of("/x"), &Assessment::Rule);
         assert_eq!(
             decision.action,
             Action::Redirect(http::HeaderValue::from_static(
@@ -468,11 +475,11 @@ mod tests {
     fn access_denial_is_a_block_whatever_the_site_action_and_is_forwarded_in_shadow()
     -> Result<(), ConfigError> {
         let redirect = site(&fields(&[REDIRECT]))?;
-        let enforced = decide(&redirect, "/x", &Assessment::AccessDenied);
+        let enforced = decide(&redirect, &views_of("/x"), &Assessment::AccessDenied);
         assert_eq!(enforced.action, Action::Block);
         assert_eq!(enforced.reason, Reason::AccessDenied);
         let shadow = site(&fields(&[SHADOW]))?;
-        let recorded = decide(&shadow, "/x", &Assessment::AccessDenied);
+        let recorded = decide(&shadow, &views_of("/x"), &Assessment::AccessDenied);
         assert_eq!(recorded.action, Action::Allow);
         assert_eq!(recorded.reason, Reason::AccessDenied);
         assert_eq!(recorded.would_have, Some(Action::Block));
@@ -487,7 +494,7 @@ mod tests {
             Assessment::Model(verdict(1.0, 1.0)),
             decision_failed(),
         ] {
-            let decision = decide(&config, "/wp-login.php", &assessment);
+            let decision = decide(&config, &views_of("/wp-login.php"), &assessment);
             assert_eq!(decision.action, Action::Allow);
         }
         Ok(())
@@ -500,7 +507,7 @@ mod tests {
     #[case::encoded_dot_segment("/%2e/wp-login.php")]
     fn fail_closed_applies_after_path_normalization(#[case] raw: &str) -> Result<(), ConfigError> {
         let config = site(&fields(&[FAIL_CLOSED]))?;
-        let decision = decide(&config, &normalized_path(raw), &decision_failed());
+        let decision = decide(&config, &views_of(raw), &decision_failed());
         assert_eq!(decision.reason, Reason::FailClosedPath);
         assert_eq!(decision.action, Action::Block);
         Ok(())

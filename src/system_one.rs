@@ -329,6 +329,7 @@ mod tests {
             host: "example.com",
             client_ip: "203.0.113.7",
             redact_headers: &[],
+            redact_fields: &[],
             inspect_body_bytes: 1024,
         })
     }

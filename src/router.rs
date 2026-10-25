@@ -225,6 +225,34 @@ pub(crate) fn normalize_host(raw: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// Returns true when a `Host` value has the shape of a hostname or a literal, with an optional port.
+///
+/// Accepted: letters, digits, `.`, `-` and `_` in the name (a trailing dot is allowed), or a
+/// bracketed IPv6 literal of hex digits, `:` and `.`, then an optional `:port` of digits.
+/// Anything else, including an empty value, is refused before routing.
+pub(crate) fn is_valid_host(raw: &str) -> bool {
+    let port_ok = |port: &str| !port.is_empty() && port.chars().all(|c| c.is_ascii_digit());
+    if let Some(rest) = raw.strip_prefix('[') {
+        let Some((literal, after)) = rest.split_once(']') else {
+            return false;
+        };
+        let literal_ok = !literal.is_empty()
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+        return literal_ok && (after.is_empty() || after.strip_prefix(':').is_some_and(port_ok));
+    }
+    let (name, port) = match raw.split_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (raw, None),
+    };
+    let name_ok = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    name_ok && port.is_none_or(port_ok)
+}
+
 #[cfg(test)]
 mod tests {
     use http::HeaderValue;
@@ -235,6 +263,36 @@ mod tests {
     use crate::config::Config;
     use crate::error::ConfigError;
     use crate::test_support::site;
+
+    #[rstest]
+    #[case::name("example.com")]
+    #[case::name_with_port("example.com:8080")]
+    #[case::trailing_dot("example.com.")]
+    #[case::hyphen_and_digits("a-1.example.co")]
+    #[case::underscore("my_app.example.com")]
+    #[case::ipv4("192.0.2.1:80")]
+    #[case::ipv6("[2001:db8::1]")]
+    #[case::ipv6_with_port("[::1]:8443")]
+    fn valid_hosts_are_accepted(#[case] raw: &str) {
+        assert!(is_valid_host(raw), "{raw}");
+    }
+
+    #[rstest]
+    #[case::empty("")]
+    #[case::space("exa mple.com")]
+    #[case::slash("example.com/x")]
+    #[case::slash_in_name("my/host.example.com")]
+    #[case::semicolon("example.com;x")]
+    #[case::empty_port("example.com:")]
+    #[case::letter_port("example.com:80a")]
+    #[case::unclosed_ipv6("[::1")]
+    #[case::ipv6_with_bad_char("[::g]")]
+    #[case::empty_ipv6("[]")]
+    #[case::ipv6_junk_after("[::1]x")]
+    #[case::leading_colon("::1")]
+    fn invalid_hosts_are_refused(#[case] raw: &str) {
+        assert!(!is_valid_host(raw), "{raw}");
+    }
 
     #[rstest]
     #[case::plain("example.com", "example.com")]

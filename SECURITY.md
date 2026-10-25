@@ -11,8 +11,9 @@ For every request that is not skipped or blocked by a rule, the router sends
 the request line, headers and up to `inspect_body_bytes` of the body to the
 configured decision backend. It drops `Cookie`, `Authorization`,
 `Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token` and any header listed in
-`redact_headers`, and replaces the values of password-, token- and card-like
-form and JSON fields with `[REDACTED]` before sending. Multipart
+`redact_headers`, and replaces the values of password-, pass-, token-, card-,
+PIN-, OTP-, session- and credential-like form and JSON fields, and of the fields
+named in `redact_field`, with `[REDACTED]` before sending. Multipart
 (`multipart/form-data`) bodies are only lexically redacted, so a sensitive field
 inside one can still reach the backend in some layouts. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the
@@ -29,7 +30,9 @@ Access logs contain the client address, the method, the path, the status and
 the decision fields, but never a request body, a query string or a credential
 header. A `$http_*` variable that names a credential or a redacted header is
 rejected when the configuration loads. Every logged value is escaped, so a
-request cannot inject a line break or a control character into the log.
+request cannot inject a line break or a control character into the log. The
+`json` format also escapes the C1 controls and U+2028 and U+2029, and the `main`
+format quotes its free-text values.
 
 With `backend = "jev"`, the same sanitized event is sent to TypeSafe
 (`api.typesafe.ai`), a third party, in the same System One request shape. The
@@ -92,10 +95,14 @@ decision model, in the order the README gives. They never send data anywhere.
 - The access list uses the client address chosen by the realip settings. That
   address is believed only from a peer listed in `real_ip_from`, so a client
   that is not a trusted proxy cannot pick its own address with a header.
-- Rules match the normalized request: the path is percent-decoded once, the
-  query and bodies are decoded at most twice, and NUL bytes are removed. A third
-  level of encoding is not decoded, so an input encoded three times is not seen
-  as the attack it encodes. The request is forwarded unchanged.
+- Rules match the normalized request: the path is read in six ways (decoded,
+  with `;` parameters cut, with `\` as `/`, and the raw path with encoded
+  separators kept), the query and bodies are decoded at most twice, and NUL bytes
+  are removed. A third level of encoding is not decoded, so an input encoded three
+  times is not seen as the attack it encodes. The request is forwarded unchanged.
+  A block matches when any reading matches, so the reading an upstream uses cannot
+  escape a `deny_path`. A static skip needs every reading to be static, so a
+  path such as `/index.php/x.css` or `/x;.css` is always inspected.
 - A body rule sees only the first `inspect_body` bytes. Anything later in the
   body is not matched, and a multipart body is not parsed.
 - Regexes use the `regex` crate, which matches in time linear in the input and
@@ -204,8 +211,8 @@ failure and on the site settings:
   after a slot was obtained), connection failures, other non-2xx statuses,
   `success: false`, and malformed or out-of-range answers.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
-  `"allow"` (the default) forwards the request, `"block"` applies the site's
-  `action`.
+  `"block"` (the default) applies the site's `action`, `"allow"` forwards the
+  request.
 - `fail_closed_paths` always blocks a failure on a matching path, whatever the
   group or setting.
 - Deterministic rules (the access list, `deny_path` and block rules) are decided
@@ -213,7 +220,13 @@ failure and on the site settings:
   rule block stays a block when the backend rate-limits, errors, is unreachable or
   is saturated. Shadow mode still forwards every request, rules included.
 
-The defaults allow requests when the backend fails. A site that depends on the
-backend to block attacks should set `on_decision_error = "block"` and, for
-paths that must never open, `fail_closed_paths`. Each setting is a trade-off:
-blocking on errors turns a provider outage into a block of legitimate traffic.
+The defaults allow requests when the backend fails or is saturated, so a provider
+outage does not block legitimate traffic. The cost is that an attacker who makes the
+backend unavailable on purpose can get requests past the model, and a site that
+keeps `on_rate_limit "allow"` or `on_decision_error "allow"` accepts that. Keep
+`fail_closed_paths` on sensitive paths, which block whatever the setting.
+
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
+
+The per-client cap also covers a single client that keeps many requests in flight
+on its own. A distributed DoS attack from many addresses is not prevented by it.

@@ -797,6 +797,26 @@ pub(crate) struct LocationConfig {
     pub(crate) websocket: bool,
 }
 
+/// The distinct locations that the path views select, in the order they are found.
+///
+/// A view is one reading of the path, see [`crate::prefilter::path_views`]. Limits
+/// are applied to every location found, so the reading the upstream uses cannot pick
+/// a location with looser limits.
+pub(crate) fn select_locations<'a>(
+    locations: &'a [LocationConfig],
+    views: &[String],
+) -> Vec<&'a LocationConfig> {
+    let mut selected: Vec<&LocationConfig> = Vec::new();
+    for view in views {
+        if let Some(location) = select_location(locations, view)
+            && !selected.iter().any(|known| std::ptr::eq(*known, location))
+        {
+            selected.push(location);
+        }
+    }
+    selected
+}
+
 /// Chooses the location for a request path, with nginx's precedence.
 ///
 /// `decoded` is the decoded path with case kept. An exact match wins at once.
@@ -1274,17 +1294,35 @@ pub(crate) struct Screened {
 /// the delay of the request is waited for once all of them have passed. The
 /// `limit_conn` permits are pushed onto `permits`, which the caller keeps until
 /// the response body is done. A refused request keeps no permit.
+///
+/// `sets` holds the limits of every location the request selects. Each set is
+/// checked in turn, so a request cannot escape one location's limits by selecting
+/// another, and the longest delay of the sets is waited for once.
 pub(crate) async fn screen(
     zones: &[Arc<ZoneStore>],
-    limits: &LimitSet,
+    sets: &[&LimitSet],
     shadow: bool,
     vars: &KeyVars<'_>,
     permits: &mut Vec<ConnPermit>,
 ) -> Screened {
     let mut screened = Screened::default();
-    let (wait, held) = screen_req(zones, limits, shadow, vars, &mut screened);
+    let mut wait = Duration::ZERO;
+    let mut held: Vec<Pending> = Vec::new();
+    for limits in sets {
+        let (set_wait, set_held) = screen_req(zones, limits, shadow, vars, &mut screened);
+        wait = wait.max(set_wait);
+        held.extend(set_held);
+        if screened.refusal.is_some() {
+            break;
+        }
+    }
     if screened.refusal.is_none() {
-        screen_conn(zones, limits, shadow, vars, permits, &mut screened);
+        for limits in sets {
+            screen_conn(zones, limits, shadow, vars, permits, &mut screened);
+            if screened.refusal.is_some() {
+                break;
+            }
+        }
     }
     if screened.refusal.is_none() && !wait.is_zero() {
         tokio::time::sleep(wait).await;
@@ -2049,9 +2087,9 @@ mod tests {
             headers: &headers,
         };
         let mut permits = Vec::new();
-        let first = screen(&zones, &limits, false, &vars, &mut permits).await;
+        let first = screen(&zones, &[&limits], false, &vars, &mut permits).await;
         assert!(first.refusal.is_none());
-        let second = screen(&zones, &limits, false, &vars, &mut permits).await;
+        let second = screen(&zones, &[&limits], false, &vars, &mut permits).await;
         assert_eq!(second.refusal.map(|r| r.reason), Some("limit_req"));
         assert_eq!(second.req_status, Some(ReqStatus::Rejected));
         assert_eq!(permits.len(), 1);
@@ -2075,12 +2113,12 @@ mod tests {
             headers: &headers,
         };
         let mut permits = Vec::new();
-        let _first = screen(&zones, &limits, false, &vars, &mut permits).await;
+        let _first = screen(&zones, &[&limits], false, &vars, &mut permits).await;
         let started = Instant::now();
-        let second = screen(&zones, &limits, false, &vars, &mut permits).await;
+        let second = screen(&zones, &[&limits], false, &vars, &mut permits).await;
         assert_eq!(second.req_status, Some(ReqStatus::Delayed));
         assert_eq!(started.elapsed(), Duration::from_secs(1));
-        let shadow = screen(&zones, &limits, true, &vars, &mut permits).await;
+        let shadow = screen(&zones, &[&limits], true, &vars, &mut permits).await;
         assert_eq!(shadow.req_status, Some(ReqStatus::DelayedDryRun));
         assert!(shadow.refusal.is_none());
     }
@@ -2119,7 +2157,7 @@ mod tests {
         let mut permits = Vec::new();
         let zones_with_header = vec![zone];
         for _ in 0..3 {
-            let screened = screen(&zones_with_header, &limits, false, &vars, &mut permits).await;
+            let screened = screen(&zones_with_header, &[&limits], false, &vars, &mut permits).await;
             assert!(screened.req_status.is_none());
             assert!(screened.refusal.is_none());
         }
@@ -2170,7 +2208,7 @@ mod tests {
         let mut permits = Vec::new();
         let screened = screen(
             &zones,
-            &limits,
+            &[&limits],
             false,
             &vars_for("other", &headers),
             &mut permits,
@@ -2207,7 +2245,7 @@ mod tests {
         let mut permits = Vec::new();
         let screened = screen(
             &zones,
-            &limits,
+            &[&limits],
             false,
             &vars_for("other", &headers),
             &mut permits,
@@ -2234,7 +2272,7 @@ mod tests {
         let mut permits = Vec::new();
         let screened = screen(
             &zones,
-            &limits,
+            &[&limits],
             false,
             &vars_for("other", &headers),
             &mut permits,
@@ -2268,7 +2306,7 @@ mod tests {
         let mut permits = Vec::new();
         let screened = screen(
             &zones,
-            &limits,
+            &[&limits],
             false,
             &vars_for("other", &headers),
             &mut permits,

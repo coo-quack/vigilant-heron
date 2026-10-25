@@ -233,6 +233,15 @@ async fn static_asset_is_forwarded_without_calling_the_backend() -> TestResult {
     proxy.stop().await
 }
 
+/// Adds `on_rate_limit allow` and `on_decision_error allow` to the first site of `config_text`.
+fn fail_open(text: &str) -> String {
+    text.replacen(
+        "    debug_headers on;\n",
+        "    debug_headers on;\n    on_rate_limit allow;\n    on_decision_error allow;\n",
+        1,
+    )
+}
+
 #[tokio::test]
 async fn backend_timeout_fails_open_on_an_ordinary_path() -> TestResult {
     let upstream = Upstream::start().await?;
@@ -241,11 +250,11 @@ async fn backend_timeout_fails_open_on_an_ordinary_path() -> TestResult {
         delay: Duration::from_millis(1_000),
         ..StubBehavior::default()
     });
-    let proxy = start_proxy(&config_text(
+    let proxy = start_proxy(&fail_open(&config_text(
         &stub.decide_url(),
         &upstream.url(),
         SLOW_TIMEOUT_MS,
-    ))
+    )))
     .await?;
 
     let reply = send(
@@ -301,11 +310,11 @@ async fn backend_server_error_fails_open() -> TestResult {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         ..StubBehavior::default()
     });
-    let proxy = start_proxy(&config_text(
+    let proxy = start_proxy(&fail_open(&config_text(
         &stub.decide_url(),
         &upstream.url(),
         GENEROUS_TIMEOUT_MS,
-    ))
+    )))
     .await?;
 
     let reply = send(
@@ -392,6 +401,155 @@ async fn backend_never_receives_credentials_and_sees_the_form_password_redacted(
         .collect();
     assert!(pairs.contains(&("password".to_owned(), "[REDACTED]".to_owned())));
     assert!(pairs.contains(&("user".to_owned(), "alice".to_owned())));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn backend_meta_host_is_the_configured_site_name_not_the_client_host() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    // www.example.com is the second name of the site example.com, so it is routed there.
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/item?id=1",
+        "www.example.com",
+        &[("content-type", "text/plain")],
+        Bytes::from_static(b"hello"),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    assert_eq!(event["event"]["meta"]["host"], "example.com");
+    let headers = event["event"]["untrusted"]["headers"].to_string();
+    assert!(headers.contains("www.example.com"), "{headers}");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_host_with_an_underscore_is_routed_to_its_site() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+client_max_body_size 1024;
+decision {{
+    backend http;
+    url "{decide}";
+    timeout {GENEROUS_TIMEOUT_MS}ms;
+    inspect_body 512;
+}}
+default_status 421;
+site *.example.com {{
+    upstream "{upstream}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        decide = stub.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "my_app.example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn backend_meta_host_is_the_wildcard_pattern_for_a_wildcard_site() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+client_max_body_size 1024;
+decision {{
+    backend http;
+    url "{decide}";
+    timeout {GENEROUS_TIMEOUT_MS}ms;
+    inspect_body 512;
+}}
+default_status 421;
+site *.example.com {{
+    upstream "{upstream}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        decide = stub.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/item?id=1",
+        "authorized-scan-answer-false.example.com",
+        &[("content-type", "text/plain")],
+        Bytes::from_static(b"hello"),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    assert_eq!(event["event"]["meta"]["host"], "*.example.com");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn drupal_login_pass_and_a_redact_field_name_never_reach_the_backend() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    // The decision block of config_text gets one more field name to redact.
+    let config = config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS).replacen(
+        "    inspect_body 512;\n",
+        "    inspect_body 512;\n    redact_field ticket_ref;\n",
+        1,
+    );
+    let proxy = start_proxy(&config).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/user/login",
+        "example.com",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        Bytes::from_static(b"name=alice&pass=hunter2&ticket_ref=T-99&form_id=user_login_form"),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    let forwarded_body = event["event"]["untrusted"]["body"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!forwarded_body.contains("hunter2"), "{forwarded_body}");
+    assert!(!forwarded_body.contains("T-99"), "{forwarded_body}");
+    assert!(forwarded_body.contains("name=alice"), "{forwarded_body}");
     proxy.stop().await
 }
 

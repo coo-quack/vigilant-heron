@@ -67,6 +67,48 @@ async fn wait_for_line(path: &Path, needle: &str) -> Result<String, BoxError> {
 const LOGIN: &str = "/wp-login.php";
 
 #[tokio::test]
+async fn a_location_limit_applies_to_a_path_that_another_reading_selects() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decider = StubDecider::start().await?;
+    let log = log_path("reading-location");
+    let _ = std::fs::remove_file(&log);
+    let top = "limit_req_zone $client_ip zone=login:1m rate=1r/m;";
+    let site = "location /login {\n        limit_req zone=login burst=0;\n        limit_req_status 429;\n    }";
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        top,
+        site,
+    ))
+    .await?;
+
+    // The plain reading of "/;/login/x" selects no location, but the reading without
+    // the ";" parameter does (Tomcat and Spring resolve it so), and its limit applies.
+    let first = send(
+        &proxy.base(),
+        Method::POST,
+        "/login/a",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(first.status, StatusCode::OK);
+    let limited = send(
+        &proxy.base(),
+        Method::POST,
+        "/;/login/x",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn a_login_location_passes_a_burst_and_answers_429_after_it() -> TestResult {
     let decider = StubDecider::start().await?;
     let upstream = Upstream::start().await?;

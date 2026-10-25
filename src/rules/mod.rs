@@ -16,7 +16,7 @@ use std::sync::{Arc, OnceLock};
 use http::{HeaderName, Method};
 
 pub(crate) use matching::{PathMatch, Pattern};
-pub(crate) use matching::{RuleInput, first_match};
+pub(crate) use matching::{RuleInput, first_match, first_skip_match};
 
 use crate::conf::{self, Directive};
 use crate::config::{block, invalid, one_arg};

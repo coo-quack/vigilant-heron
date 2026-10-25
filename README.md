@@ -133,12 +133,13 @@ The router finds its configuration in this order: `-c`, then the `VIGILANT_HERON
 ## What happens to each request
 
 1. **Limits.** A client that sends too many requests is refused with its status code (`limit_req`, `limit_conn`).
-2. **Access list.** A denied client address gets 403.
-3. **Fixed rules.** Built-in and user rules block known attack patterns without asking the model. Skip rules let known-safe requests through. A fixed rule decides the request, and the model cannot change that decision.
-4. **Static files.** Requests for images, CSS and JavaScript go straight to the site.
-5. **Model.** The router sends a redacted copy of the request to the model. Cookies and authorization headers are removed, and the body is cut to its first 8 KiB by default. The model returns two scores. A score at or above its threshold blocks the request with 403, or redirects it.
-6. **Model failure.** If the model does not answer in time, or answers badly, `on_decision_error` decides. The default is to let the request through. You can set it to block instead.
-7. **Forward.** The request goes to the upstream, and the router writes one access line.
+2. **Host check.** A `Host` header with characters that cannot be a host name gets 400.
+3. **Access list.** A denied client address gets 403.
+4. **Fixed rules.** Built-in and user rules block known attack patterns without asking the model. Skip rules let known-safe requests through. A fixed rule decides the request, and the model cannot change that decision.
+5. **Static files.** Plain requests for images, CSS and JavaScript go straight to the site. The router does not ask the model about them.
+6. **Model.** The router sends a redacted copy of the request to the model. Cookies and authorization headers are removed, and the body is cut to its first 8 KiB by default. The model returns two scores. A score at or above its threshold blocks the request with 403, or redirects it.
+7. **Model failure.** If the model does not answer in time, or answers badly, `on_decision_error` decides. The default is to let the request through. You can set it to block instead.
+8. **Forward.** The request goes to the upstream, and the router writes one access line.
 
 In shadow mode, steps 1 to 6 still run and are logged, but every request is forwarded.
 
