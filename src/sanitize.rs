@@ -18,9 +18,31 @@ const DROPPED_HEADERS: [&str; 5] = [
     "x-auth-token",
 ];
 
-const SENSITIVE_KEY_PARTS: [&str; 10] = [
-    "password", "passwd", "pwd", "secret", "token", "api_key", "apikey", "card", "cvv", "ssn",
+/// Parts that mark a field as sensitive when they occur anywhere in its name.
+///
+/// The name is compared without its non-alphanumeric characters and in lowercase,
+/// so `api_key`, `API-KEY` and `apikey` all match `apikey`.
+const SENSITIVE_KEY_PARTS: [&str; 14] = [
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "card",
+    "cvv",
+    "ssn",
+    "passphrase",
+    "passcode",
+    "credential",
+    "privatekey",
+    "accesskey",
 ];
+
+/// Short words that mark a field as sensitive only when a whole word of its name
+/// is one of them. A substring match would redact `shipping` (`pin`), `author`
+/// (`auth`) and `passenger` (`pass`).
+const SENSITIVE_WORDS: [&str; 7] = ["pass", "pin", "otp", "auth", "session", "cookie", "jwt"];
 
 /// The JSON body posted to the decision backend.
 #[derive(Debug, Serialize)]
@@ -70,6 +92,8 @@ pub(crate) struct EventInput<'a> {
     pub(crate) client_ip: &'a str,
     /// Extra header names to drop, lowercased.
     pub(crate) redact_headers: &'a [String],
+    /// Extra body field names to redact, lowercased (`redact_field`).
+    pub(crate) redact_fields: &'a [String],
     /// Maximum number of body bytes sent to the backend.
     pub(crate) inspect_body_bytes: usize,
 }
@@ -80,7 +104,7 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
         .headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let redacted = redact_body(content_type, input.body);
+    let redacted = redact_body(content_type, input.body, input.redact_fields);
     let (body, cut) = truncate_utf8(redacted, input.inspect_body_bytes);
     let body_truncated = cut || input.body_continues;
     DecisionEvent {
@@ -122,25 +146,72 @@ pub(crate) fn sanitize_headers(headers: &HeaderMap, extra: &[String]) -> Vec<(St
 }
 
 /// Returns true when a field name suggests a credential or payment secret.
+///
+/// The name is sensitive when one of [`SENSITIVE_KEY_PARTS`] occurs in it, or when
+/// one of its words is one of [`SENSITIVE_WORDS`]. Words are split at every
+/// non-alphanumeric character and at a lowercase-to-uppercase change.
 pub(crate) fn is_sensitive_key(key: &str) -> bool {
-    let lowered = key.to_lowercase();
+    let compact: String = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect::<String>()
+        .to_ascii_lowercase();
     SENSITIVE_KEY_PARTS
         .iter()
-        .any(|part| lowered.contains(part))
+        .any(|part| compact.contains(part))
+        || key_words(key)
+            .iter()
+            .any(|word| SENSITIVE_WORDS.contains(&word.as_str()))
+}
+
+/// Splits a field name into lowercase words, at non-alphanumeric characters and at a
+/// lowercase-to-uppercase change, as in `userPin` (`user`, `pin`).
+fn key_words(key: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut after_lower = false;
+    for c in key.chars() {
+        if !c.is_ascii_alphanumeric() {
+            words.push(std::mem::take(&mut word));
+            after_lower = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && after_lower {
+            words.push(std::mem::take(&mut word));
+        }
+        after_lower = c.is_ascii_lowercase();
+        word.push(c.to_ascii_lowercase());
+    }
+    words.push(word);
+    words.retain(|word| !word.is_empty());
+    words
+}
+
+/// Returns true when a field must be redacted: a sensitive name, or one of the
+/// `redact_field` names. Those are compared case-insensitively with the whole name.
+fn is_redacted_key(key: &str, redact_fields: &[String]) -> bool {
+    is_sensitive_key(key)
+        || redact_fields
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case(key))
 }
 
 /// Redacts sensitive fields of a body.
 ///
 /// Form bodies are parsed as form data. Other bodies are parsed as JSON when
 /// possible. Anything else, including malformed JSON, gets lexical redaction.
-pub(crate) fn redact_body(content_type: Option<&str>, body: &[u8]) -> String {
+pub(crate) fn redact_body(
+    content_type: Option<&str>,
+    body: &[u8],
+    redact_fields: &[String],
+) -> String {
     if is_form_content_type(content_type) {
-        return redact_form(body);
+        return redact_form(body, redact_fields);
     }
-    if let Some(json) = redact_json(body) {
+    if let Some(json) = redact_json(body, redact_fields) {
         return json;
     }
-    redact_lexical(&String::from_utf8_lossy(body))
+    redact_lexical(&String::from_utf8_lossy(body), redact_fields)
 }
 
 fn is_form_content_type(content_type: Option<&str>) -> bool {
@@ -158,29 +229,31 @@ fn is_form_content_type(content_type: Option<&str>) -> bool {
 /// Two passes run. The first redacts `key=value` tokens separated by `&`, `;` or
 /// whitespace. The second redacts `"key": value` pairs, where the value is a JSON
 /// string, a bracketed value or a bare token.
-pub(crate) fn redact_lexical(text: &str) -> String {
-    redact_json_like(&redact_key_value_tokens(text))
+pub(crate) fn redact_lexical(text: &str, redact_fields: &[String]) -> String {
+    redact_json_like(&redact_key_value_tokens(text, redact_fields), redact_fields)
 }
 
-fn redact_key_value_tokens(text: &str) -> String {
+fn redact_key_value_tokens(text: &str, redact_fields: &[String]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut token = String::new();
     for c in text.chars() {
         if c == '&' || c == ';' || c.is_whitespace() {
-            push_token(&mut out, &token);
+            push_token(&mut out, &token, redact_fields);
             token.clear();
             out.push(c);
         } else {
             token.push(c);
         }
     }
-    push_token(&mut out, &token);
+    push_token(&mut out, &token, redact_fields);
     out
 }
 
-fn push_token(out: &mut String, token: &str) {
+fn push_token(out: &mut String, token: &str, redact_fields: &[String]) {
     match token.split_once('=') {
-        Some((key, _)) if is_sensitive_key(key.trim_matches(|c| c == '"' || c == '\'')) => {
+        Some((key, _))
+            if is_redacted_key(key.trim_matches(|c| c == '"' || c == '\''), redact_fields) =>
+        {
             out.push_str(key);
             out.push('=');
             out.push_str(REDACTED);
@@ -193,7 +266,7 @@ fn push_token(out: &mut String, token: &str) {
 ///
 /// Single pass: every key is read once, and a value is scanned only when it is
 /// replaced or copied, so the work is linear in the length of the text.
-fn redact_json_like(text: &str) -> String {
+fn redact_json_like(text: &str, redact_fields: &[String]) -> String {
     let chars: Vec<char> = text.chars().collect();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -216,7 +289,7 @@ fn redact_json_like(text: &str) -> String {
         let value_start = skip_whitespace(&chars, colon + 1);
         let key = collect_range(&chars, i + 1, key_end - 1);
         copy_range(&chars, i, value_start, &mut out);
-        let sensitive = is_sensitive_key(&key);
+        let sensitive = is_redacted_key(&key, redact_fields);
         if !sensitive && matches!(chars.get(value_start), Some('{' | '[')) {
             // Keep scanning inside the container, where nested keys are checked. The
             // container's end is not needed, so it is not searched for: each character
@@ -313,10 +386,10 @@ fn collect_range(chars: &[char], from: usize, to: usize) -> String {
     (from..to).filter_map(|j| chars.get(j).copied()).collect()
 }
 
-fn redact_form(body: &[u8]) -> String {
+fn redact_form(body: &[u8], redact_fields: &[String]) -> String {
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (key, value) in form_urlencoded::parse(body) {
-        let value: &str = if is_sensitive_key(&key) {
+        let value: &str = if is_redacted_key(&key, redact_fields) {
             REDACTED
         } else {
             &value
@@ -326,26 +399,26 @@ fn redact_form(body: &[u8]) -> String {
     serializer.finish()
 }
 
-fn redact_json(body: &[u8]) -> Option<String> {
+fn redact_json(body: &[u8], redact_fields: &[String]) -> Option<String> {
     let mut value: Value = serde_json::from_slice(body).ok()?;
-    redact_value(&mut value);
+    redact_value(&mut value, redact_fields);
     serde_json::to_string(&value).ok()
 }
 
-fn redact_value(value: &mut Value) {
+fn redact_value(value: &mut Value, redact_fields: &[String]) {
     match value {
         Value::Object(map) => {
             for (key, entry) in map.iter_mut() {
-                if is_sensitive_key(key) {
+                if is_redacted_key(key, redact_fields) {
                     *entry = Value::String(REDACTED.to_owned());
                 } else {
-                    redact_value(entry);
+                    redact_value(entry, redact_fields);
                 }
             }
         }
         Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_value(item);
+                redact_value(item, redact_fields);
             }
         }
         _ => {}
@@ -384,6 +457,11 @@ mod tests {
         form_urlencoded::parse(encoded.as_bytes())
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect()
+    }
+
+    /// Redacts a body with no extra field names.
+    fn redact(content_type: Option<&str>, body: &[u8]) -> String {
+        redact_body(content_type, body, &[])
     }
 
     fn json_value(encoded: &str) -> Option<Value> {
@@ -450,6 +528,22 @@ mod tests {
     #[case::card("card_number")]
     #[case::cvv("CVV")]
     #[case::ssn("ssn")]
+    #[case::pass("pass")]
+    #[case::drupal_pass_confirm("pass_confirm")]
+    #[case::passphrase("passphrase")]
+    #[case::passcode("passcode")]
+    #[case::pin("pin")]
+    #[case::pin_camel("userPin")]
+    #[case::otp("otp")]
+    #[case::credential("credential")]
+    #[case::auth("auth")]
+    #[case::session("session_id")]
+    #[case::private_key("private_key")]
+    #[case::private_key_camel("PrivateKey")]
+    #[case::access_key("AWS-ACCESS_KEY")]
+    #[case::secret_key("secret_key")]
+    #[case::jwt("jwt")]
+    #[case::cookie("cookie")]
     fn sensitive_key_names_are_detected(#[case] key: &str) {
         assert!(is_sensitive_key(key));
     }
@@ -458,13 +552,65 @@ mod tests {
     #[case::name("name")]
     #[case::email("email")]
     #[case::comment("comment")]
+    #[case::author("author")]
+    #[case::shipping("shipping")]
+    #[case::passenger("passenger")]
+    #[case::pinned("pinned_note")]
+    #[case::footprint("footprint")]
     fn ordinary_key_names_are_not_sensitive(#[case] key: &str) {
         assert!(!is_sensitive_key(key));
     }
 
     #[test]
+    fn drupal_login_password_is_redacted_in_a_form_body() {
+        let redacted = redact(
+            Some("application/x-www-form-urlencoded"),
+            b"name=alice&pass=hunter2&form_id=user_login_form",
+        );
+        let pairs = form_pairs(&redacted);
+        assert!(pairs.contains(&("name".to_owned(), "alice".to_owned())));
+        assert!(pairs.contains(&("pass".to_owned(), REDACTED.to_owned())));
+        assert!(!redacted.contains("hunter2"));
+    }
+
+    #[test]
+    fn ordinary_fields_with_short_sensitive_looking_parts_are_kept() {
+        let body = b"author=ann&shipping=tokyo&passenger=kim";
+        assert_eq!(
+            redact(Some("application/x-www-form-urlencoded"), body),
+            "author=ann&shipping=tokyo&passenger=kim"
+        );
+        assert_eq!(
+            redact(None, b"author=ann&shipping=tokyo&passenger=kim"),
+            "author=ann&shipping=tokyo&passenger=kim"
+        );
+    }
+
+    #[test]
+    fn json_and_lexical_bodies_redact_the_pass_field() {
+        let json = redact(
+            Some("application/json"),
+            br#"{"name":"alice","pass":"hunter2"}"#,
+        );
+        let value = json_value(&json).unwrap_or(Value::Null);
+        assert_eq!(value["pass"], REDACTED);
+        assert_eq!(value["name"], "alice");
+        assert_eq!(
+            redact(
+                Some("application/json"),
+                br#"{"name":"alice","pass":"hunter2""#
+            ),
+            r#"{"name":"alice","pass":"[REDACTED]""#
+        );
+        assert_eq!(
+            redact(Some("text/plain"), b"name=alice&pass=hunter2"),
+            "name=alice&pass=[REDACTED]"
+        );
+    }
+
+    #[test]
     fn form_body_redacts_sensitive_values_and_keeps_others() {
-        let redacted = redact_body(
+        let redacted = redact(
             Some("application/x-www-form-urlencoded"),
             b"user=alice&password=hunter2&comment=hello+world",
         );
@@ -478,7 +624,7 @@ mod tests {
     #[test]
     fn json_body_redacts_nested_and_array_values() {
         let body = br#"{"user":{"name":"alice","password":"hunter2"},"items":[{"token":"t1"},{"name":"n"}],"count":3}"#;
-        let redacted = redact_body(Some("application/json"), body);
+        let redacted = redact(Some("application/json"), body);
         let value = json_value(&redacted).unwrap_or(Value::Null);
         assert_eq!(value["user"]["name"], "alice");
         assert_eq!(value["user"]["password"], REDACTED);
@@ -490,14 +636,14 @@ mod tests {
 
     #[test]
     fn json_value_under_a_sensitive_key_is_replaced_whole() {
-        let redacted = redact_body(Some("application/json"), br#"{"secret":{"a":1,"b":[2]}}"#);
+        let redacted = redact(Some("application/json"), br#"{"secret":{"a":1,"b":[2]}}"#);
         let value = json_value(&redacted).unwrap_or(Value::Null);
         assert_eq!(value["secret"], REDACTED);
     }
 
     #[test]
     fn json_content_type_with_parameters_is_recognized() {
-        let redacted = redact_body(Some("Application/JSON; charset=utf-8"), br#"{"pwd":"x"}"#);
+        let redacted = redact(Some("Application/JSON; charset=utf-8"), br#"{"pwd":"x"}"#);
         let value = json_value(&redacted).unwrap_or(Value::Null);
         assert_eq!(value["pwd"], REDACTED);
     }
@@ -505,7 +651,7 @@ mod tests {
     #[test]
     fn malformed_json_string_value_is_redacted() {
         assert_eq!(
-            redact_body(Some("application/json"), br#"{"password": "hunter2""#),
+            redact(Some("application/json"), br#"{"password": "hunter2""#),
             r#"{"password": "[REDACTED]""#
         );
     }
@@ -513,7 +659,7 @@ mod tests {
     #[test]
     fn malformed_json_bare_values_are_redacted_up_to_a_delimiter() {
         assert_eq!(
-            redact_body(
+            redact(
                 Some("application/json"),
                 br#"{"token":12345,"name":"alice""#
             ),
@@ -524,7 +670,7 @@ mod tests {
     #[test]
     fn malformed_json_redacts_nested_keys_and_escaped_quotes() {
         assert_eq!(
-            redact_body(
+            redact(
                 Some("application/json"),
                 br#"{"outer":{"password":"a\"b", "x":1"#
             ),
@@ -535,7 +681,7 @@ mod tests {
     #[test]
     fn malformed_json_redacts_a_sensitive_container_whole() {
         assert_eq!(
-            redact_body(
+            redact(
                 Some("application/json"),
                 br#"{"secret":{"a":"hunter 2"}, "ok":true"#
             ),
@@ -546,21 +692,62 @@ mod tests {
     #[test]
     fn plain_text_key_value_pairs_are_redacted() {
         assert_eq!(
-            redact_body(Some("text/plain"), b"session=1; password=hunter2 next"),
-            "session=1; password=[REDACTED] next"
+            redact(Some("text/plain"), b"session=1; password=hunter2 next"),
+            "session=[REDACTED]; password=[REDACTED] next"
         );
         assert_eq!(
-            redact_body(None, b"a=1&card=4111&b=2"),
+            redact(None, b"a=1&card=4111&b=2"),
             "a=1&card=[REDACTED]&b=2"
         );
     }
 
     #[test]
-    fn plain_text_without_sensitive_keys_is_unchanged() {
-        assert_eq!(
-            redact_body(Some("text/plain"), b"hello world"),
-            "hello world"
+    fn redact_field_names_are_redacted_in_every_body_format() {
+        let fields = vec!["ticket_ref".to_owned()];
+        let form = redact_body(
+            Some("application/x-www-form-urlencoded"),
+            b"Ticket_Ref=T1&ticket=x",
+            &fields,
         );
+        let pairs = form_pairs(&form);
+        assert!(pairs.contains(&("Ticket_Ref".to_owned(), REDACTED.to_owned())));
+        assert!(pairs.contains(&("ticket".to_owned(), "x".to_owned())));
+
+        let json = redact_body(
+            Some("application/json"),
+            br#"{"outer":{"ticket_ref":"T1"},"ticket":"x"}"#,
+            &fields,
+        );
+        let value = json_value(&json).unwrap_or(Value::Null);
+        assert_eq!(value["outer"]["ticket_ref"], REDACTED);
+        assert_eq!(value["ticket"], "x");
+
+        assert_eq!(
+            redact_body(None, b"ticket_ref=T1 ticket=x", &fields),
+            "ticket_ref=[REDACTED] ticket=x"
+        );
+        assert_eq!(
+            redact_body(
+                Some("application/json"),
+                br#"{"ticket_ref": "T1", "n": 1"#,
+                &fields
+            ),
+            r#"{"ticket_ref": "[REDACTED]", "n": 1"#
+        );
+    }
+
+    #[test]
+    fn redact_field_names_match_the_whole_name_only() {
+        let fields = vec!["ticket_ref".to_owned()];
+        assert_eq!(
+            redact_body(None, b"my_ticket_ref=T1&ticket_refs=2", &fields),
+            "my_ticket_ref=T1&ticket_refs=2"
+        );
+    }
+
+    #[test]
+    fn plain_text_without_sensitive_keys_is_unchanged() {
+        assert_eq!(redact(Some("text/plain"), b"hello world"), "hello world");
     }
 
     /// Random JSON values whose keys include sensitive and ordinary names.
@@ -650,7 +837,7 @@ mod tests {
         let body = "\"\":{".repeat(1024 * 1024 / 5);
         let started = std::time::Instant::now();
         let redacted = finishes_within(Duration::from_secs(2), move || {
-            redact_body(None, body.as_bytes())
+            redact(None, body.as_bytes())
         });
         assert!(started.elapsed() < Duration::from_secs(2));
         assert!(redacted.starts_with("\"\":{\"\":{"));
@@ -678,7 +865,7 @@ mod tests {
             ),
         ) {
             let text: String = tokens.concat();
-            prop_assert_eq!(redact_json_like(&text), redact_json_like_eager(&text));
+            prop_assert_eq!(redact_json_like(&text, &[]), redact_json_like_eager(&text));
         }
 
         #[test]
@@ -686,20 +873,20 @@ mod tests {
             value in arbitrary_json(),
         ) {
             let text = value.to_string();
-            prop_assert_eq!(redact_json_like(&text), redact_json_like_eager(&text));
+            prop_assert_eq!(redact_json_like(&text, &[]), redact_json_like_eager(&text));
         }
 
         #[test]
         fn lexical_key_value_redaction_never_keeps_the_secret(value in "zq[a-z0-9]{8,16}") {
-            let redacted = redact_lexical(&format!("name=alice&password={value}"));
+            let redacted = redact_lexical(&format!("name=alice&password={value}"), &[]);
             prop_assert!(!redacted.contains(&value));
             prop_assert!(redacted.contains("name=alice"));
         }
 
         #[test]
         fn malformed_json_never_keeps_the_secret(value in "zq[a-z0-9]{8,16}") {
-            let quoted = redact_body(Some("application/json"), format!("{{\"password\": \"{value}\"").as_bytes());
-            let bare = redact_body(Some("application/json"), format!("{{\"token\":{value}").as_bytes());
+            let quoted = redact(Some("application/json"), format!("{{\"password\": \"{value}\"").as_bytes());
+            let bare = redact(Some("application/json"), format!("{{\"token\":{value}").as_bytes());
             prop_assert!(!quoted.contains(&value));
             prop_assert!(!bare.contains(&value));
         }
@@ -739,6 +926,7 @@ mod tests {
             host: "example.com",
             client_ip: "203.0.113.7",
             redact_headers: &[],
+            redact_fields: &[],
             inspect_body_bytes: 4,
         });
         let json = serde_json::to_value(&event).unwrap_or(Value::Null);
@@ -761,6 +949,7 @@ mod tests {
             host: "example.com",
             client_ip: "203.0.113.7",
             redact_headers: &[],
+            redact_fields: &[],
             inspect_body_bytes: 10,
         });
         let json = serde_json::to_value(&event).unwrap_or(Value::Null);
@@ -783,7 +972,7 @@ mod tests {
                 .append_pair("password", &value)
                 .append_pair("name", "alice")
                 .finish();
-            let redacted = redact_body(Some("application/x-www-form-urlencoded"), encoded.as_bytes());
+            let redacted = redact(Some("application/x-www-form-urlencoded"), encoded.as_bytes());
             let pairs = form_pairs(&redacted);
             prop_assert!(pairs.iter().all(|(_, found)| *found != value));
         }
@@ -792,7 +981,7 @@ mod tests {
         fn redacted_json_never_contains_a_sensitive_value(value in "[ -~]{1,24}") {
             prop_assume!(value != REDACTED);
             let body = serde_json::json!({"outer": [{"token": value.clone()}], "name": "alice"});
-            let redacted = redact_body(Some("application/json"), body.to_string().as_bytes());
+            let redacted = redact(Some("application/json"), body.to_string().as_bytes());
             let parsed = json_value(&redacted).unwrap_or(Value::Null);
             prop_assert_ne!(&parsed["outer"][0]["token"], &Value::String(value.clone()));
         }

@@ -120,11 +120,17 @@ sent:
 - Credential headers are removed. `cookie`, `authorization`,
   `proxy-authorization`, `x-api-key` and `x-auth-token` are always dropped, and
   each name in `redact_header` is dropped too.
-- Form and JSON bodies are scanned for sensitive fields. A field whose name
-  contains `password`, `passwd`, `pwd`, `secret`, `token`, `api_key`, `apikey`,
-  `card`, `cvv` or `ssn` has its value replaced by `[REDACTED]`. Text that is
+- Form and JSON bodies are scanned for sensitive fields. A field is sensitive
+  when its name contains one of `password`, `passwd`, `pwd`, `secret`, `token`,
+  `apikey`, `card`, `cvv`, `ssn`, `passphrase`, `passcode`, `credential`,
+  `private_key` or `access_key` (case and `_`, `-`, `.` ignored), or when one of
+  its words is `pass`, `pin`, `otp`, `auth`, `session`, `cookie` or `jwt`. A word
+  is a run of letters and digits, split at other characters and at a lowercase to
+  uppercase change, so `author`, `shipping` and `passenger` are not sensitive. The
+  value is replaced by `[REDACTED]`. A field named in `redact_field` is also
+  replaced, when its name equals that name, case-insensitively. Text that is
   neither form data nor valid JSON is scanned for `key=value` pairs and
-  `"key": value` pairs with the same names.
+  `"key": value` pairs with the same rules.
 - Only the first `inspect_body` bytes of the body are sent, cut on a UTF-8 boundary.
   `body_truncated` is set when the body was longer.
 

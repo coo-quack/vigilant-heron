@@ -156,3 +156,15 @@
   length. The end is now computed only for a value that is replaced or copied, so
   the scan is linear. The output is unchanged; a property test compares it with
   the previous implementation.
+- Security (F2): the sensitive field names now include `pass`, `passphrase`,
+  `passcode`, `pin`, `otp`, `credential`, `auth`, `session`, `private_key`,
+  `access_key`, `secret_key`, `jwt` and `cookie`. A Drupal login
+  (`name=alice&pass=...`) no longer sends its password to the decision backend.
+  Short words (`pass`, `pin`, `otp`, `auth`, `session`, `cookie`, `jwt`) match a
+  whole word of the field name, so `author`, `shipping` and `passenger` are not
+  redacted. The known names now also match with `_`, `-` or `.` removed
+  (`api_key`, `API-KEY`). New `redact_field <name> ...;` directive in the
+  `decision` block adds field names, matched exactly and case-insensitively.
+  The expectation `session=1` in the lexical test became `session=[REDACTED]`,
+  because the list now includes `session` (the previous expectation encoded the
+  shorter list).

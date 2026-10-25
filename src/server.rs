@@ -85,6 +85,8 @@ pub(crate) struct AppState<B> {
     inspect_body_bytes: usize,
     /// Header names dropped before the event is sent to the backend.
     backend_redact: Vec<String>,
+    /// Body field names redacted before the event is sent to the backend (`redact_field`).
+    backend_redact_fields: Vec<String>,
     backend: B,
     default_status: StatusCode,
     realip: RealIp,
@@ -168,6 +170,7 @@ impl AppState<Backend> {
             proxies,
             inspect_body_bytes: config.decision.inspect_body_bytes,
             backend_redact,
+            backend_redact_fields: config.decision.redact_fields.clone(),
             backend,
             default_status: config.default_status,
             realip: config.realip,
@@ -1072,6 +1075,7 @@ async fn assess<B: DecisionBackend>(
                 host: &host,
                 client_ip,
                 redact_headers: &state.backend_redact,
+                redact_fields: &state.backend_redact_fields,
                 inspect_body_bytes: state.inspect_body_bytes,
             });
             match state.backend.decide(&event).await {

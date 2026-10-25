@@ -405,6 +405,39 @@ async fn backend_never_receives_credentials_and_sees_the_form_password_redacted(
 }
 
 #[tokio::test]
+async fn drupal_login_pass_and_a_redact_field_name_never_reach_the_backend() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    // The decision block of config_text gets one more field name to redact.
+    let config = config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS).replacen(
+        "    inspect_body 512;\n",
+        "    inspect_body 512;\n    redact_field ticket_ref;\n",
+        1,
+    );
+    let proxy = start_proxy(&config).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/user/login",
+        "example.com",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        Bytes::from_static(b"name=alice&pass=hunter2&ticket_ref=T-99&form_id=user_login_form"),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    let forwarded_body = event["event"]["untrusted"]["body"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!forwarded_body.contains("hunter2"), "{forwarded_body}");
+    assert!(!forwarded_body.contains("T-99"), "{forwarded_body}");
+    assert!(forwarded_body.contains("name=alice"), "{forwarded_body}");
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn upstream_that_is_down_gets_502() -> TestResult {
     let stub = StubDecider::start().await?;
     let dead_upstream = closed_port_url().await?;

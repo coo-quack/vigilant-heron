@@ -11,8 +11,9 @@ For every request that is not skipped or blocked by a rule, the router sends
 the request line, headers and up to `inspect_body_bytes` of the body to the
 configured decision backend. It drops `Cookie`, `Authorization`,
 `Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token` and any header listed in
-`redact_headers`, and replaces the values of password-, token- and card-like
-form and JSON fields with `[REDACTED]` before sending. Multipart
+`redact_headers`, and replaces the values of password-, pass-, token-, card-,
+PIN-, OTP-, session- and credential-like form and JSON fields, and of the fields
+named in `redact_field`, with `[REDACTED]` before sending. Multipart
 (`multipart/form-data`) bodies are only lexically redacted, so a sensitive field
 inside one can still reach the backend in some layouts. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the

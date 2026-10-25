@@ -497,6 +497,14 @@ Rejected with an error that names `client_max_body_size`, which is set at the to
 
 Extra header names removed before the event is sent to the backend. Repeatable. They cannot be logged either.
 
+### `redact_field`
+
+- **Syntax:** `redact_field <name> ...;`
+- **Default:** none. Field names with password-, token-, card-like or other sensitive words are redacted already (see [How it works](/how-it-works)).
+- **Context:** decision.
+
+Extra form and JSON field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. Repeatable.
+
 ## Site block
 
 A `site` names the hosts it serves after the keyword. It is required to have at

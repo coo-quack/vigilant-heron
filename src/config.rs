@@ -193,6 +193,7 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
     "inspect_body",
     "max_body",
     "redact_header",
+    "redact_field",
 ];
 
 /// Validated configuration for the whole proxy.
@@ -248,6 +249,9 @@ pub struct DecisionConfig {
     pub inspect_body_bytes: usize,
     /// Extra header names to drop before sending, lowercased.
     pub redact_headers: Vec<String>,
+    /// Extra body field names to redact before sending, lowercased. Each name is
+    /// matched exactly, with the field name compared case-insensitively.
+    pub redact_fields: Vec<String>,
 }
 
 /// Timers and header limits of client connections, set at the top level only.
@@ -1393,6 +1397,7 @@ where
     let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
     let mut inspect_body = DEFAULT_INSPECT_BODY;
     let mut redact_headers = Vec::new();
+    let mut redact_fields = Vec::new();
     let mut backend_line = directive;
     let mut token_line = directive;
     let mut model_line = directive;
@@ -1462,6 +1467,15 @@ where
                     ));
                 }
                 redact_headers.extend(child.args.iter().map(|h| h.to_ascii_lowercase()));
+            }
+            "redact_field" => {
+                if child.args.is_empty() {
+                    return Err(invalid(
+                        child,
+                        "\"redact_field\" needs at least one field name",
+                    ));
+                }
+                redact_fields.extend(child.args.iter().map(|f| f.to_ascii_lowercase()));
             }
             other => {
                 return Err(invalid(
@@ -1566,6 +1580,7 @@ where
         max_concurrency,
         inspect_body_bytes: inspect_body,
         redact_headers,
+        redact_fields,
     })
 }
 
@@ -2462,6 +2477,24 @@ mod tests {
             with_decision("    backend http;\n    redact_header X-Session;\n")
         );
         assert!(message(parse(&redact)).contains("never logged"));
+    }
+
+    #[test]
+    fn redact_field_names_are_read_lowercased_in_the_decision_block() -> Result<(), ConfigError> {
+        let config = parse(&with_decision(
+            "    backend http;\n    redact_field Ticket_Ref Internal-Note;\n    redact_field trace;\n",
+        ))?;
+        assert_eq!(
+            config.decision.redact_fields,
+            ["ticket_ref", "internal-note", "trace"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn redact_field_needs_a_name() {
+        let text = with_decision("    backend http;\n    redact_field;\n");
+        assert!(message(parse(&text)).contains("\"redact_field\" needs at least one field name"));
     }
 
     #[test]
