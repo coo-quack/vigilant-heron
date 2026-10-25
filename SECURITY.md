@@ -143,6 +143,21 @@ Keep a rule-based WAF in front of the router, start each site in `shadow`
 mode, and switch to `enforce` only after measuring missed attacks and false
 positives on real traffic.
 
+## Password guessing and request floods
+
+The decision model judges one request at a time, so it cannot tell that the same
+client has tried a hundred passwords. Throttling that is the job of
+`limit_req` on the path, for example on `/wp-login.php` (see README, "Limits").
+A limit is a rate, not a verdict: the model's scores do not change it.
+
+Zones live in the router process. When a zone has no free state, the request is
+treated as a rejection: it gets the configured status (503 unless
+`limit_req_status` or `limit_conn_status` says otherwise), and in dry run it goes
+on. The error log marks such events with `limit_error=zone_exhausted`, so a flood
+of distinct keys is visible to operators. Size the zones for the number of
+distinct keys (`$client_ip`) you expect; a larger zone holds more states, at
+128 bytes (`limit_req`) or 64 bytes (`limit_conn`) per state.
+
 ## Failure behavior
 
 When the decision backend cannot judge a request, the outcome depends on the

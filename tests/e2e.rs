@@ -467,3 +467,72 @@ async fn rule_block_on_a_large_post_gets_403_through_nginx() -> TestResult {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+/// A key no earlier run has used, so the e2e limits start from empty buckets.
+fn limit_key() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    format!("e2e-{}-{nanos}", std::process::id())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn login_location_answers_429_after_a_burst_of_two() -> TestResult {
+    let key = limit_key();
+    let mut statuses = Vec::new();
+    for _ in 0..4 {
+        let reply = send(
+            &base(),
+            Method::POST,
+            "/wp-login.php",
+            "limits.test",
+            &[("x-limit-key", key.as_str())],
+            Bytes::from_static(b"log=a&pwd=b"),
+        )
+        .await?;
+        statuses.push(reply.status);
+    }
+    assert_eq!(
+        statuses,
+        vec![
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn second_concurrent_request_to_a_held_path_gets_503() -> TestResult {
+    let key = limit_key();
+    let first_key = key.clone();
+    let first = tokio::spawn(async move {
+        send(
+            &base(),
+            Method::POST,
+            "/hold",
+            "limits.test",
+            &[("x-limit-key", first_key.as_str())],
+            Bytes::new(),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let second = send(
+        &base(),
+        Method::POST,
+        "/hold",
+        "limits.test",
+        &[("x-limit-key", key.as_str())],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(second.status, StatusCode::SERVICE_UNAVAILABLE);
+    let first = first.await??;
+    assert_eq!(first.status, StatusCode::OK);
+    Ok(())
+}

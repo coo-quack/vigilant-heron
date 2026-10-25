@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use http::{HeaderMap, HeaderName};
 
 /// Request headers that may never appear in a log, whatever the configuration.
-const FORBIDDEN_HEADERS: [&str; 5] = [
+pub(crate) const FORBIDDEN_HEADERS: [&str; 5] = [
     "cookie",
     "authorization",
     "proxy-authorization",
@@ -54,6 +54,8 @@ pub(crate) enum Field {
     UpstreamStatus,
     UpstreamError,
     LatencyMs,
+    LimitReqStatus,
+    LimitConnStatus,
 }
 
 impl Field {
@@ -83,6 +85,8 @@ impl Field {
             "upstream_status" => Self::UpstreamStatus,
             "upstream_error" => Self::UpstreamError,
             "latency_ms" => Self::LatencyMs,
+            "limit_req_status" => Self::LimitReqStatus,
+            "limit_conn_status" => Self::LimitConnStatus,
             _ => return None,
         })
     }
@@ -309,6 +313,10 @@ pub(crate) struct AccessRecord<'a> {
     pub(crate) upstream_error: Option<&'a str>,
     /// Time from the start of the request to the answer, in milliseconds.
     pub(crate) latency_ms: u64,
+    /// `$limit_req_status`: the worst `limit_req` outcome, when a zone applied.
+    pub(crate) limit_req_status: Option<&'a str>,
+    /// `$limit_conn_status`: the worst `limit_conn` outcome, when a zone applied.
+    pub(crate) limit_conn_status: Option<&'a str>,
 }
 
 /// The value of a field, or `None` when it has none.
@@ -339,6 +347,8 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::UpstreamStatus => record.upstream_status.map(|v| v.to_string()),
         Field::UpstreamError => record.upstream_error.and_then(text),
         Field::LatencyMs => Some(record.latency_ms.to_string()),
+        Field::LimitReqStatus => record.limit_req_status.and_then(text),
+        Field::LimitConnStatus => record.limit_conn_status.and_then(text),
     }
 }
 
@@ -502,6 +512,8 @@ mod tests {
             category: Some("sql_injection"),
             decision_error: None,
             retry_after: None,
+            limit_req_status: None,
+            limit_conn_status: None,
             input_tokens: Some(1234),
             upstream_status: Some(200),
             upstream_error: None,

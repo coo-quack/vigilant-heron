@@ -20,6 +20,7 @@ use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use tokio::time::Sleep;
 
+use crate::limits::ConnPermit;
 use crate::transport::expired;
 
 /// An error that a body can return.
@@ -288,6 +289,8 @@ pub(crate) struct Finish<B> {
     inner: B,
     phase: Arc<crate::transport::PhaseCell>,
     body_done: Arc<AtomicBool>,
+    /// `limit_conn` counts of the request, released when the response is dropped.
+    permits: Vec<ConnPermit>,
 }
 
 impl<B> Finish<B> {
@@ -301,7 +304,14 @@ impl<B> Finish<B> {
             inner,
             phase,
             body_done,
+            permits: Vec::new(),
         }
+    }
+
+    /// Keeps the `limit_conn` counts of the request until this body is dropped.
+    pub(crate) fn holding(mut self, permits: Vec<ConnPermit>) -> Self {
+        self.permits = permits;
+        self
     }
 
     /// Ends the response's use of the connection: idle for keep-alive when the request

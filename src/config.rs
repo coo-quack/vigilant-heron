@@ -17,6 +17,7 @@ use crate::access::AccessEntry;
 use crate::accesslog::{Escape, LogFormat};
 use crate::conf::{self, Directive};
 use crate::error::ConfigError;
+use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig};
 use crate::logsink::Destination;
 use crate::realip::{IpNet, RealIp};
 use crate::router::normalize_host;
@@ -103,6 +104,10 @@ pub struct Config {
     pub error_log: ErrorLogConfig,
     /// The top-level access list, used for every site that has none of its own.
     pub access: Vec<AccessEntry>,
+    /// The `limit_req_zone` and `limit_conn_zone` zones, in definition order.
+    pub(crate) zones: Vec<LimitZone>,
+    /// The limits of the top level, inherited by every site.
+    pub(crate) limits: LimitSet,
 }
 
 /// Settings for the decision backend and the body it receives.
@@ -250,6 +255,10 @@ pub struct SiteConfig {
     pub access: Vec<AccessEntry>,
     /// The rules this site runs, in evaluation order.
     pub(crate) rules: SiteRules,
+    /// The limits of the site, before any location is selected.
+    pub(crate) limits: LimitSet,
+    /// The site's location blocks, in configuration order.
+    pub(crate) locations: Vec<LocationConfig>,
 }
 
 /// One access-log destination with its format.
@@ -449,7 +458,7 @@ fn parse_time(directive: &Directive, text: &str) -> Result<Duration, ConfigError
 }
 
 /// Parses a size: a number with `k`, `m` or `g` (any case). A bare number is bytes.
-fn parse_size(directive: &Directive, text: &str) -> Result<usize, ConfigError> {
+pub(crate) fn parse_size(directive: &Directive, text: &str) -> Result<usize, ConfigError> {
     let (digits, unit) = split_unit(text);
     let value: usize = digits.parse().map_err(|_| {
         invalid(
@@ -642,7 +651,7 @@ fn is_valid_model_id(value: &str) -> bool {
 }
 
 /// Records a directive that may appear only once.
-fn once(seen: &mut HashSet<String>, directive: &Directive) -> Result<(), ConfigError> {
+pub(crate) fn once(seen: &mut HashSet<String>, directive: &Directive) -> Result<(), ConfigError> {
     if seen.insert(directive.name.clone()) {
         Ok(())
     } else {
@@ -689,6 +698,8 @@ where
     };
     let mut access_directives = Vec::new();
     let mut format_directives = Vec::new();
+    let mut zone_directives: Vec<&Directive> = Vec::new();
+    let mut top_limit_directives: Vec<&Directive> = Vec::new();
     let mut connection = ConnectionConfig {
         client_header_timeout: DEFAULT_CLIENT_HEADER_TIMEOUT,
         keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
@@ -716,12 +727,17 @@ where
         if directive.name == "log_format" {
             format_directives.push(directive);
         }
+        if limits::ZONE_NAMES.contains(&directive.name.as_str()) {
+            zone_directives.push(directive);
+        }
     }
     let formats = collect_formats(&format_directives)?;
 
     for directive in directives {
         match directive.name.as_str() {
             "log_format" => {}
+            name if limits::ZONE_NAMES.contains(&name) => {}
+            name if limits::LIMIT_NAMES.contains(&name) => top_limit_directives.push(directive),
             "listen" => {
                 once(&mut seen, directive)?;
                 listen = Some(one_arg(directive)?.to_owned());
@@ -888,6 +904,12 @@ where
     let decision = parse_decision(decision_directive, lookup)?;
     let redact = decision.redact_headers.clone();
     let formats = compile_formats(formats, &redact)?;
+    let zones = limits::build_zones(&zone_directives, &redact)?;
+    let mut top_overrides = LimitOverrides::default();
+    for directive in &top_limit_directives {
+        top_overrides.apply(directive, &zones, &mut seen)?;
+    }
+    let top_limits = top_overrides.resolve(&LimitSet::default());
     let access_logs = resolve_top_access(&access_directives, &formats)?;
 
     if site_directives.is_empty() {
@@ -903,6 +925,8 @@ where
         builtin_enabled: builtin_top,
         disabled: &disabled_top,
         rules: &top_rules,
+        zones: &zones,
+        limits: &top_limits,
     };
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
@@ -948,6 +972,8 @@ where
         error_log,
         connection,
         access: top_access,
+        zones,
+        limits: top_limits,
     })
 }
 
@@ -1406,6 +1432,10 @@ struct Top<'a> {
     disabled: &'a [String],
     /// Top-level rules, each with the sites it applies to.
     rules: &'a [ParsedRule],
+    /// The limit zones.
+    zones: &'a [LimitZone],
+    /// The limits of the top level.
+    limits: &'a LimitSet,
 }
 
 /// Reads one `allow` or `deny` directive.
@@ -1476,6 +1506,8 @@ fn parse_site(
     let mut builtin_enabled: Option<bool> = None;
     let mut own_disabled: Vec<String> = Vec::new();
     let mut own_rules: Vec<ParsedRule> = Vec::new();
+    let mut site_limits = LimitOverrides::default();
+    let mut pending_locations = Vec::new();
 
     for child in block(directive)? {
         match child.name.as_str() {
@@ -1588,6 +1620,18 @@ fn parse_site(
                 rules::claim_id(claimed, &parsed)?;
                 own_rules.push(parsed);
             }
+            name if limits::ZONE_NAMES.contains(&name) => {
+                return Err(invalid(
+                    child,
+                    format!(
+                        "\"{name}\" is only valid at the top level: zones are shared by every site"
+                    ),
+                ));
+            }
+            name if limits::LIMIT_NAMES.contains(&name) => {
+                site_limits.apply(child, top.zones, &mut seen)?;
+            }
+            "location" => pending_locations.push(limits::parse_location(child, top.zones)?),
             other => {
                 return Err(invalid(
                     child,
@@ -1595,6 +1639,24 @@ fn parse_site(
                 ));
             }
         }
+    }
+    let site_limit_set = site_limits.resolve(top.limits);
+    let mut locations: Vec<LocationConfig> = Vec::new();
+    for pending in pending_locations {
+        let duplicate = locations.iter().any(|earlier| {
+            earlier.matcher == pending.matcher
+                && !matches!(pending.matcher, limits::Matcher::Regex(_))
+        });
+        if duplicate {
+            return Err(invalid(
+                pending.directive,
+                "duplicate \"location\" with the same modifier and path",
+            ));
+        }
+        locations.push(LocationConfig {
+            matcher: pending.matcher,
+            limits: pending.overrides.resolve(&site_limit_set),
+        });
     }
 
     if access_off {
@@ -1652,6 +1714,8 @@ fn parse_site(
         timeouts,
         access,
         rules,
+        limits: site_limit_set,
+        locations,
     })
 }
 

@@ -17,6 +17,7 @@ mod conf;
 mod config;
 mod decision;
 mod error;
+mod limits;
 mod logsink;
 mod policy;
 mod prefilter;

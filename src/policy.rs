@@ -3,7 +3,7 @@
 //! Deterministic rules are decided before the backend is called, so the
 //! `Rule` assessment never depends on how a backend failure is configured.
 
-use http::HeaderValue;
+use http::{HeaderValue, StatusCode};
 
 use crate::config::{FailureAction, Mode, SiteAction, SiteConfig};
 use crate::decision::Verdict;
@@ -17,6 +17,8 @@ pub(crate) enum Action {
     Block,
     /// Respond with 302 and this `Location` value.
     Redirect(HeaderValue),
+    /// Respond with this status, because a limit refused the request. Only seen as a would-have action.
+    Reject(StatusCode),
 }
 
 impl Action {
@@ -26,6 +28,7 @@ impl Action {
             Self::Allow => "allow",
             Self::Block => "block",
             Self::Redirect(_) => "redirect",
+            Self::Reject(_) => "reject",
         }
     }
 }

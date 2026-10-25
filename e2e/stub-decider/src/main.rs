@@ -8,7 +8,8 @@
 //! see the same scores on every run. Requests whose path contains `/slow` are
 //! held for one second before the answer. Any `POST /echo/...` is an upstream
 //! for the e2e upload site: it answers with the length and FNV-1a hash of the body
-//! it received, so the test can check the body arrived intact.
+//! it received, so the test can check the body arrived intact. An echo whose path
+//! contains `/hold` is held for one second first.
 
 use std::convert::Infallible;
 use std::sync::OnceLock;
@@ -37,6 +38,10 @@ const INSTRUCTION_MARKERS: [&str; 2] = ["ignore previous", "answer benign"];
 const HIGH: f64 = 0.99;
 const LOW: f64 = 0.01;
 const SLOW_MARKER: &str = "/slow";
+
+/// Echo requests whose path contains this are held for one second, so a limit on
+/// concurrent requests can be tested through the upstream.
+const ECHO_HOLD_MARKER: &str = "/hold";
 /// A request whose path contains this is answered with HTTP 429 and `Retry-After`.
 const RATE_LIMIT_MARKER: &str = "/ratelimited";
 const SLOW_DELAY: Duration = Duration::from_secs(1);
@@ -117,6 +122,9 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
 
 /// Answers with the length and FNV-1a hash of the request body, as a decimal string.
 async fn echo(request: Request<Incoming>) -> Response<Full<Bytes>> {
+    if request.uri().path().contains(ECHO_HOLD_MARKER) {
+        tokio::time::sleep(SLOW_DELAY).await;
+    }
     let Ok(collected) = request.into_body().collect().await else {
         return reply(StatusCode::BAD_REQUEST, &json!({"error": "body"}));
     };
