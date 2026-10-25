@@ -38,6 +38,7 @@ impl Running {
             },
             reloads,
             move || Config::load(&file),
+            |_| {},
         ));
         Ok(Self {
             base,

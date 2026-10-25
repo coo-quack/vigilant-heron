@@ -179,7 +179,9 @@ fails validation is rejected: the error is logged with its file and line, and
 the configuration that was running keeps serving. Requests in flight during a
 reload finish with the configuration they started with. The listen address and
 the connection-level settings do not change until a restart, and a reload that
-changes them logs a warning.
+changes them logs a warning. The error log follows the reloaded file: its level
+and destination apply at once. A destination that cannot be opened fails the
+reload, and the failure is logged to the destination still in use.
 
 ## Failure behavior
 

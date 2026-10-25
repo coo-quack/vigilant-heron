@@ -38,8 +38,8 @@ use crate::accesslog::{AccessRecord, LogFormat};
 use crate::block::{BlockResponse, BlockStatus};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
 use crate::config::{
-    AccessLogConfig, BackendConfig, Config, ConnectionConfig, ErrorLogConfig, MAX_REQUEST_ID_BYTES,
-    Mode, SiteConfig,
+    AccessLogConfig, BackendConfig, Config, ConnectionConfig, MAX_REQUEST_ID_BYTES, Mode,
+    SiteConfig,
 };
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
 use crate::error::ConfigError;
@@ -207,7 +207,6 @@ struct Startup {
     worker_threads: Option<usize>,
     max_connections: usize,
     connection: ConnectionConfig,
-    error_log: ErrorLogConfig,
 }
 
 impl Startup {
@@ -217,7 +216,6 @@ impl Startup {
             worker_threads: config.worker_threads,
             max_connections: config.max_connections,
             connection: config.connection.clone(),
-            error_log: config.error_log.clone(),
         }
     }
 
@@ -237,16 +235,15 @@ impl Startup {
                 "connection timers and header limits changed; a restart is needed for them to take effect"
             );
         }
-        if config.error_log.destination != self.error_log.destination
-            || config.error_log.level != self.error_log.level
-        {
-            tracing::warn!("error_log changed; a restart is needed for it to take effect");
-        }
     }
 }
 
 /// Where a reload gets its configuration: a function that reads and validates it.
 type Loader = Box<dyn Fn() -> Result<Config, ConfigError> + Send>;
+
+/// Called with a reloaded configuration once it is in service, for the settings
+/// that live outside the server (the error log).
+type Applied = Box<dyn Fn(&Config) + Send>;
 
 /// Serves requests on `listener` until `shutdown` completes.
 ///
@@ -274,6 +271,10 @@ pub async fn serve(
 /// with the same name and size exists. The listen address, `worker_threads`,
 /// `max_connections` and the connection timers apply only at startup.
 ///
+/// `applied` is called with the new configuration after it is in service, and
+/// before the reload is logged. It is not called for a reload that fails, so the
+/// caller can stage a change in `load` and apply it here.
+///
 /// # Errors
 ///
 /// Returns the same errors as [`serve`].
@@ -283,15 +284,22 @@ pub async fn serve_reloadable(
     shutdown: impl Future<Output = ()>,
     reloads: mpsc::Receiver<()>,
     load: impl Fn() -> Result<Config, ConfigError> + Send + 'static,
+    applied: impl Fn(&Config) + Send + 'static,
 ) -> Result<(), ServeError> {
-    run(listener, config, shutdown, Some((reloads, Box::new(load)))).await
+    run(
+        listener,
+        config,
+        shutdown,
+        Some((reloads, Box::new(load), Box::new(applied))),
+    )
+    .await
 }
 
 async fn run(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()>,
-    reloads: Option<(mpsc::Receiver<()>, Loader)>,
+    reloads: Option<(mpsc::Receiver<()>, Loader, Applied)>,
 ) -> Result<(), ServeError> {
     let max_connections = config.max_connections;
     let settings = ConnectionSettings {
@@ -305,9 +313,9 @@ async fn run(
     let slots = Arc::new(Semaphore::new(max_connections));
     let mut shutdown = pin!(shutdown);
     let mut connections = JoinSet::new();
-    let (mut requests, load) = match reloads {
-        Some((requests, load)) => (Some(requests), Some(load)),
-        None => (None, None),
+    let (mut requests, load, applied) = match reloads {
+        Some((requests, load, applied)) => (Some(requests), Some(load), Some(applied)),
+        None => (None, None, None),
     };
     loop {
         // Both waits race with shutdown, so a full connection limit cannot block the stop.
@@ -315,8 +323,8 @@ async fn run(
         let permit = tokio::select! {
             () = &mut shutdown => break,
             Some(()) = next_reload(&mut requests) => {
-                if let Some(load) = &load {
-                    reload(load.as_ref(), &startup, &current_tx);
+                if let (Some(load), Some(applied)) = (&load, &applied) {
+                    reload(load.as_ref(), applied.as_ref(), &startup, &current_tx);
                 }
                 continue;
             }
@@ -327,8 +335,8 @@ async fn run(
         let (stream, peer) = tokio::select! {
             () = &mut shutdown => break,
             Some(()) = next_reload(&mut requests) => {
-                if let Some(load) = &load {
-                    reload(load.as_ref(), &startup, &current_tx);
+                if let (Some(load), Some(applied)) = (&load, &applied) {
+                    reload(load.as_ref(), applied.as_ref(), &startup, &current_tx);
                 }
                 continue;
             }
@@ -363,6 +371,7 @@ async fn next_reload(requests: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
 /// failure is logged and leaves the current state in place.
 fn reload(
     load: &dyn Fn() -> Result<Config, ConfigError>,
+    applied: &dyn Fn(&Config),
     startup: &Startup,
     current: &watch::Sender<Arc<AppState<Backend>>>,
 ) {
@@ -375,9 +384,10 @@ fn reload(
     };
     startup.report_changes(&config);
     let previous = current.borrow().clone();
-    match AppState::from_config(config, &previous.zones) {
+    match AppState::from_config(config.clone(), &previous.zones) {
         Ok(state) => {
             current.send_replace(Arc::new(state));
+            applied(&config);
             tracing::info!("configuration reloaded");
         }
         Err(error) => {

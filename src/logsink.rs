@@ -11,16 +11,23 @@ use std::io::{self, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
+use tracing_subscriber::Registry;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 
 use crate::accesslog;
+use crate::config::{ErrorLogConfig, LogLevel};
+use crate::error::ConfigError;
+use crate::transport::lock;
 
 /// Lines the queue holds before new lines are dropped.
 pub(crate) const QUEUE_CAPACITY: usize = 4096;
@@ -264,78 +271,44 @@ async fn run_writer(
     }
 }
 
-/// The error log: where `tracing` events are written.
-#[derive(Debug, Clone)]
+/// The error log's output. Every write and every reopen takes the lock, so a
+/// line is never split, and a swap to another destination never lands inside one.
+#[derive(Debug)]
 enum ErrorSink {
     /// Standard output.
     Stdout,
     /// Standard error.
     Stderr,
-    /// A file, reopened on SIGUSR1.
+    /// A file, appended to and reopened on SIGUSR1.
     File {
         /// Where the file is.
         path: PathBuf,
         /// The open file, when there is one.
-        file: Arc<Mutex<Option<File>>>,
+        file: Option<File>,
     },
 }
 
-/// Handle to the error log, used to reopen its file.
-#[derive(Debug, Clone)]
-pub struct ErrorLogHandle {
-    sink: ErrorSink,
-}
-
-impl ErrorLogHandle {
-    /// Reopens the error log file, after logrotate moved it away. Other destinations do nothing.
-    pub fn reopen(&self) {
-        self.sink.reopen();
-    }
-}
-
-/// Sends `tracing` output to the `error_log` destination at its level, and returns a
-/// handle for reopening it. Call it once, before the runtime starts.
-#[must_use]
-pub fn install_error_log(config: &crate::config::ErrorLogConfig) -> ErrorLogHandle {
-    let level = match config.level {
-        crate::config::LogLevel::Error => tracing::Level::ERROR,
-        crate::config::LogLevel::Warn => tracing::Level::WARN,
-        crate::config::LogLevel::Info => tracing::Level::INFO,
-        crate::config::LogLevel::Debug => tracing::Level::DEBUG,
-    };
-    let sink = ErrorSink::open(&config.destination);
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(level)
-        .with_ansi(false)
-        .with_writer(sink.clone())
-        .finish();
-    // Only the first installation takes effect; later calls leave the existing subscriber.
-    let _ = tracing::subscriber::set_global_default(subscriber);
-    ErrorLogHandle { sink }
-}
-
 impl ErrorSink {
-    /// Opens the error log for `destination`.
-    fn open(destination: &Destination) -> Self {
+    /// Opens `destination`. A file that cannot be opened is an error.
+    fn open(destination: &Destination) -> io::Result<Self> {
         match destination {
-            Destination::Stdout => Self::Stdout,
-            Destination::File(path) => Self::File {
+            Destination::Stdout => Ok(Self::Stdout),
+            Destination::File(path) => Ok(Self::File {
                 path: path.clone(),
-                file: Arc::new(Mutex::new(open_std_file(path))),
-            },
-            _ => Self::Stderr,
+                file: Some(open_std_file(path)?),
+            }),
+            _ => Ok(Self::Stderr),
         }
     }
 
     /// Reopens the file, after logrotate moved it away.
-    fn reopen(&self) {
+    fn reopen(&mut self) {
         if let Self::File { path, file } = self {
-            let mut guard = file.lock().unwrap_or_else(PoisonError::into_inner);
-            *guard = open_std_file(path);
+            *file = open_std_file(path).ok();
         }
     }
 
-    fn write_all(&self, bytes: &[u8]) {
+    fn write_all(&mut self, bytes: &[u8]) {
         match self {
             Self::Stdout => {
                 let _ = io::stdout().write_all(bytes);
@@ -343,29 +316,120 @@ impl ErrorSink {
             Self::Stderr => {
                 let _ = io::stderr().write_all(bytes);
             }
-            Self::File { file, .. } => {
-                let mut guard = file.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(handle) = guard.as_mut() {
-                    let _ = handle.write_all(bytes);
-                }
+            Self::File {
+                file: Some(handle), ..
+            } => {
+                let _ = handle.write_all(bytes);
             }
+            Self::File { file: None, .. } => {}
         }
     }
 }
 
-#[must_use]
-fn open_std_file(path: &PathBuf) -> Option<File> {
-    StdOpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()
+/// A checked `error_log` destination and level, waiting for [`ErrorLogHandle::commit`].
+#[derive(Debug)]
+struct Staged {
+    sink: ErrorSink,
+    level: LevelFilter,
 }
+
+/// Handle to the error log. It reopens the file on SIGUSR1, and applies the
+/// `error_log` of a reloaded configuration: [`stage`](Self::stage) checks it and
+/// [`commit`](Self::commit) switches to it.
+#[derive(Clone)]
+pub struct ErrorLogHandle {
+    sink: Arc<Mutex<ErrorSink>>,
+    level: reload::Handle<LevelFilter, Registry>,
+    staged: Arc<Mutex<Option<Staged>>>,
+}
+
+impl ErrorLogHandle {
+    /// Reopens the error log file, after logrotate moved it away. Other destinations do nothing.
+    pub fn reopen(&self) {
+        lock(&self.sink).reopen();
+    }
+
+    /// Opens the destination of `config` and keeps it for [`commit`](Self::commit).
+    /// Nothing that is written changes until `commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ErrorLog`] when the destination cannot be opened.
+    pub fn stage(&self, config: &ErrorLogConfig) -> Result<(), ConfigError> {
+        let sink =
+            ErrorSink::open(&config.destination).map_err(|source| ConfigError::ErrorLog {
+                destination: config.destination.label(),
+                source,
+            })?;
+        *lock(&self.staged) = Some(Staged {
+            sink,
+            level: level_filter(config.level),
+        });
+        Ok(())
+    }
+
+    /// Switches to the staged destination and level. Messages logged after this
+    /// call go to the new destination. Does nothing when nothing is staged.
+    pub fn commit(&self) {
+        let Some(staged) = lock(&self.staged).take() else {
+            return;
+        };
+        // The previous file is closed when its sink is dropped here.
+        *lock(&self.sink) = staged.sink;
+        // Applying the level cannot fail: the handle's subscriber is alive while this handle is.
+        let _ = self.level.modify(|filter| *filter = staged.level);
+    }
+}
+
+/// Sends `tracing` output to the `error_log` destination at its level, and returns
+/// a handle that reloads them. Call it once, before the runtime starts: a second
+/// call leaves the first subscriber in place, and its handle changes nothing.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::ErrorLog`] when a file destination cannot be opened.
+pub fn install_error_log(config: &ErrorLogConfig) -> Result<ErrorLogHandle, ConfigError> {
+    let sink = Arc::new(Mutex::new(ErrorSink::Stderr));
+    let (level_layer, level) = reload::Layer::new(level_filter(config.level));
+    let subscriber = tracing_subscriber::registry().with(level_layer).with(
+        tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(SharedSink(Arc::clone(&sink))),
+    );
+    // Only the first installation takes effect.
+    let _ = tracing::subscriber::set_global_default(subscriber);
+    let handle = ErrorLogHandle {
+        sink,
+        level,
+        staged: Arc::new(Mutex::new(None)),
+    };
+    handle.stage(config)?;
+    handle.commit();
+    Ok(handle)
+}
+
+/// The `tracing` filter for an `error_log` level.
+fn level_filter(level: LogLevel) -> LevelFilter {
+    match level {
+        LogLevel::Error => LevelFilter::ERROR,
+        LogLevel::Warn => LevelFilter::WARN,
+        LogLevel::Info => LevelFilter::INFO,
+        LogLevel::Debug => LevelFilter::DEBUG,
+    }
+}
+
+fn open_std_file(path: &PathBuf) -> io::Result<File> {
+    StdOpenOptions::new().create(true).append(true).open(path)
+}
+
+/// The writer shared by every event: each event is written through the lock.
+#[derive(Clone)]
+struct SharedSink(Arc<Mutex<ErrorSink>>);
 
 /// Buffers one `tracing` event and writes it in one call.
 struct EventWriter {
     buffer: Vec<u8>,
-    sink: ErrorSink,
+    sink: Arc<Mutex<ErrorSink>>,
 }
 
 impl io::Write for EventWriter {
@@ -381,17 +445,17 @@ impl io::Write for EventWriter {
 
 impl Drop for EventWriter {
     fn drop(&mut self) {
-        self.sink.write_all(&self.buffer);
+        lock(&self.sink).write_all(&self.buffer);
     }
 }
 
-impl<'a> MakeWriter<'a> for ErrorSink {
+impl<'a> MakeWriter<'a> for SharedSink {
     type Writer = EventWriter;
 
     fn make_writer(&'a self) -> Self::Writer {
         EventWriter {
             buffer: Vec::new(),
-            sink: self.clone(),
+            sink: Arc::clone(&self.0),
         }
     }
 }

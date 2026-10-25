@@ -44,7 +44,7 @@ fn run_cli() -> anyhow::Result<ExitCode> {
     // The configuration is loaded before the runtime exists, because `worker_threads` sizes the runtime.
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
-    let error_log = install_error_log(&config.error_log);
+    let error_log = install_error_log(&config.error_log)?;
     let runtime = build_runtime(config.worker_threads)?;
     runtime.block_on(run(config, error_log, config_path))?;
     Ok(ExitCode::SUCCESS)
@@ -117,14 +117,13 @@ async fn run(
     error_log: ErrorLogHandle,
     config_path: PathBuf,
 ) -> anyhow::Result<()> {
-    // SIGHUP reloads the configuration, as `nginx -s reload` does. The error log is reopened too.
+    // SIGHUP reloads the configuration, as `nginx -s reload` does. The reload
+    // opens the error log destination of the new file, so it also reopens the file.
     let (reload_tx, reload_rx) = tokio::sync::mpsc::channel::<()>(1);
     match signal(SignalKind::hangup()) {
         Ok(mut hangup) => {
-            let error_log = error_log.clone();
             tokio::spawn(async move {
                 while hangup.recv().await.is_some() {
-                    error_log.reopen();
                     // A reload already waiting covers this signal too.
                     let _ = reload_tx.try_send(());
                 }
@@ -137,6 +136,7 @@ async fn run(
     // Reopen the error log on SIGUSR1, so logrotate can move the file away.
     match signal(SignalKind::user_defined1()) {
         Ok(mut usr1) => {
+            let error_log = error_log.clone();
             tokio::spawn(async move {
                 while usr1.recv().await.is_some() {
                     error_log.reopen();
@@ -151,9 +151,22 @@ async fn run(
         .await
         .with_context(|| format!("binding {}", config.listen))?;
     tracing::info!(listen = %config.listen, "vigilant-heron is listening");
-    serve_reloadable(listener, config, shutdown_signal(), reload_rx, move || {
-        Config::load(&config_path)
-    })
+    // A reload stages the new error log destination before the configuration is
+    // put into service, and the staged destination is committed only after that.
+    let staging = error_log.clone();
+    let committing = error_log;
+    serve_reloadable(
+        listener,
+        config,
+        shutdown_signal(),
+        reload_rx,
+        move || {
+            let config = Config::load(&config_path)?;
+            staging.stage(&config.error_log)?;
+            Ok(config)
+        },
+        move |_| committing.commit(),
+    )
     .await?;
     tracing::info!("vigilant-heron stopped");
     Ok(())
