@@ -16,7 +16,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use http::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderName, HeaderValue, LOCATION};
+use http::header::{
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION, UPGRADE,
+};
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::Body;
@@ -25,24 +27,28 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
+use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::access::{self, AccessEntry};
 use crate::accesslog::{AccessRecord, LogFormat};
+use crate::block::{BlockResponse, BlockStatus};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
 use crate::config::{
-    AccessLogConfig, BackendConfig, Config, MAX_REQUEST_ID_BYTES, Mode, SiteConfig,
+    AccessLogConfig, BackendConfig, Config, ConnectionConfig, ErrorLogConfig, MAX_REQUEST_ID_BYTES,
+    Mode, SiteConfig,
 };
 use crate::decision::{Backend, DecisionBackend, HttpDecisionBackend, Limits, decision_client};
+use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
 use crate::logsink::{Writer, spawn_writer};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
-use crate::proxy::Proxy;
+use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
 use crate::realip::RealIp;
 use crate::router::{Router, normalize_host};
 use crate::rules::RuleInput;
@@ -51,8 +57,13 @@ use crate::system_one::SystemOneBackend;
 use crate::transport::{
     ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Phase, PhaseCell, Rejection, RejectionSlot, lock,
 };
+use crate::tunnel;
 
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
+
+/// Marks a response whose connection must close without the response being written (`block_status 444`).
+#[derive(Debug, Clone, Copy)]
+struct CloseWithoutResponse;
 
 type ResponseBody = BoxBody<Bytes, BoxError>;
 
@@ -72,10 +83,6 @@ pub(crate) struct AppState<B> {
     proxies: Vec<Proxy>,
     /// Bytes of the request body read for the decision.
     inspect_body_bytes: usize,
-    /// Connection timers and header limits.
-    timers: ClientTimers,
-    /// Requests per connection before it is closed.
-    keepalive_requests: usize,
     /// Header names dropped before the event is sent to the backend.
     backend_redact: Vec<String>,
     backend: B,
@@ -93,7 +100,9 @@ pub(crate) struct AppState<B> {
 }
 
 impl AppState<Backend> {
-    fn from_config(config: Config) -> Result<Self, ServeError> {
+    /// Builds the state of `config`. Zones named like a zone of `previous`, with the
+    /// same size, keep their counts.
+    fn from_config(config: Config, previous: &[Arc<ZoneStore>]) -> Result<Self, ServeError> {
         let client = decision_client()?;
         let url = config.decision.url.clone();
         let limits = Limits {
@@ -158,8 +167,6 @@ impl AppState<Backend> {
             sites: config.sites,
             proxies,
             inspect_body_bytes: config.decision.inspect_body_bytes,
-            timers: ClientTimers::from_config(&config.connection),
-            keepalive_requests: config.connection.keepalive_requests,
             backend_redact,
             backend,
             default_status: config.default_status,
@@ -170,12 +177,76 @@ impl AppState<Backend> {
             zones: config
                 .zones
                 .into_iter()
-                .map(|zone| Arc::new(ZoneStore::new(zone)))
+                .map(|zone| {
+                    let shared = previous.iter().find(|old| {
+                        old.name() == zone.name.as_str() && old.capacity() == zone.capacity
+                    });
+                    Arc::new(match shared {
+                        Some(old) => ZoneStore::sharing(zone, old),
+                        None => ZoneStore::new(zone),
+                    })
+                })
                 .collect(),
             top_limits: config.limits,
         })
     }
 }
+
+/// Connection settings that stay the same for the whole run: a reload does not change them.
+#[derive(Debug, Clone, Copy)]
+struct ConnectionSettings {
+    /// Connection timers and header limits.
+    timers: ClientTimers,
+    /// Requests per connection before it is closed.
+    keepalive_requests: usize,
+}
+
+/// The settings that a reload cannot change. A reload that changes one logs a warning.
+struct Startup {
+    listen: String,
+    worker_threads: Option<usize>,
+    max_connections: usize,
+    connection: ConnectionConfig,
+    error_log: ErrorLogConfig,
+}
+
+impl Startup {
+    fn of(config: &Config) -> Self {
+        Self {
+            listen: config.listen.clone(),
+            worker_threads: config.worker_threads,
+            max_connections: config.max_connections,
+            connection: config.connection.clone(),
+            error_log: config.error_log.clone(),
+        }
+    }
+
+    /// Warns about each setting of `config` that differs from the startup value.
+    fn report_changes(&self, config: &Config) {
+        if config.listen != self.listen {
+            tracing::warn!(listen = %config.listen, "listen changed; a restart is needed for it to take effect");
+        }
+        if config.worker_threads != self.worker_threads {
+            tracing::warn!("worker_threads changed; a restart is needed for it to take effect");
+        }
+        if config.max_connections != self.max_connections {
+            tracing::warn!("max_connections changed; a restart is needed for it to take effect");
+        }
+        if config.connection != self.connection {
+            tracing::warn!(
+                "connection timers and header limits changed; a restart is needed for them to take effect"
+            );
+        }
+        if config.error_log.destination != self.error_log.destination
+            || config.error_log.level != self.error_log.level
+        {
+            tracing::warn!("error_log changed; a restart is needed for it to take effect");
+        }
+    }
+}
+
+/// Where a reload gets its configuration: a function that reads and validates it.
+type Loader = Box<dyn Fn() -> Result<Config, ConfigError> + Send>;
 
 /// Serves requests on `listener` until `shutdown` completes.
 ///
@@ -184,32 +255,88 @@ impl AppState<Backend> {
 ///
 /// # Errors
 ///
-/// Returns [`ServeError::Accept`] when the listener fails to accept a connection.
+/// Returns [`ServeError::Accept`] when the listener fails to accept a connection,
+/// and an error when the configuration cannot be put into service.
 pub async fn serve(
     listener: TcpListener,
     config: Config,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ServeError> {
+    run(listener, config, shutdown, None).await
+}
+
+/// Serves like [`serve`], and reloads the configuration each time `reloads` receives a message.
+///
+/// `load` reads and validates the configuration. A reload that fails is logged at
+/// error level, and the previous configuration keeps serving. A reload that
+/// succeeds applies to the requests that start after it; requests in flight finish
+/// with the configuration they started with. Zones keep their counts when a zone
+/// with the same name and size exists. The listen address, `worker_threads`,
+/// `max_connections` and the connection timers apply only at startup.
+///
+/// # Errors
+///
+/// Returns the same errors as [`serve`].
+pub async fn serve_reloadable(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+    reloads: mpsc::Receiver<()>,
+    load: impl Fn() -> Result<Config, ConfigError> + Send + 'static,
+) -> Result<(), ServeError> {
+    run(listener, config, shutdown, Some((reloads, Box::new(load)))).await
+}
+
+async fn run(
+    listener: TcpListener,
+    config: Config,
+    shutdown: impl Future<Output = ()>,
+    reloads: Option<(mpsc::Receiver<()>, Loader)>,
+) -> Result<(), ServeError> {
     let max_connections = config.max_connections;
-    let state = Arc::new(AppState::from_config(config)?);
+    let settings = ConnectionSettings {
+        timers: ClientTimers::from_config(&config.connection),
+        keepalive_requests: config.connection.keepalive_requests,
+    };
+    let startup = Startup::of(&config);
+    let initial = Arc::new(AppState::from_config(config, &[])?);
+    let (current_tx, current_rx) = watch::channel(initial);
     let (stop_tx, stop_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
     let mut shutdown = pin!(shutdown);
     let mut connections = JoinSet::new();
+    let (mut requests, load) = match reloads {
+        Some((requests, load)) => (Some(requests), Some(load)),
+        None => (None, None),
+    };
     loop {
         // Both waits race with shutdown, so a full connection limit cannot block the stop.
+        // A reload is applied while waiting too, and then the loop starts again.
         let permit = tokio::select! {
             () = &mut shutdown => break,
+            Some(()) = next_reload(&mut requests) => {
+                if let Some(load) = &load {
+                    reload(load.as_ref(), &startup, &current_tx);
+                }
+                continue;
+            }
             permit = Arc::clone(&slots).acquire_owned() => {
                 permit.map_err(|_| ServeError::Accept(std::io::Error::other("connection limiter closed")))?
             }
         };
         let (stream, peer) = tokio::select! {
             () = &mut shutdown => break,
+            Some(()) = next_reload(&mut requests) => {
+                if let Some(load) = &load {
+                    reload(load.as_ref(), &startup, &current_tx);
+                }
+                continue;
+            }
             accepted = listener.accept() => accepted.map_err(ServeError::Accept)?,
         };
         connections.spawn(serve_connection(
-            Arc::clone(&state),
+            current_rx.clone(),
+            settings,
             stream,
             peer,
             stop_rx.clone(),
@@ -223,6 +350,42 @@ pub async fn serve(
     Ok(())
 }
 
+/// Waits for the next reload request. Without a reload source it never completes,
+/// and a closed source ends the wait for good.
+async fn next_reload(requests: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
+    match requests {
+        Some(requests) => requests.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Builds the state of a new configuration and publishes it to new requests. A
+/// failure is logged and leaves the current state in place.
+fn reload(
+    load: &dyn Fn() -> Result<Config, ConfigError>,
+    startup: &Startup,
+    current: &watch::Sender<Arc<AppState<Backend>>>,
+) {
+    let config = match load() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(%error, "configuration reload failed; keeping the previous configuration");
+            return;
+        }
+    };
+    startup.report_changes(&config);
+    let previous = current.borrow().clone();
+    match AppState::from_config(config, &previous.zones) {
+        Ok(state) => {
+            current.send_replace(Arc::new(state));
+            tracing::info!("configuration reloaded");
+        }
+        Err(error) => {
+            tracing::error!(%error, "configuration reload failed; keeping the previous configuration");
+        }
+    }
+}
+
 /// State of one connection that its requests share.
 struct Connection {
     phase: Arc<PhaseCell>,
@@ -230,8 +393,9 @@ struct Connection {
     served: AtomicUsize,
 }
 
-async fn serve_connection<B: DecisionBackend>(
-    state: Arc<AppState<B>>,
+async fn serve_connection(
+    current: watch::Receiver<Arc<AppState<Backend>>>,
+    settings: ConnectionSettings,
     stream: TcpStream,
     peer: SocketAddr,
     mut stop: watch::Receiver<bool>,
@@ -243,7 +407,7 @@ async fn serve_connection<B: DecisionBackend>(
     let io = TokioIo::new(ClientIo::new(
         stream,
         Arc::clone(&phase),
-        state.timers,
+        settings.timers,
         Arc::clone(&rejection),
     ));
     let connection = Arc::new(Connection {
@@ -251,17 +415,28 @@ async fn serve_connection<B: DecisionBackend>(
         served: AtomicUsize::new(0),
     });
     let mut builder = http1::Builder::new();
-    builder.keep_alive(state.timers.keep_alive > Duration::ZERO);
-    if state.timers.head.total > HYPER_DEFAULT_BUFFER {
-        builder.max_buf_size(state.timers.head.total);
+    builder.keep_alive(settings.timers.keep_alive > Duration::ZERO);
+    if settings.timers.head.total > HYPER_DEFAULT_BUFFER {
+        builder.max_buf_size(settings.timers.head.total);
     }
-    let service_state = Arc::clone(&state);
+    let service_current = current.clone();
     let service = service_fn(move |request| {
-        let state = Arc::clone(&service_state);
+        // Each request takes the configuration that is current when it starts.
+        let state = service_current.borrow().clone();
         let connection = Arc::clone(&connection);
-        async move { Ok::<_, Infallible>(handle(&state, &connection, peer, request).await) }
+        async move {
+            handle(
+                &state,
+                &connection,
+                peer,
+                request,
+                settings.keepalive_requests,
+            )
+            .await
+        }
     });
-    let connection_future = builder.serve_connection(io, service);
+    // `with_upgrades` keeps the connection driven until an upgraded tunnel takes it over.
+    let connection_future = builder.serve_connection(io, service).with_upgrades();
     let mut connection_future = pin!(connection_future);
     tokio::select! {
         result = connection_future.as_mut() => {
@@ -278,12 +453,15 @@ async fn serve_connection<B: DecisionBackend>(
     }
     let rejected = lock(&rejection).take();
     if let Some(rejection) = rejected {
+        let state = current.borrow().clone();
         write_rejection(&state.global_sinks, rejection, peer, started);
     }
 }
 
 /// Facts about a request that are known before its decision.
 struct Trace<'a> {
+    /// The upgrade of the client connection, taken by a tunnel that the request starts.
+    upgrade: Mutex<Option<OnUpgrade>>,
     client_addr: IpAddr,
     client_ip: &'a str,
     remote_addr: &'a str,
@@ -296,12 +474,16 @@ struct Trace<'a> {
 }
 
 /// Answers one request on a connection and records it.
+///
+/// An error ends the connection without a response. It is returned for a block
+/// with `block_status 444`, after the request has been logged.
 async fn handle<B: DecisionBackend>(
     state: &AppState<B>,
     connection: &Connection,
     peer: SocketAddr,
-    request: Request<Incoming>,
-) -> Response<ResponseBody> {
+    mut request: Request<Incoming>,
+    keepalive_requests: usize,
+) -> Result<Response<ResponseBody>, std::io::Error> {
     let started = Instant::now();
     connection.phase.set(Phase::Busy);
     let served = connection
@@ -312,9 +494,11 @@ async fn handle<B: DecisionBackend>(
     let client = client_addr.to_string();
     let request_id = request_id(state, request.headers());
     let remote = peer.ip().to_string();
+    let client_upgrade = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
     let done = Arc::new(AtomicBool::new(body.is_end_stream()));
     let trace = Trace {
+        upgrade: Mutex::new(Some(client_upgrade)),
         client_addr,
         client_ip: &client,
         remote_addr: &remote,
@@ -325,18 +509,27 @@ async fn handle<B: DecisionBackend>(
     };
     let mut held = Vec::new();
     let mut response = pipeline(state, &parts, body, &done, &trace, peer, &mut held).await;
-    if served >= state.keepalive_requests {
+    if response
+        .extensions()
+        .get::<CloseWithoutResponse>()
+        .is_some()
+    {
+        return Err(std::io::Error::other(
+            "blocked with block_status 444: closed without a response",
+        ));
+    }
+    if served >= keepalive_requests {
         response
             .headers_mut()
             .insert(CONNECTION, HeaderValue::from_static("close"));
     }
     let (parts, body) = response.into_parts();
-    Response::from_parts(
+    Ok(Response::from_parts(
         parts,
         Finish::new(body, Arc::clone(&connection.phase), done)
             .holding(held)
             .boxed(),
-    )
+    ))
 }
 
 #[expect(
@@ -371,6 +564,9 @@ async fn pipeline<B: DecisionBackend>(
         path: &decoded,
         headers: &parts.headers,
     };
+    // The block response of the location that was selected, else of the site.
+    let site_block = matched.map(|site| &site.block);
+    let block = location.map(|location| &location.block).or(site_block);
     let shadow = matched.is_some_and(|site| site.mode == Mode::Shadow);
     let screened = limits::screen(&state.zones, limit_set, shadow, &key_vars, held).await;
     *lock(&trace.limit_req) = screened.req_status.map(ReqStatus::name);
@@ -489,14 +685,45 @@ async fn pipeline<B: DecisionBackend>(
             Screening::SkipRule(id) => Some(Arc::clone(id)),
             Screening::Skip | Screening::Inspect => None,
         };
-        let assessment = assess(state, site, parts, &sniffed, trace.client_ip, &screening).await;
+        let assessment = assess(state, parts, &sniffed, trace.client_ip, &screening).await;
         (assessment, rule_id)
     };
     let mut decision = policy::decide(site, &path, &assessment);
     if decision.would_have.is_none() {
         decision.would_have = screened.would_have.map(Action::Reject);
     }
-    let outcome = respond(proxy, site, parts, body, peer, &decision).await;
+    // Access-list denials keep 403 as nginx's `deny` does, whatever block_status says.
+    let access_block = BlockResponse::default();
+    let block = if access_denied {
+        &access_block
+    } else {
+        block.unwrap_or(&access_block)
+    };
+    // The request headers that proxy_set_header values may use, and the operations of the level in effect.
+    let header_ops = location
+        .map(|location| location.proxy_headers.as_slice())
+        .or_else(|| matched.map(|site| site.proxy_headers.as_slice()))
+        .unwrap_or_default();
+    let ctx = HeaderContext {
+        client_ip: trace.client_ip,
+        remote_addr: trace.remote_addr,
+        host: &host,
+        site: site_name(site),
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        request_id: trace.request_id.unwrap_or_default(),
+        headers: &parts.headers,
+    };
+    let delivery = Delivery {
+        proxy,
+        upstream: &site.upstream,
+        headers: header_ops,
+        block,
+        ctx,
+        websocket: location.map_or(site.websocket, |location| location.websocket),
+        client_upgrade: &trace.upgrade,
+    };
+    let outcome = respond(&delivery, parts, body, peer, &decision, held).await;
     let mut response = outcome.response;
     if site.debug_headers {
         add_debug_header(response.headers_mut(), &decision);
@@ -580,41 +807,93 @@ fn close(response: &mut Response<ResponseBody>) {
         .insert(CONNECTION, HeaderValue::from_static("close"));
 }
 
+/// Where an allowed request is forwarded, and what a block answers with.
+struct Delivery<'a> {
+    /// The upstream client of the site.
+    proxy: &'a Proxy,
+    /// The site's upstream URI.
+    upstream: &'a http::Uri,
+    /// The `proxy_set_header` operations of the level in effect.
+    headers: &'a [HeaderOp],
+    /// The block response of the level in effect.
+    block: &'a BlockResponse,
+    /// The values `proxy_set_header` values may use.
+    ctx: HeaderContext<'a>,
+    /// Whether an Upgrade request is tunnelled (`proxy_websocket on`).
+    websocket: bool,
+    /// The client connection's upgrade, which the tunnel takes when the upstream switches protocols.
+    client_upgrade: &'a Mutex<Option<OnUpgrade>>,
+}
+
 /// Forwards an allowed request, or answers a block or redirect.
 ///
 /// `complete` says whether the request body was read in full. When it was not,
 /// the response closes the connection, because the rest of the body would
 /// otherwise be read as the next request.
 async fn respond(
-    proxy: &Proxy,
-    site: &SiteConfig,
+    delivery: &Delivery<'_>,
     parts: &Parts,
     body: ClientBody,
     peer: SocketAddr,
     decision: &Decision,
+    held: &mut Vec<ConnPermit>,
 ) -> Outcome {
     let complete = body.is_complete();
+    let block = delivery.block;
     match &decision.action {
         Action::Allow => {
             let path_and_query = parts
                 .uri
                 .path_and_query()
                 .map_or("/", |value| value.as_str());
-            match proxy
+            // An Upgrade request keeps its Upgrade and Connection headers only when the site tunnels them.
+            let upgrade = if delivery.websocket {
+                upgrade_request(&parts.headers)
+            } else {
+                None
+            };
+            let mut headers =
+                upstream_headers(&parts.headers, peer.ip(), delivery.headers, &delivery.ctx);
+            if let Some(protocol) = &upgrade {
+                headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+                headers.insert(UPGRADE, protocol.clone());
+            }
+            match delivery
+                .proxy
                 .forward(
                     parts.method.clone(),
-                    &parts.headers,
+                    headers,
                     path_and_query,
                     body,
-                    &site.upstream,
-                    peer.ip(),
+                    delivery.upstream,
                 )
                 .await
             {
-                Ok(upstream) => {
+                Ok(mut upstream) => {
                     let status = upstream.status().as_u16();
+                    // A 101 answer to an Upgrade request starts a tunnel; its headers are kept.
+                    let switching = upgrade.is_some() && status == 101;
+                    let client_upgrade = if switching {
+                        lock(delivery.client_upgrade).take()
+                    } else {
+                        None
+                    };
+                    let upstream_upgrade = client_upgrade
+                        .as_ref()
+                        .map(|_| hyper::upgrade::on(&mut upstream));
+                    let tunnel = upstream_upgrade.is_some();
                     let (mut upstream_parts, upstream_body) = upstream.into_parts();
-                    crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
+                    if !tunnel {
+                        crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
+                    }
+                    if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
+                        tunnel::spawn(
+                            client,
+                            upstream,
+                            delivery.proxy.read_timeout(),
+                            std::mem::take(held),
+                        );
+                    }
                     Outcome {
                         response: Response::from_parts(upstream_parts, upstream_body.boxed()),
                         upstream_status: Some(status),
@@ -626,7 +905,15 @@ async fn respond(
             }
         }
         Action::Block => {
-            let mut response = status_response(StatusCode::FORBIDDEN, "Forbidden\n");
+            let mut response = match block.status {
+                BlockStatus::Respond(status) => block_response(status, block.page.as_ref()),
+                BlockStatus::Close => {
+                    // The status is only logged: the connection closes without writing it.
+                    let mut response = status_response(close_status(), "");
+                    response.extensions_mut().insert(CloseWithoutResponse);
+                    response
+                }
+            };
             if !complete {
                 close(&mut response);
             }
@@ -703,7 +990,6 @@ fn body_failure(
 
 async fn assess<B: DecisionBackend>(
     state: &AppState<B>,
-    site: &SiteConfig,
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
@@ -714,7 +1000,8 @@ async fn assess<B: DecisionBackend>(
         Screening::SkipRule(_) => Assessment::SkipRule,
         Screening::Skip => Assessment::Skip,
         Screening::Inspect => {
-            let host = site.hosts.first().map_or("", String::as_str);
+            // The event carries the host the client asked for, which may match a wildcard or regex name.
+            let host = host_name(parts);
             let event = sanitize::build_event(&EventInput {
                 method: &parts.method,
                 path: parts.uri.path(),
@@ -722,7 +1009,7 @@ async fn assess<B: DecisionBackend>(
                 headers: &parts.headers,
                 body: &sniffed.prefix,
                 body_continues: sniffed.truncated,
-                host,
+                host: &host,
                 client_ip,
                 redact_headers: &state.backend_redact,
                 inspect_body_bytes: state.inspect_body_bytes,
@@ -913,6 +1200,32 @@ fn add_debug_header(headers: &mut HeaderMap, decision: &Decision) {
     );
     if let Ok(value) = HeaderValue::from_str(&value) {
         headers.insert(DEBUG_HEADER, value);
+    }
+}
+
+/// The status of a 444 block, which is logged and never sent.
+fn close_status() -> StatusCode {
+    StatusCode::from_u16(444).unwrap_or(StatusCode::FORBIDDEN)
+}
+
+/// A block response: the configured page as HTML when there is one, else the short text of nginx's 403.
+fn block_response(status: StatusCode, page: Option<&Bytes>) -> Response<ResponseBody> {
+    match page {
+        Some(page) => {
+            let mut response = Response::new(
+                Full::new(page.clone())
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            );
+            *response.status_mut() = status;
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
+            );
+            response
+        }
+        None if status == StatusCode::FORBIDDEN => status_response(status, "Forbidden\n"),
+        None => status_response(status, ""),
     }
 }
 

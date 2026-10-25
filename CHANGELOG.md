@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Host matching as in nginx `server_name`: exact names, `*.example.com`,
+  `example.*`, `.example.com` and `~regex` names in a `site`, with exact, then
+  leading wildcard, then trailing wildcard, then regex precedence. `default_server;`
+  marks the one site that takes hosts matching no site (at most one per
+  configuration). A name claimed by two sites is still a configuration error.
+- `proxy_set_header <name> <value>;` at the top level, in a `site` and in a
+  `location`, with nginx's replace-per-level and empty-removes rules. Values take
+  `$client_ip`, `$remote_addr`, `$host`, `$site`, `$method`, `$path`,
+  `$request_id` and `$http_<name>`. The default headers (Host kept,
+  `X-Forwarded-For` appended) are unchanged. Hop-by-hop headers cannot be set.
+- `SIGHUP` reloads the configuration like `nginx -s reload`. A valid file is
+  applied to new requests, while requests in flight finish with the old one. A
+  broken file is logged at error level with its file and line, and the old
+  configuration keeps serving. Zones keep their counts when the name and size
+  match. Listen address, `worker_threads`, `max_connections`, connection timers
+  and the error log destination and level apply only at startup (a warning is
+  logged). `SIGUSR1` still reopens the log files.
+- `vigilant-heron -t [--config <path>]` checks the configuration like `nginx -t`:
+  it validates the whole file (includes, rules, block pages, token variables),
+  reports the result on stderr and exits 0 or 1. It never binds or serves.
+- `proxy_websocket on|off;` in a `site` and a `location` (default off). With `on`,
+  an HTTP/1.1 Upgrade handshake is screened like any request, then forwarded; a
+  `101` from the upstream is spliced into a bidirectional tunnel that closes after
+  `proxy_read_timeout` of inactivity, and counts against `limit_conn`. Only the
+  handshake is judged, not the frames.
+- `block_status <code>;` (4xx or 5xx, or 444 to close the connection without a
+  response) and `block_page <file>;` (HTML, at most 64 KiB, read at load time) for
+  blocked requests, at the top level, in a `site` and in a `location`. Limit
+  refusals and access-list denials (403) keep their statuses.
 - Request-rate and connection limits, with nginx's `limit_req` and `limit_conn`
   semantics: `limit_req_zone` and `limit_conn_zone` at the top level, `limit_req`,
   `limit_conn`, their status, dry-run and log-level directives at the top level,

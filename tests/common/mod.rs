@@ -91,7 +91,17 @@ impl Upstream {
                     .and_then(|value| value.to_str().ok())
                     .map_or(Value::Null, |value| Value::String(value.to_owned()))
             };
+            let all_headers: serde_json::Map<String, Value> = headers
+                .iter()
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|text| (name.as_str().to_owned(), Value::String(text.to_owned())))
+                })
+                .collect();
             let echo = json!({
+                "headers": Value::Object(all_headers),
                 "method": request.method().as_str(),
                 "uri": request.uri().path_and_query().map_or("", |value| value.as_str()),
                 "host": header_text("host"),

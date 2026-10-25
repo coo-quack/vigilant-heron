@@ -9,7 +9,9 @@
 //! held for one second before the answer. Any `POST /echo/...` is an upstream
 //! for the e2e upload site: it answers with the length and FNV-1a hash of the body
 //! it received, so the test can check the body arrived intact. An echo whose path
-//! contains `/hold` is held for one second first.
+//! contains `/hold` is held for one second first. A `GET /ws...` with an
+//! `Upgrade` header answers 101 Switching Protocols and then echoes every byte
+//! it receives on the upgraded connection.
 
 use std::convert::Infallible;
 use std::sync::OnceLock;
@@ -19,6 +21,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HeaderValue, RETRY_AFTER};
+use hyper::header::{CONNECTION, UPGRADE};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -32,6 +35,7 @@ const DECIDE_PATH: &str = "/decide";
 const CLEF_PATH: &str = "/client/v4/accounts/test/ai/run/@cf/cloudflare/clef-flash";
 const JEV_PATH: &str = "/v1/systemone";
 const ECHO_PREFIX: &str = "/echo/";
+const WS_PREFIX: &str = "/ws";
 const BEARER_TOKEN: &str = "Bearer test-token";
 const ATTACK_MARKERS: [&str; 4] = ["' or 1=1", "<script", "../", "union select"];
 const INSTRUCTION_MARKERS: [&str; 2] = ["ignore previous", "answer benign"];
@@ -64,12 +68,16 @@ async fn main() -> std::io::Result<()> {
             // A client that hangs up mid-request is not an error for the stub.
             let _ = http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades()
                 .await;
         });
     }
 }
 
 async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+    if request.uri().path().starts_with(WS_PREFIX) && request.headers().contains_key(UPGRADE) {
+        return Ok(websocket(request));
+    }
     if request.method() != Method::POST {
         return Ok(reply(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -118,6 +126,26 @@ async fn route(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infa
         return Ok(jev(&payload).await);
     }
     Ok(clef(&payload).await)
+}
+
+/// Switches protocols and echoes the upgraded connection until the client closes it.
+fn websocket(mut request: Request<Incoming>) -> Response<Full<Bytes>> {
+    let on_upgrade = hyper::upgrade::on(&mut request);
+    tokio::spawn(async move {
+        if let Ok(upgraded) = on_upgrade.await {
+            let (mut read, mut write) = tokio::io::split(TokioIo::new(upgraded));
+            let _ = tokio::io::copy(&mut read, &mut write).await;
+        }
+    });
+    let mut response = Response::new(Full::new(Bytes::new()));
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    response
+        .headers_mut()
+        .insert(UPGRADE, HeaderValue::from_static("websocket"));
+    response
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+    response
 }
 
 /// Answers with the length and FNV-1a hash of the request body, as a decimal string.

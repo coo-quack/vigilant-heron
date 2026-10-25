@@ -427,6 +427,118 @@ The configuration uses nginx syntax: `directive arguments;` and blocks such as
 [`examples/vigilant-heron.conf`](examples/vigilant-heron.conf) for every
 directive with comments.
 
+### Host matching
+
+A `site` lists its names after the keyword, and a request is sent to the site
+whose name matches its `Host` header (port and trailing dot ignored, case
+ignored). The forms follow nginx `server_name`:
+
+- an exact name: `example.com`
+- a leading wildcard: `*.example.com` matches `a.example.com` and `a.b.example.com`, but not `example.com`
+- a trailing wildcard: `example.*` matches `example.com` and `example.jp`
+- `.example.com`, which is `example.com` and `*.example.com` together
+- a regular expression: `~^(www\.)?example\.(com|jp)$`, matched against the
+  lowercased host with the `regex` crate. Quote it if it contains spaces or `;`
+
+A host is matched in this order: the exact name, then the longest leading
+wildcard, then the longest trailing wildcard, then the first regular expression
+in the order the sites are written. A name may belong to one site only, and a
+duplicate is a configuration error.
+
+`default_server;` inside one `site` takes every request whose host matches no
+site. Without it, such a request gets `default_status` (421 by default). At most
+one site may be marked, and the request is judged by that site's settings.
+
+### Block responses
+
+A request that a rule or the decision backend blocks gets 403 with the body
+`Forbidden`. Two directives change that. They are valid at the top level, in a
+`site`, and in a `location` (which inherits from its site, which inherits from
+the top level):
+
+- `block_status <code>;` sets the status: any 4xx or 5xx code, or `444`. With
+  `444` the connection is closed without a response, as nginx does. The access
+  log still records the request with status 444. The connection closes at once
+  and does not linger, because no response is written for it.
+- `block_page <file>;` serves an HTML file for block responses, with
+  `Content-Type: text/html; charset=utf-8`. The file is read when the
+  configuration loads, must be at most 64 KiB, and a relative path is relative to
+  the file that holds the directive.
+
+Two responses keep their own status. A limit refusal keeps the status of its
+`limit_req_status` or `limit_conn_status`. An access-list denial stays 403, as
+nginx's `deny` does, whatever `block_status` says. Redirect sites
+(`action redirect`) are unchanged.
+
+```
+site example.com {
+    upstream http://app:8080;
+    block_status 404;
+    block_page /etc/vigilant-heron/blocked.html;
+    location /api/ {
+        block_status 429;
+    }
+}
+```
+
+### Proxy headers
+
+By default the upstream receives the request's headers without the hop-by-hop
+ones, with the peer address appended to `X-Forwarded-For`, and the `Host` the
+client sent. `proxy_set_header <name> <value>;` changes that. It is valid at the
+top level, in a `site`, and in a `location`:
+
+- The value may contain these variables: `$client_ip` (the address from the
+  realip settings), `$remote_addr` (the TCP peer), `$host`, `$site`, `$method`,
+  `$path`, `$request_id`, and `$http_<name>` (a request header, with `_` for `-`).
+  A value with `$` in it must be quoted when it has `{` or `}`, as in
+  `"${http_x_forwarded_proto}"`.
+- The operations of a level are applied in order after the defaults, so a later
+  line replaces an earlier one with the same name.
+- An empty value, or a value whose variable is empty (for example a missing
+  `$http_<name>`), removes the header.
+- A level with any `proxy_set_header` replaces the list it inherits. A location
+  without one uses its site's list, and a site without one uses the top level's.
+- The defaults are not switched off by an operation: `X-Forwarded-For` is still
+  appended unless the list sets or removes it, and `Host` is kept unless set.
+- Hop-by-hop headers (`Connection`, `Upgrade`, `Keep-Alive`, `Transfer-Encoding`,
+  `TE`, `Trailer`, `Proxy-Connection`) cannot be set, and are a configuration error.
+
+To add the usual proxy headers:
+
+```
+proxy_set_header X-Real-IP $client_ip;
+proxy_set_header X-Forwarded-Proto "$http_x_forwarded_proto";
+```
+
+`$http_x_forwarded_proto` is empty when the edge sends no such header, so the
+upstream gets no `X-Forwarded-Proto`. The edge (nginx or Cloudflare) has to set
+it for it to arrive.
+
+### WebSocket
+
+`proxy_websocket on;` in a `site` or a `location` lets HTTP/1.1 `Upgrade`
+requests (WebSocket, mainly) reach the upstream. The default is `off`, and then
+an Upgrade request is screened and forwarded as an ordinary request, without
+the upgrade headers.
+
+With `on`, the handshake goes through the same screening as any request: the
+limits, the access list, the rules and the decision model. A blocked handshake
+gets the block response and no upgrade. An allowed one is forwarded with its
+`Upgrade` and `Connection` headers. When the upstream answers `101 Switching
+Protocols`, the two connections are joined and their bytes are copied both ways.
+
+- Only the handshake is judged. Frames are not inspected, so a payload that
+  attacks the upstream after the handshake is not seen.
+- The tunnel closes when either side closes, or when neither side has moved a
+  byte for `proxy_read_timeout` (60s by default).
+- While a tunnel is open it counts against `limit_conn`, like any connection.
+- Shutdown does not wait for open tunnels: they end on their own timeout or when
+  the connection closes.
+
+The edge must forward the upgrade too. With nginx in front, use
+`proxy_http_version 1.1;` and pass `Upgrade` and `Connection` (see `e2e/`).
+
 Times take `ms`, `s`, `m` or `h` (a bare number is seconds, as in nginx). Sizes
 take `k`, `m` or `g`. Every error names the file and line, for example
 `vigilant-heron.conf:12: "block_threshold" must be between 0 and 1`.
@@ -459,6 +571,36 @@ be set or the router refuses to start.
 
 The config path can also come from `VIGILANT_HERON_CONFIG`; the default is
 `/etc/vigilant-heron/vigilant-heron.conf`.
+
+### Reload and log reopen
+
+Two signals are handled, and they are documented together:
+
+- `SIGHUP` reloads the configuration, as `nginx -s reload` does. The whole file,
+  with its includes, is read and validated again. If it is valid, the new
+  configuration serves every request that starts after the reload. Requests in
+  flight finish with the configuration they started with. If it is not valid, the
+  error is logged at error level with its file and line, and the previous
+  configuration keeps serving. `SIGHUP` also reopens the error log file.
+  Zones keep their counts when a zone with the same name and size exists in the
+  new file, and otherwise start empty. Access logs are written to the destinations
+  of the new file.
+- `SIGUSR1` reopens the file destinations of the access logs and the error log,
+  so logrotate can move them away, without a reload.
+
+Some settings are read at startup only. A reload that changes one logs a warning,
+and the change takes effect at the next restart: `listen`, `worker_threads`,
+`max_connections`, the connection timers and header limits (the `client_*`,
+`keepalive_*`, `send_timeout`, `large_client_header_buffers` and `lingering_*`
+directives), and the `error_log` destination and level. The `error_log` file
+itself is reopened on each reload.
+
+`vigilant-heron -t [--config <path>]` checks the configuration the way
+`nginx -t` does. It reads the includes, rules, block pages and token variables,
+validates everything, and then exits. It never binds the listen address or
+starts serving. On success it writes `configuration file <path> test is
+successful` to stderr and exits 0. On failure it writes the error, with its
+file and line, and `configuration file <path> test failed`, and exits 1.
 
 With Docker, use the published image (`linux/amd64` and `linux/arm64`). The
 package is private while the repository is private, so log in to `ghcr.io`

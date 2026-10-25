@@ -28,9 +28,11 @@ use http::{HeaderMap, HeaderName, StatusCode};
 use tokio::time::Instant;
 
 use crate::accesslog::FORBIDDEN_HEADERS;
+use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::Directive;
-use crate::config::{block, invalid, once, one_arg, parse_size};
+use crate::config::{block, invalid, once, one_arg, parse_bool, parse_size};
 use crate::error::ConfigError;
+use crate::proxy::HeaderOp;
 use crate::transport::lock;
 
 /// Bytes of memory per `limit_req` state, as in nginx.
@@ -673,6 +675,12 @@ pub(crate) struct PendingLocation<'a> {
     pub(crate) matcher: Matcher,
     /// The limit directives written in the block.
     pub(crate) overrides: LimitOverrides,
+    /// The block response directives written in the block.
+    pub(crate) block: BlockOverrides,
+    /// The `proxy_set_header` operations of the block, which replace the site's when present.
+    pub(crate) headers: Option<Vec<HeaderOp>>,
+    /// The `proxy_websocket` setting of the block, when it has one.
+    pub(crate) websocket: Option<bool>,
 }
 
 /// Parses `location [=|~|~*|^~] <path> { ... }`, with only limit directives inside.
@@ -730,20 +738,37 @@ pub(crate) fn parse_location<'a>(
         }
     };
     let mut overrides = LimitOverrides::default();
+    let mut block_overrides = BlockOverrides::default();
+    let mut headers: Option<Vec<HeaderOp>> = None;
+    let mut websocket: Option<bool> = None;
     let mut seen = HashSet::new();
     for child in block(directive)? {
-        if !LIMIT_NAMES.contains(&child.name.as_str()) {
+        let name = child.name.as_str();
+        if BLOCK_NAMES.contains(&name) {
+            block_overrides.apply(child, &mut seen)?;
+        } else if name == "proxy_websocket" {
+            once(&mut seen, child)?;
+            websocket = Some(parse_bool(child, one_arg(child)?)?);
+        } else if name == "proxy_set_header" {
+            headers
+                .get_or_insert_with(Vec::new)
+                .push(HeaderOp::parse(child)?);
+        } else if LIMIT_NAMES.contains(&name) {
+            overrides.apply(child, zones, &mut seen)?;
+        } else {
             return Err(invalid(
                 child,
                 format!("unknown directive \"{}\" in location", child.name),
             ));
         }
-        overrides.apply(child, zones, &mut seen)?;
     }
     Ok(PendingLocation {
         directive,
         matcher,
         overrides,
+        block: block_overrides,
+        headers,
+        websocket,
     })
 }
 
@@ -764,6 +789,12 @@ pub(crate) struct LocationConfig {
     pub(crate) matcher: Matcher,
     /// The limits that apply to requests this location selects.
     pub(crate) limits: LimitSet,
+    /// The block response for requests this location selects.
+    pub(crate) block: BlockResponse,
+    /// The `proxy_set_header` operations for requests this location selects.
+    pub(crate) proxy_headers: Vec<HeaderOp>,
+    /// Whether this location tunnels Upgrade requests.
+    pub(crate) websocket: bool,
 }
 
 /// Chooses the location for a request path, with nginx's precedence.
@@ -898,22 +929,38 @@ pub(crate) struct ZoneStore {
     def: LimitZone,
     /// Drain time of one request, for `limit_req` zones.
     interval_ns: Option<u64>,
-    table: std::sync::Mutex<Table>,
+    /// The counted state. A reloaded configuration shares it with the zone it replaces.
+    table: Arc<std::sync::Mutex<Table>>,
 }
 
 impl ZoneStore {
     /// Creates the empty state of `def`.
     pub(crate) fn new(def: LimitZone) -> Self {
+        let table = Arc::new(std::sync::Mutex::new(Table::new(def.capacity)));
+        Self::with_table(def, table)
+    }
+
+    /// Creates the zone `def` on the state of `previous`, which a reload keeps when the
+    /// name and size are the same. The definition itself is the new one.
+    pub(crate) fn sharing(def: LimitZone, previous: &Self) -> Self {
+        Self::with_table(def, Arc::clone(&previous.table))
+    }
+
+    fn with_table(def: LimitZone, table: Arc<std::sync::Mutex<Table>>) -> Self {
         let interval_ns = match def.kind {
             ZoneKind::Req { interval_ns } => Some(interval_ns),
             ZoneKind::Conn => None,
         };
-        let table = std::sync::Mutex::new(Table::new(def.capacity));
         Self {
             def,
             interval_ns,
             table,
         }
+    }
+
+    /// The number of states the zone holds, which is its size.
+    pub(crate) fn capacity(&self) -> usize {
+        self.def.capacity
     }
 
     /// Accounts one request against a `limit_req` zone.

@@ -15,12 +15,14 @@ use http::{HeaderName, HeaderValue, StatusCode, Uri};
 
 use crate::access::AccessEntry;
 use crate::accesslog::{Escape, LogFormat};
+use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::{self, Directive};
 use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig};
 use crate::logsink::Destination;
+use crate::proxy::HeaderOp;
 use crate::realip::{IpNet, RealIp};
-use crate::router::normalize_host;
+use crate::router::HostPattern;
 use crate::rules::{self, ParsedRule, Rule, Scope, SiteRules};
 use crate::system_one::{ApiToken, ClefModel};
 
@@ -223,8 +225,18 @@ pub enum BackendConfig {
 /// Configuration for one site, selected by the request `Host`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SiteConfig {
-    /// Normalized host names that select this site.
+    /// Host names that select this site, as written in the configuration (normalized).
     pub hosts: Vec<String>,
+    /// Whether this site takes the requests whose host matches no site.
+    pub default_server: bool,
+    /// The response to a blocked request, unless a location overrides it.
+    pub block: BlockResponse,
+    /// The `proxy_set_header` operations applied to forwarded requests, unless a location overrides them.
+    pub(crate) proxy_headers: Vec<HeaderOp>,
+    /// Whether Upgrade requests are tunnelled (`proxy_websocket on`), unless a location overrides it.
+    pub websocket: bool,
+    /// The parsed host names, in configuration order.
+    pub(crate) host_patterns: Vec<HostPattern>,
     /// Absolute `http://` URI requests are forwarded to.
     pub upstream: Uri,
     /// Whether verdicts are enforced or only recorded.
@@ -497,7 +509,7 @@ fn split_unit(text: &str) -> (&str, &str) {
     text.split_at(split)
 }
 
-fn parse_bool(directive: &Directive, text: &str) -> Result<bool, ConfigError> {
+pub(crate) fn parse_bool(directive: &Directive, text: &str) -> Result<bool, ConfigError> {
     match text {
         "on" => Ok(true),
         "off" => Ok(false),
@@ -681,6 +693,8 @@ where
     let mut builtin_top = true;
     let mut disabled_top: Vec<String> = Vec::new();
     let mut top_access: Vec<AccessEntry> = Vec::new();
+    let mut top_block = BlockOverrides::default();
+    let mut top_headers: Option<Vec<HeaderOp>> = None;
     let mut top_rules: Vec<ParsedRule> = Vec::new();
     let mut listen = None;
     let mut worker_threads = None;
@@ -873,6 +887,10 @@ where
                 ));
             }
             "allow" | "deny" => top_access.push(access_entry(directive)?),
+            name if BLOCK_NAMES.contains(&name) => top_block.apply(directive, &mut seen)?,
+            "proxy_set_header" => top_headers
+                .get_or_insert_with(Vec::new)
+                .push(HeaderOp::parse(directive)?),
             "builtin_rules" => {
                 once(&mut seen, directive)?;
                 builtin_top = parse_bool(directive, one_arg(directive)?)?;
@@ -910,6 +928,8 @@ where
         top_overrides.apply(directive, &zones, &mut seen)?;
     }
     let top_limits = top_overrides.resolve(&LimitSet::default());
+    let top_block = top_block.resolve(&BlockResponse::default());
+    let top_headers = top_headers.unwrap_or_default();
     let access_logs = resolve_top_access(&access_directives, &formats)?;
 
     if site_directives.is_empty() {
@@ -927,18 +947,32 @@ where
         rules: &top_rules,
         zones: &zones,
         limits: &top_limits,
+        block: &top_block,
+        headers: &top_headers,
     };
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
+    let mut default_seen = false;
     for site in site_directives {
         let parsed = parse_site(site, &formats, &top, &mut claimed)?;
-        for host in &parsed.hosts {
-            if !hosts_seen.insert(host.clone()) {
-                return Err(invalid(
-                    site,
-                    format!("host \"{host}\" is listed by more than one site"),
-                ));
+        for pattern in &parsed.host_patterns {
+            for claim in pattern.claims() {
+                if !hosts_seen.insert(claim) {
+                    return Err(invalid(
+                        site,
+                        format!(
+                            "host \"{}\" is listed by more than one site",
+                            pattern.display()
+                        ),
+                    ));
+                }
             }
+        }
+        if parsed.default_server {
+            if default_seen {
+                return Err(invalid(site, "only one site may be marked default_server"));
+            }
+            default_seen = true;
         }
         sites.push(parsed);
     }
@@ -1436,6 +1470,10 @@ struct Top<'a> {
     zones: &'a [LimitZone],
     /// The limits of the top level.
     limits: &'a LimitSet,
+    /// The top-level block response, inherited by every site.
+    block: &'a BlockResponse,
+    /// The top-level `proxy_set_header` operations, inherited by every site.
+    headers: &'a [HeaderOp],
 }
 
 /// Reads one `allow` or `deny` directive.
@@ -1474,19 +1512,20 @@ fn parse_site(
     if directive.args.is_empty() {
         return Err(invalid(directive, "\"site\" needs at least one host name"));
     }
-    let mut hosts = Vec::new();
+    let mut host_patterns = Vec::new();
     for host in &directive.args {
-        let normalized = normalize_host(host);
-        if normalized.is_empty() {
-            return Err(invalid(
+        let pattern = HostPattern::parse(host).map_err(|reason| {
+            invalid(
                 directive,
-                format!("\"site\" has an invalid host name: {host}"),
-            ));
-        }
-        hosts.push(normalized);
+                format!("\"site\" has an invalid host name {host}: {reason}"),
+            )
+        })?;
+        host_patterns.push(pattern);
     }
+    let hosts: Vec<String> = host_patterns.iter().map(HostPattern::display).collect();
 
     let mut seen = HashSet::new();
+    let mut default_server = false;
     let mut upstream = None;
     let mut mode = Mode::Enforce;
     let mut action = SiteAction::Block;
@@ -1508,6 +1547,9 @@ fn parse_site(
     let mut own_rules: Vec<ParsedRule> = Vec::new();
     let mut site_limits = LimitOverrides::default();
     let mut pending_locations = Vec::new();
+    let mut site_block = BlockOverrides::default();
+    let mut site_headers: Option<Vec<HeaderOp>> = None;
+    let mut websocket = false;
 
     for child in block(directive)? {
         match child.name.as_str() {
@@ -1631,7 +1673,22 @@ fn parse_site(
             name if limits::LIMIT_NAMES.contains(&name) => {
                 site_limits.apply(child, top.zones, &mut seen)?;
             }
+            name if BLOCK_NAMES.contains(&name) => site_block.apply(child, &mut seen)?,
+            "proxy_websocket" => {
+                once(&mut seen, child)?;
+                websocket = parse_bool(child, one_arg(child)?)?;
+            }
+            "proxy_set_header" => site_headers
+                .get_or_insert_with(Vec::new)
+                .push(HeaderOp::parse(child)?),
             "location" => pending_locations.push(limits::parse_location(child, top.zones)?),
+            "default_server" => {
+                if !child.args.is_empty() {
+                    return Err(invalid(child, "\"default_server\" takes no arguments"));
+                }
+                once(&mut seen, child)?;
+                default_server = true;
+            }
             other => {
                 return Err(invalid(
                     child,
@@ -1641,6 +1698,9 @@ fn parse_site(
         }
     }
     let site_limit_set = site_limits.resolve(top.limits);
+    let block_response = site_block.resolve(top.block);
+    // A site with its own proxy_set_header replaces the inherited list, as in nginx.
+    let proxy_headers = site_headers.unwrap_or_else(|| top.headers.to_vec());
     let mut locations: Vec<LocationConfig> = Vec::new();
     for pending in pending_locations {
         let duplicate = locations.iter().any(|earlier| {
@@ -1656,6 +1716,9 @@ fn parse_site(
         locations.push(LocationConfig {
             matcher: pending.matcher,
             limits: pending.overrides.resolve(&site_limit_set),
+            block: pending.block.resolve(&block_response),
+            proxy_headers: pending.headers.unwrap_or_else(|| proxy_headers.clone()),
+            websocket: pending.websocket.unwrap_or(websocket),
         });
     }
 
@@ -1694,6 +1757,11 @@ fn parse_site(
 
     Ok(SiteConfig {
         hosts,
+        default_server,
+        host_patterns,
+        block: block_response,
+        proxy_headers,
+        websocket,
         upstream,
         mode,
         action,
@@ -2340,6 +2408,133 @@ mod tests {
         fn parsing_arbitrary_text_never_panics(text in "[a-z0-9 ;{}\"'#$=/:.,\n-]{0,300}") {
             let _ = Config::parse_str_with_lookup(&text, "fuzz.conf", |_| None);
         }
+    }
+
+    /// A configuration with the given site blocks after the decision block.
+    fn with_sites(sites: &str) -> String {
+        format!(
+            "listen 127.0.0.1:8080;\ndecision {{\n    backend http;\n    url http://stub-decider:9000/decide;\n}}\n{sites}"
+        )
+    }
+
+    #[rstest]
+    #[case::domain_and_exact(
+        "site .example.com {\n    upstream http://u:80;\n}\nsite example.com {\n    upstream http://u:80;\n}\n"
+    )]
+    #[case::leading_twice(
+        "site *.example.com {\n    upstream http://u:80;\n}\nsite *.example.com {\n    upstream http://u:80;\n}\n"
+    )]
+    #[case::same_regex_in_two_sites(
+        "site ~^a\\.test$ {\n    upstream http://u:80;\n}\nsite ~^a\\.test$ {\n    upstream http://u:80;\n}\n"
+    )]
+    #[case::name_twice_in_one_site("site x.test x.test {\n    upstream http://u:80;\n}\n")]
+    fn a_name_claimed_by_two_sites_is_rejected(#[case] sites: &str) {
+        let result = Config::parse_str(&with_sites(sites), "hosts.conf");
+        assert!(message(result.map(|_| ())).contains("is listed by more than one site"));
+    }
+
+    #[test]
+    fn a_wildcard_and_its_bare_name_in_different_sites_do_not_clash() -> Result<(), ConfigError> {
+        let config = Config::parse_str(
+            &with_sites(
+                "site *.example.com {\n    upstream http://u:80;\n}\nsite example.com {\n    upstream http://u:80;\n}\n",
+            ),
+            "hosts.conf",
+        )?;
+        assert_eq!(config.sites.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_host_name_is_reported_with_its_line() {
+        let result = Config::parse_str(
+            &with_sites(
+                "site ok.test {\n    upstream http://u:80;\n}\nsite a*.test {\n    upstream http://u:80;\n}\n",
+            ),
+            "hosts.conf",
+        );
+        let text = message(result.map(|_| ()));
+        assert!(text.contains("hosts.conf:"), "{text}");
+        assert!(text.contains("invalid host name a*.test"), "{text}");
+    }
+
+    #[test]
+    fn a_regex_that_does_not_compile_is_reported() {
+        let result = Config::parse_str(
+            &with_sites("site ~(unclosed {\n    upstream http://u:80;\n}\n"),
+            "hosts.conf",
+        );
+        assert!(message(result.map(|_| ())).contains("does not compile"));
+    }
+
+    #[test]
+    fn default_server_marks_one_site() -> Result<(), ConfigError> {
+        let config = Config::parse_str(
+            &with_sites(
+                "site a.test {\n    upstream http://u:80;\n}\nsite b.test {\n    upstream http://u:80;\n    default_server;\n}\n",
+            ),
+            "default.conf",
+        )?;
+        let flags: Vec<bool> = config.sites.iter().map(|s| s.default_server).collect();
+        assert_eq!(flags, [false, true]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_default_server_is_rejected_at_its_site() {
+        let result = Config::parse_str(
+            &with_sites(
+                "site a.test {\n    upstream http://u:80;\n    default_server;\n}\nsite b.test {\n    upstream http://u:80;\n    default_server;\n}\n",
+            ),
+            "default.conf",
+        );
+        let text = message(result.map(|_| ()));
+        assert!(text.contains("default.conf:10:"), "{text}");
+        assert!(
+            text.contains("only one site may be marked default_server"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn default_server_takes_no_arguments() {
+        let result = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n    default_server yes;\n}\n"),
+            "default.conf",
+        );
+        assert!(message(result.map(|_| ())).contains("takes no arguments"));
+    }
+
+    #[test]
+    fn proxy_websocket_takes_on_or_off_and_is_off_by_default() -> Result<(), ConfigError> {
+        let off = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n}\n"),
+            "ws.conf",
+        )?;
+        assert!(!off.sites.first().is_some_and(|site| site.websocket));
+        let on = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n    proxy_websocket on;\n}\n"),
+            "ws.conf",
+        )?;
+        assert!(on.sites.first().is_some_and(|site| site.websocket));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_websocket_rejects_other_values_and_top_level_use() {
+        let value = Config::parse_str(
+            &with_sites("site a.test {\n    upstream http://u:80;\n    proxy_websocket yes;\n}\n"),
+            "ws.conf",
+        );
+        assert!(value.is_err());
+        let top = Config::parse_str(
+            &format!(
+                "proxy_websocket on;\n{}",
+                with_sites("site a.test {\n    upstream http://u:80;\n}\n")
+            ),
+            "ws.conf",
+        );
+        assert!(message(top.map(|_| ())).contains("unknown directive \"proxy_websocket\""));
     }
 }
 

@@ -158,6 +158,29 @@ of distinct keys is visible to operators. Size the zones for the number of
 distinct keys (`$client_ip`) you expect; a larger zone holds more states, at
 128 bytes (`limit_req`) or 64 bytes (`limit_conn`) per state.
 
+## Upgraded connections and 444
+
+`proxy_websocket on;` tunnels an HTTP `Upgrade` after its handshake is
+screened. The handshake goes through the same checks as any request, and a
+blocked handshake gets no upgrade. After a `101`, the frames are not inspected:
+the router copies the bytes both ways without parsing them. A payload that
+attacks the upstream after the handshake passes unseen, and only the handshake
+is judged. A tunnel closes when either side closes, or when neither side moves
+a byte for `proxy_read_timeout`. It holds its `limit_conn` permits while open.
+
+`block_status 444;` closes the connection without writing a response, as
+nginx does. A client that sent a body may then see a reset instead of a status.
+The request is still logged with status 444.
+
+## Reload
+
+`SIGHUP` validates the whole configuration before it applies it. A file that
+fails validation is rejected: the error is logged with its file and line, and
+the configuration that was running keeps serving. Requests in flight during a
+reload finish with the configuration they started with. The listen address and
+the connection-level settings do not change until a restart, and a reload that
+changes them logs a warning.
+
 ## Failure behavior
 
 When the decision backend cannot judge a request, the outcome depends on the

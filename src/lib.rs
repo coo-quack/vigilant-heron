@@ -12,6 +12,7 @@
 
 mod access;
 mod accesslog;
+mod block;
 mod body;
 mod conf;
 mod config;
@@ -31,8 +32,10 @@ mod system_one;
 #[cfg(test)]
 mod test_support;
 mod transport;
+mod tunnel;
 
 pub use accesslog::LogFormat;
+pub use block::{BlockResponse, BlockStatus};
 pub use config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, DecisionConfig, ErrorLogConfig,
     FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, SiteAction, SiteConfig,
@@ -41,5 +44,5 @@ pub use config::{
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
-pub use server::serve;
+pub use server::{serve, serve_reloadable};
 pub use system_one::{ApiToken, ClefModel};
