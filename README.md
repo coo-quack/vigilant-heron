@@ -20,12 +20,16 @@ For every request, the router:
    blocked without calling the backend; plain GET/HEAD requests for static
    assets skip it.
 3. Sends a sanitized copy of the request to the decision backend: credential
-   headers are dropped, password- and token-like fields are redacted, the body
-   is truncated, and all client data sits under an `untrusted` field.
+   headers are dropped, password- and token-like fields are redacted, only the
+   first `inspect_body` bytes of the body are sent, and all client data sits
+   under an `untrusted` field.
 4. Applies the site's policy to the returned scores (`attack`,
    `ai_instruction`): block (403), redirect (302), or forward. When the
    backend fails, the failure settings decide (see [Failure behavior](#failure-behavior)).
-5. Logs one `vigilant_heron::decision` event per request.
+5. Forwards the request, with the rest of its body streamed as it arrives.
+   The upstream gets the whole body; the backend never sees more than
+   `inspect_body`.
+6. Logs one access line per request.
 
 Every deterministic rule runs in step 2, before the backend is called, and no
 failure setting changes its result: a rule block stays a block when the backend
@@ -72,6 +76,66 @@ are set by default too), `timeout 300ms`, `block_threshold 0.87`,
 `instruction_threshold 0.8`, and both failure settings `"allow"`. Configs that
 want the JSON protocol must set `backend http;`.
 
+## Timeouts and limits
+
+The directives use nginx's names, units and defaults, and mean what they mean
+in nginx unless the table or the notes below say otherwise. `keepalive_timeout 0`
+disables keep-alive, and `client_max_body_size 0` removes the body limit.
+
+| Directive | Default | Set in | Bounds | When it expires |
+|---|---|---|---|---|
+| `client_header_timeout` | 60s | top level | the whole request header, counted from its first byte (from accept, for the first request) | 408 when part of the header arrived, otherwise the connection closes |
+| `keepalive_timeout` | 75s | top level | idle time between two requests on a connection | the connection closes |
+| `keepalive_requests` | 1000 | top level | requests served on one connection | the last one answers `Connection: close` |
+| `send_timeout` | 60s | top level | time between two successive writes to the client | the connection closes |
+| `large_client_header_buffers` | 4 8k | top level | request line up to 8k, each header field up to 8k, the header section up to 4 × 8k | 414 for a long request line, 400 for a long field or section |
+| `client_body_timeout` | 60s | top level, site | time between two successive reads of the request body | 408 |
+| `client_max_body_size` | 1m | top level, site | the request body | 413, before the body is read when `Content-Length` says so |
+| `proxy_connect_timeout` | 60s | top level, site | connecting to the upstream | 504 |
+| `proxy_read_timeout` | 60s | top level, site | the wait for the response head, and between two successive response reads | 504 before the head; after it, the connection closes |
+| `proxy_send_timeout` | 60s | top level, site | time between two successive writes to the upstream | 504 before the response head |
+
+An upstream that cannot be reached, or that resets the connection, still gets
+502. Expired timers and oversized requests are visible in the access log: the
+`$status` is the status sent, `$reason` names the cause (`header_timeout`,
+`body_timeout`, `body_too_large`, `unreadable_body`, `uri_too_long`,
+`header_too_large`), and
+`$upstream_error` names the upstream failure.
+
+Notes on where the limits differ from nginx:
+
+- The connection timers and header limits (`client_header_timeout`,
+  `keepalive_timeout`, `keepalive_requests`, `send_timeout` and
+  `large_client_header_buffers`) are top-level only. They apply before the
+  `Host` selects a site, and a `site` block that sets one is a configuration
+  error.
+- The `proxy_read_timeout` clock starts when the request is handed to the
+  upstream client, so it includes connecting. `proxy_connect_timeout` bounds
+  the connect on its own.
+- A zero time is rejected for every timer except `keepalive_timeout`.
+- A connection whose `client_header_timeout` expires before it sent any byte
+  of a request is closed without a response. The first request's clock starts
+  when the connection is accepted.
+
+Where each limit is enforced. The header limits and the connection timers
+apply to the bytes before hyper parses them, in the socket wrapper
+(`src/transport.rs`). The body timer and `client_max_body_size` apply while the
+body is read (`src/body.rs`). The upstream timers apply in the upstream client
+(`src/proxy.rs`).
+
+Request bodies are streamed. The router reads the first `inspect_body` bytes
+for the decision and forwards the rest as the upstream reads it. A body over
+`client_max_body_size` is refused with 413 when the `Content-Length` shows it
+before anything is read. A chunked body that grows past the limit is cut off:
+the upstream request is aborted and the client gets 413, unless the upstream
+has already answered, in which case the connection closes. Memory per request
+is bounded by `inspect_body` and a few buffers, not by the body size.
+
+The header limits are checked on the first bytes of each request, so a
+request pipelined behind another on the same connection is not checked by
+them, only by hyper's own buffer limit. hyper's limit of 100 header fields is
+unchanged.
+
 ## Evaluation
 
 The first measurement of Clef-flash and Jev on the labelled dataset is in
@@ -96,6 +160,11 @@ default is `access_log stdout json;`. Formats are defined with `log_format`
 from the variables listed in the example file. `error_log` controls the
 operational messages. A file destination is reopened on SIGUSR1, so logrotate
 can move it away.
+
+Migration from `max_body`: the body limit is now the top-level
+`client_max_body_size`, which defaults to 1m. It was 10m as `decision.max_body`,
+so uploads between 1 and 10 MB need `client_max_body_size 10m;`, and a
+`max_body` line is an error that names its replacement.
 
 Migration from the earlier TOML configuration: there is no automatic converter.
 Each `[[sites]]` table becomes a `site` block, `timeout_ms = 150` becomes

@@ -65,6 +65,8 @@ configs:
     content: |
       server {
         listen 80;
+        # Above the router's 1 MB default, so the router decides on uploads.
+        client_max_body_size 10m;
 
         location / {
           proxy_pass http://vigilant-heron:8080;

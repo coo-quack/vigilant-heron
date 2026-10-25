@@ -38,6 +38,7 @@ fn clef_config(
         r#"
 listen 127.0.0.1:0;
 
+client_max_body_size 1024;
 decision {{
     backend clef;
     model clef-flash;
@@ -45,7 +46,6 @@ decision {{
     api_token_env "{TOKEN_ENV}";
     timeout 2000ms;
     inspect_body 512;
-    max_body 1024;
 }}
 
 default_status 421;

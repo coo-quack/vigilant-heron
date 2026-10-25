@@ -50,6 +50,8 @@ pub(crate) enum Field {
     DecisionError,
     RetryAfter,
     InputTokens,
+    UpstreamStatus,
+    UpstreamError,
     LatencyMs,
 }
 
@@ -76,6 +78,8 @@ impl Field {
             "decision_error" => Self::DecisionError,
             "retry_after" => Self::RetryAfter,
             "input_tokens" => Self::InputTokens,
+            "upstream_status" => Self::UpstreamStatus,
+            "upstream_error" => Self::UpstreamError,
             "latency_ms" => Self::LatencyMs,
             _ => return None,
         })
@@ -294,6 +298,11 @@ pub(crate) struct AccessRecord<'a> {
     pub(crate) retry_after: Option<&'a str>,
     /// Input tokens the backend reported.
     pub(crate) input_tokens: Option<u64>,
+    /// Status the upstream answered with, when it answered.
+    pub(crate) upstream_status: Option<u16>,
+    /// Why the upstream did not give a response: `connect_timeout`, `connect_failed`,
+    /// `read_timeout`, `send_timeout` or `upstream_failed`.
+    pub(crate) upstream_error: Option<&'a str>,
     /// Time from the start of the request to the answer, in milliseconds.
     pub(crate) latency_ms: u64,
 }
@@ -322,6 +331,8 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::DecisionError => record.decision_error.and_then(text),
         Field::RetryAfter => record.retry_after.and_then(text),
         Field::InputTokens => record.input_tokens.map(|v| v.to_string()),
+        Field::UpstreamStatus => record.upstream_status.map(|v| v.to_string()),
+        Field::UpstreamError => record.upstream_error.and_then(text),
         Field::LatencyMs => Some(record.latency_ms.to_string()),
     }
 }
@@ -486,6 +497,8 @@ mod tests {
             decision_error: None,
             retry_after: None,
             input_tokens: Some(1234),
+            upstream_status: Some(200),
+            upstream_error: None,
             latency_ms: 17,
         }
     }

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Breaking:** `decision.max_body` is replaced by the top-level
+  `client_max_body_size`, which takes nginx's units and defaults to `1m`
+  (`max_body` defaulted to 10m). `client_max_body_size 0` is unlimited. A body
+  over the limit gets 413, before it is read when `Content-Length` shows it.
+  Uploads between 1 and 10 MB need `client_max_body_size 10m;`. `max_body` is
+  now a configuration error that names its replacement.
+- **Breaking:** request bodies are streamed. Only the first `inspect_body` bytes
+  are read for the decision, and the rest is forwarded as it arrives, so memory
+  per request no longer grows with the body (up to 10 MB before).
+- Connection timers with nginx's names and defaults: `client_header_timeout`,
+  `client_body_timeout`, `send_timeout`, `keepalive_timeout` (0 disables
+  keep-alive) and `keepalive_requests`. The connection timers and header limits
+  are top-level only; the body timer and `client_max_body_size` can be set per
+  site.
+- `large_client_header_buffers`: a request line over one buffer gets 414, a
+  header field or a header section over its limit gets 400. A request header
+  that stops arriving gets 408; a silent connection is closed.
+- Upstream timers with nginx's names and defaults, per site: `proxy_connect_timeout`,
+  `proxy_read_timeout` and `proxy_send_timeout`. A connect, read or send timeout
+  before the response gets 504; a connection failure keeps 502.
+- Access log variables `$upstream_status` and `$upstream_error`. A timer or
+  limit that answers the client is logged with its status and `$reason`.
 - **Breaking:** the configuration is nginx-style (`vigilant-heron.conf`), not
   TOML. Each TOML key has a directive, times and sizes take units, and
   `include` splits files. The default path is `/etc/vigilant-heron/vigilant-heron.conf`.

@@ -41,7 +41,9 @@ src/
   decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
-  proxy.rs       # Forwarding to upstreams, hop-by-hop headers
+  proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers
+  transport.rs   # Client socket: header, keep-alive and send timers, header limits (414/400); upstream send timer
+  body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
   server.rs      # Accept loop and per-request pipeline, access records
   error.rs       # Error types
 tests/
@@ -49,12 +51,13 @@ tests/
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
   jev.rs         # In-process tests of the Jev backend against a fake endpoint
   failures.rs    # Failure settings, rule-first guarantee, queued requests with one slot
+  limits.rs      # Timers, header limits, body limit and upstream timeouts, with short timers
   logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack
-  vigilant-heron.conf # Router for the http backend, with three sites
+  vigilant-heron.conf # Router for the http backend, with four sites (one for uploads)
   config-clef.conf    # Second router that uses backend clef against the stub
   config-jev.conf     # Third router that uses backend jev against the stub
   compose.yaml   # nginx edge, three routers, stub decider, upstream

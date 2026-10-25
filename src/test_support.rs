@@ -19,12 +19,12 @@ pub(crate) fn site(site_fields: &str) -> Result<SiteConfig, ConfigError> {
         r"
 listen 127.0.0.1:8080;
 
+client_max_body_size 10m;
 decision {{
     backend http;
     url http://stub-decider:9000/decide;
     timeout 150ms;
     inspect_body 8k;
-    max_body 10m;
 }}
 
 default_status 421;

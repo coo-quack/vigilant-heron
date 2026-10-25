@@ -357,3 +357,51 @@ async fn rate_limited_decision_on_a_site_that_blocks_gets_403() -> TestResult {
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+/// FNV-1a over `bytes`. The stub decider reports the same hash for the bodies it receives.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn large_upload_passes_through_nginx_and_the_router_intact() -> TestResult {
+    let body: Vec<u8> = (0..5 * 1024 * 1024)
+        .map(|index: usize| b'a' + u8::try_from(index % 26).unwrap_or(0))
+        .collect();
+    let reply = send(
+        &base(),
+        Method::POST,
+        "/echo/upload",
+        "upload.test",
+        &[("content-type", "application/octet-stream")],
+        Bytes::from(body.clone()),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["length"], serde_json::json!(body.len()));
+    assert_eq!(
+        reply.json()["hash"],
+        serde_json::json!(fnv1a(&body).to_string())
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs the e2e compose stack; run scripts/e2e.sh"]
+async fn upload_over_client_max_body_size_gets_413() -> TestResult {
+    // enforce.test keeps the default limit of 1 MB; nginx in front allows 10 MB.
+    let reply = send(
+        &base(),
+        Method::POST,
+        "/upload",
+        "enforce.test",
+        &[("content-type", "application/octet-stream")],
+        Bytes::from(vec![b'a'; 2 * 1024 * 1024]),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}

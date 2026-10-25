@@ -33,13 +33,13 @@ request_id_header x-request-id;
 access_log @ACCESS_LOG@ json;
 @WORKER_THREADS@
 
+client_max_body_size 10485760;
 decision {
     backend http;
     url http://127.0.0.1:9000/decide;
     timeout 300ms;
     max_concurrency @MAX_CONCURRENCY@;
     inspect_body 8192;
-    max_body 10485760;
 }
 
 default_status 421;

@@ -34,8 +34,28 @@ const DEFAULT_BLOCK_THRESHOLD: f64 = 0.87;
 const DEFAULT_INSTRUCTION_THRESHOLD: f64 = 0.8;
 /// Default inspected body size.
 const DEFAULT_INSPECT_BODY: usize = 8 * 1024;
-/// Default largest request body.
-const DEFAULT_MAX_BODY: usize = 10 * 1024 * 1024;
+/// Default `client_header_timeout`.
+const DEFAULT_CLIENT_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `client_body_timeout`.
+const DEFAULT_CLIENT_BODY_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `send_timeout`.
+const DEFAULT_SEND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `keepalive_timeout`.
+const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(75);
+/// Default `keepalive_requests`.
+const DEFAULT_KEEPALIVE_REQUESTS: usize = 1000;
+/// Default `large_client_header_buffers` count.
+const DEFAULT_HEADER_BUFFER_COUNT: usize = 4;
+/// Default `large_client_header_buffers` size.
+const DEFAULT_HEADER_BUFFER_SIZE: usize = 8 * 1024;
+/// Default `client_max_body_size`.
+const DEFAULT_CLIENT_MAX_BODY: usize = 1024 * 1024;
+/// Default `proxy_connect_timeout`.
+const DEFAULT_PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `proxy_read_timeout`.
+const DEFAULT_PROXY_READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default `proxy_send_timeout`.
+const DEFAULT_PROXY_SEND_TIMEOUT: Duration = Duration::from_secs(60);
 /// The Jev endpoint used when `url` is omitted.
 const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 /// The Jev model used when `model` is omitted.
@@ -62,6 +82,8 @@ pub struct Config {
     pub request_id_header: Option<HeaderName>,
     /// How the client address is chosen.
     pub realip: RealIp,
+    /// Timers and header limits of client connections.
+    pub connection: ConnectionConfig,
     /// Status returned for hosts that match no site.
     pub default_status: StatusCode,
     /// Settings for the decision backend.
@@ -89,10 +111,53 @@ pub struct DecisionConfig {
     pub max_concurrency: usize,
     /// Bytes of the request body that are sent to the backend.
     pub inspect_body_bytes: usize,
-    /// Largest request body the proxy reads at all.
-    pub max_body_bytes: usize,
     /// Extra header names to drop before sending, lowercased.
     pub redact_headers: Vec<String>,
+}
+
+/// Timers and header limits of client connections, set at the top level only.
+///
+/// They apply before the request's `Host` selects a site, so no site can
+/// override them. The directive names follow nginx.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConnectionConfig {
+    /// Time allowed to receive a whole request header, counted from the first
+    /// byte of a request. Also bounds the first request of a connection.
+    pub client_header_timeout: Duration,
+    /// Idle time allowed between requests on a keep-alive connection. Zero
+    /// disables keep-alive: every connection serves one request.
+    pub keepalive_timeout: Duration,
+    /// Requests served on one connection. The last one answers `Connection: close`.
+    pub keepalive_requests: usize,
+    /// Longest wait between two successive writes to the client.
+    pub send_timeout: Duration,
+    /// Size limits of the request line and header fields.
+    pub large_header_buffers: HeaderBuffers,
+}
+
+/// Limits for the request line and header section, as `large_client_header_buffers`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeaderBuffers {
+    /// Number of buffers. The whole header section may use `count * size` bytes.
+    pub count: usize,
+    /// Size of one buffer. The request line and each header field may use `size` bytes.
+    pub size: usize,
+}
+
+/// Timers and body limit of one site. Each value is the top-level value unless the site sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SiteTimeouts {
+    /// Longest wait between two successive reads of the request body from the client.
+    pub client_body_timeout: Duration,
+    /// Largest request body in bytes. `None` (`client_max_body_size 0`) is unlimited.
+    pub max_body_bytes: Option<usize>,
+    /// Time allowed to connect to the upstream.
+    pub proxy_connect_timeout: Duration,
+    /// Time allowed from sending a request to receiving the response head, and
+    /// between two successive reads of the response body.
+    pub proxy_read_timeout: Duration,
+    /// Longest wait between two successive writes to the upstream.
+    pub proxy_send_timeout: Duration,
 }
 
 /// The protocol used to reach the decision backend.
@@ -145,6 +210,8 @@ pub struct SiteConfig {
     pub debug_headers: bool,
     /// The site's own access logs. `None` inherits the top-level ones; `Some(empty)` is `access_log off`.
     pub access_logs: Option<Vec<AccessLogConfig>>,
+    /// Body and upstream timers and the body size limit of this site.
+    pub timeouts: SiteTimeouts,
 }
 
 /// One access-log destination with its format.
@@ -422,6 +489,85 @@ fn parse_threshold(directive: &Directive, text: &str) -> Result<f64, ConfigError
     }
 }
 
+/// Parses a time that must be greater than zero.
+fn parse_positive_time(directive: &Directive, text: &str) -> Result<Duration, ConfigError> {
+    let duration = parse_time(directive, text)?;
+    if duration.is_zero() {
+        return Err(invalid(
+            directive,
+            format!("\"{}\" must be greater than 0", directive.name),
+        ));
+    }
+    Ok(duration)
+}
+
+/// Parses `client_max_body_size`: `0` means unlimited and gives `None`.
+fn parse_body_limit(directive: &Directive, text: &str) -> Result<Option<usize>, ConfigError> {
+    let size = parse_size(directive, text)?;
+    Ok((size > 0).then_some(size))
+}
+
+/// Parses `large_client_header_buffers <number> <size>`.
+fn parse_header_buffers(directive: &Directive) -> Result<HeaderBuffers, ConfigError> {
+    let [count, size] = directive.args.as_slice() else {
+        return Err(invalid(
+            directive,
+            "\"large_client_header_buffers\" takes two arguments: a number and a size",
+        ));
+    };
+    let count = parse_usize(directive, count)?;
+    let size = parse_size(directive, size)?;
+    if count == 0 || size == 0 {
+        return Err(invalid(
+            directive,
+            "\"large_client_header_buffers\" needs a number and a size of at least 1",
+        ));
+    }
+    Ok(HeaderBuffers { count, size })
+}
+
+/// Timers that a site may override, and the top-level directives that set them.
+const SITE_TIMEOUT_NAMES: [&str; 5] = [
+    "client_body_timeout",
+    "client_max_body_size",
+    "proxy_connect_timeout",
+    "proxy_read_timeout",
+    "proxy_send_timeout",
+];
+
+/// Connection timers that apply before a site is chosen, so only the top level may set them.
+const CONNECTION_NAMES: [&str; 6] = [
+    "client_header_timeout",
+    "keepalive_timeout",
+    "keepalive_requests",
+    "send_timeout",
+    "large_client_header_buffers",
+    "max_body",
+];
+
+/// Sets one of the site-overridable timers or the body limit. Other names are left alone.
+fn set_site_timeout(directive: &Directive, timeouts: &mut SiteTimeouts) -> Result<(), ConfigError> {
+    match directive.name.as_str() {
+        "client_body_timeout" => {
+            timeouts.client_body_timeout = parse_positive_time(directive, one_arg(directive)?)?;
+        }
+        "client_max_body_size" => {
+            timeouts.max_body_bytes = parse_body_limit(directive, one_arg(directive)?)?;
+        }
+        "proxy_connect_timeout" => {
+            timeouts.proxy_connect_timeout = parse_positive_time(directive, one_arg(directive)?)?;
+        }
+        "proxy_read_timeout" => {
+            timeouts.proxy_read_timeout = parse_positive_time(directive, one_arg(directive)?)?;
+        }
+        "proxy_send_timeout" => {
+            timeouts.proxy_send_timeout = parse_positive_time(directive, one_arg(directive)?)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn parse_absolute_uri(text: &str, schemes: &[&str]) -> Option<Uri> {
     let uri = text.parse::<Uri>().ok()?;
     let scheme_ok = uri
@@ -476,6 +622,24 @@ where
     };
     let mut access_directives = Vec::new();
     let mut format_directives = Vec::new();
+    let mut connection = ConnectionConfig {
+        client_header_timeout: DEFAULT_CLIENT_HEADER_TIMEOUT,
+        keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
+        keepalive_requests: DEFAULT_KEEPALIVE_REQUESTS,
+        send_timeout: DEFAULT_SEND_TIMEOUT,
+        large_header_buffers: HeaderBuffers {
+            count: DEFAULT_HEADER_BUFFER_COUNT,
+            size: DEFAULT_HEADER_BUFFER_SIZE,
+        },
+    };
+    // The top-level values of the site-overridable timers, inherited by every site.
+    let mut site_timeouts = SiteTimeouts {
+        client_body_timeout: DEFAULT_CLIENT_BODY_TIMEOUT,
+        max_body_bytes: Some(DEFAULT_CLIENT_MAX_BODY),
+        proxy_connect_timeout: DEFAULT_PROXY_CONNECT_TIMEOUT,
+        proxy_read_timeout: DEFAULT_PROXY_READ_TIMEOUT,
+        proxy_send_timeout: DEFAULT_PROXY_SEND_TIMEOUT,
+    };
 
     // Pass one: formats first, so access logs can refer to them.
     for directive in directives {
@@ -568,6 +732,48 @@ where
                 block(directive)?;
                 decision_directive = Some(directive);
             }
+            "client_header_timeout" => {
+                once(&mut seen, directive)?;
+                connection.client_header_timeout =
+                    parse_positive_time(directive, one_arg(directive)?)?;
+            }
+            "keepalive_timeout" => {
+                once(&mut seen, directive)?;
+                connection.keepalive_timeout = parse_time(directive, one_arg(directive)?)?;
+            }
+            "keepalive_requests" => {
+                once(&mut seen, directive)?;
+                let count = parse_usize(directive, one_arg(directive)?)?;
+                if count == 0 {
+                    return Err(invalid(
+                        directive,
+                        "\"keepalive_requests\" must be at least 1",
+                    ));
+                }
+                connection.keepalive_requests = count;
+            }
+            "send_timeout" => {
+                once(&mut seen, directive)?;
+                connection.send_timeout = parse_positive_time(directive, one_arg(directive)?)?;
+            }
+            "large_client_header_buffers" => {
+                once(&mut seen, directive)?;
+                connection.large_header_buffers = parse_header_buffers(directive)?;
+            }
+            "client_body_timeout"
+            | "client_max_body_size"
+            | "proxy_connect_timeout"
+            | "proxy_read_timeout"
+            | "proxy_send_timeout" => {
+                once(&mut seen, directive)?;
+                set_site_timeout(directive, &mut site_timeouts)?;
+            }
+            "max_body" => {
+                return Err(invalid(
+                    directive,
+                    "\"max_body\" was replaced by \"client_max_body_size\", which is set at the top level",
+                ));
+            }
             "site" => site_directives.push(directive),
             "error_log" => {
                 once(&mut seen, directive)?;
@@ -600,7 +806,7 @@ where
     let mut sites = Vec::new();
     let mut hosts_seen: HashSet<String> = HashSet::new();
     for site in site_directives {
-        let parsed = parse_site(site, &formats)?;
+        let parsed = parse_site(site, &formats, &site_timeouts)?;
         for host in &parsed.hosts {
             if !hosts_seen.insert(host.clone()) {
                 return Err(invalid(
@@ -628,6 +834,7 @@ where
         sites,
         access_logs,
         error_log,
+        connection,
     })
 }
 
@@ -880,7 +1087,6 @@ where
     let mut queue_timeout = Duration::ZERO;
     let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
     let mut inspect_body = DEFAULT_INSPECT_BODY;
-    let mut max_body = DEFAULT_MAX_BODY;
     let mut redact_headers = Vec::new();
     let mut backend_line = directive;
     let mut token_line = directive;
@@ -932,8 +1138,10 @@ where
                 inspect_body = parse_size(child, one_arg(child)?)?;
             }
             "max_body" => {
-                once(&mut seen, child)?;
-                max_body = parse_size(child, one_arg(child)?)?;
+                return Err(invalid(
+                    child,
+                    "\"max_body\" was replaced by \"client_max_body_size\", which is set at the top level",
+                ));
             }
             "redact_header" => {
                 if child.args.is_empty() {
@@ -964,12 +1172,6 @@ where
     }
     if max_concurrency == 0 {
         return Err(invalid(directive, "\"max_concurrency\" must be at least 1"));
-    }
-    if inspect_body > max_body {
-        return Err(invalid(
-            directive,
-            "\"inspect_body\" must not exceed \"max_body\"",
-        ));
     }
 
     let (url_text, url_line) = match url_text {
@@ -1052,7 +1254,6 @@ where
         queue_timeout,
         max_concurrency,
         inspect_body_bytes: inspect_body,
-        max_body_bytes: max_body,
         redact_headers,
     })
 }
@@ -1082,7 +1283,11 @@ where
     clippy::too_many_lines,
     reason = "one arm per directive keeps each name and its check together"
 )]
-fn parse_site(directive: &Directive, formats: &Formats) -> Result<SiteConfig, ConfigError> {
+fn parse_site(
+    directive: &Directive,
+    formats: &Formats,
+    defaults: &SiteTimeouts,
+) -> Result<SiteConfig, ConfigError> {
     if directive.args.is_empty() {
         return Err(invalid(directive, "\"site\" needs at least one host name"));
     }
@@ -1113,9 +1318,22 @@ fn parse_site(directive: &Directive, formats: &Formats) -> Result<SiteConfig, Co
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
+    let mut timeouts = *defaults;
 
     for child in block(directive)? {
         match child.name.as_str() {
+            name if SITE_TIMEOUT_NAMES.contains(&name) => {
+                once(&mut seen, child)?;
+                set_site_timeout(child, &mut timeouts)?;
+            }
+            name if CONNECTION_NAMES.contains(&name) => {
+                return Err(invalid(
+                    child,
+                    format!(
+                        "\"{name}\" is only valid at the top level: it applies before the Host selects a site"
+                    ),
+                ));
+            }
             "upstream" => {
                 once(&mut seen, child)?;
                 let text = one_arg(child)?;
@@ -1242,6 +1460,7 @@ fn parse_site(directive: &Directive, formats: &Formats) -> Result<SiteConfig, Co
         }),
         debug_headers,
         access_logs,
+        timeouts,
     })
 }
 
@@ -1307,7 +1526,11 @@ mod tests {
         assert_eq!(config.decision.queue_timeout, Duration::ZERO);
         assert_eq!(config.decision.max_concurrency, 64);
         assert_eq!(config.decision.inspect_body_bytes, 8192);
-        assert_eq!(config.decision.max_body_bytes, 10 * 1024 * 1024);
+        assert_eq!(
+            config.connection.client_header_timeout,
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.sites[0].timeouts.max_body_bytes, Some(1024 * 1024));
         assert_eq!(config.realip.header, HeaderName::from_static("x-real-ip"));
         assert!(!config.realip.recursive);
         assert_eq!(config.realip.trusted.len(), 0);
@@ -1457,7 +1680,7 @@ mod tests {
         #[case] expected: usize,
     ) -> Result<(), ConfigError> {
         let config = parse(&with_decision(&format!(
-            "    backend http;\n    inspect_body {text};\n    max_body 1g;\n"
+            "    backend http;\n    inspect_body {text};\n"
         )))?;
         assert_eq!(config.decision.inspect_body_bytes, expected);
         Ok(())
@@ -1484,9 +1707,9 @@ mod tests {
     }
 
     #[test]
-    fn inspect_body_larger_than_max_body_is_rejected() {
-        let text = with_decision("    backend http;\n    inspect_body 2m;\n    max_body 1m;\n");
-        assert!(message(parse(&text)).contains("must not exceed"));
+    fn max_body_in_decision_is_replaced_by_client_max_body_size() {
+        let text = with_decision("    backend http;\n    max_body 1m;\n");
+        assert!(message(parse(&text)).contains("replaced by \"client_max_body_size\""));
     }
 
     #[test]
@@ -1862,5 +2085,208 @@ mod tests {
         fn parsing_arbitrary_text_never_panics(text in "[a-z0-9 ;{}\"'#$=/:.,\n-]{0,300}") {
             let _ = Config::parse_str_with_lookup(&text, "fuzz.conf", |_| None);
         }
+    }
+}
+
+#[cfg(test)]
+mod connection_limit_tests {
+    use std::time::Duration;
+
+    use rstest::rstest;
+
+    use super::*;
+
+    const DECISION: &str =
+        "decision {\n    backend http;\n    url http://stub-decider:9000/decide;\n}\n";
+    const SITE: &str = "site example.com {\n    upstream http://upstream:80;\n}\n";
+
+    fn parse(top: &str, site: &str) -> Result<Config, ConfigError> {
+        let text = format!(
+            "listen 127.0.0.1:8080;\n{top}{DECISION}site example.com {{\n    upstream http://upstream:80;\n{site}}}\n"
+        );
+        Config::parse_str_with_lookup(&text, "test.conf", |_| None)
+    }
+
+    fn message(result: Result<Config, ConfigError>) -> String {
+        match result {
+            Ok(_) => String::new(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn every_connection_directive_has_the_nginx_default() -> Result<(), ConfigError> {
+        let config = Config::parse_str(
+            &format!("listen 127.0.0.1:8080;\n{DECISION}{SITE}"),
+            "t.conf",
+        )?;
+        let connection = &config.connection;
+        assert_eq!(connection.client_header_timeout, Duration::from_secs(60));
+        assert_eq!(connection.keepalive_timeout, Duration::from_secs(75));
+        assert_eq!(connection.keepalive_requests, 1000);
+        assert_eq!(connection.send_timeout, Duration::from_secs(60));
+        assert_eq!(
+            connection.large_header_buffers,
+            HeaderBuffers {
+                count: 4,
+                size: 8192
+            }
+        );
+        let timeouts = config.sites[0].timeouts;
+        assert_eq!(timeouts.client_body_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.max_body_bytes, Some(1024 * 1024));
+        assert_eq!(timeouts.proxy_connect_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.proxy_read_timeout, Duration::from_secs(60));
+        assert_eq!(timeouts.proxy_send_timeout, Duration::from_secs(60));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::milliseconds("200ms", Duration::from_millis(200))]
+    #[case::bare_seconds("5", Duration::from_secs(5))]
+    #[case::seconds("5s", Duration::from_secs(5))]
+    #[case::minutes("2m", Duration::from_secs(120))]
+    #[case::hours("1h", Duration::from_secs(3600))]
+    fn client_header_timeout_takes_nginx_time_units(
+        #[case] text: &str,
+        #[case] expected: Duration,
+    ) -> Result<(), ConfigError> {
+        let config = parse(&format!("client_header_timeout {text};\n"), "")?;
+        assert_eq!(config.connection.client_header_timeout, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn keepalive_timeout_zero_disables_keep_alive() -> Result<(), ConfigError> {
+        let config = parse("keepalive_timeout 0;\n", "")?;
+        assert_eq!(config.connection.keepalive_timeout, Duration::ZERO);
+        Ok(())
+    }
+
+    #[test]
+    fn keepalive_timeout_and_send_timeout_take_their_values() -> Result<(), ConfigError> {
+        let config = parse("keepalive_timeout 30s;\nsend_timeout 250ms;\n", "")?;
+        assert_eq!(config.connection.keepalive_timeout, Duration::from_secs(30));
+        assert_eq!(config.connection.send_timeout, Duration::from_millis(250));
+        Ok(())
+    }
+
+    #[test]
+    fn keepalive_requests_and_header_buffers_are_read() -> Result<(), ConfigError> {
+        let config = parse(
+            "keepalive_requests 5;\nlarge_client_header_buffers 2 16k;\n",
+            "",
+        )?;
+        assert_eq!(config.connection.keepalive_requests, 5);
+        assert_eq!(
+            config.connection.large_header_buffers,
+            HeaderBuffers {
+                count: 2,
+                size: 16 * 1024
+            }
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::client_header_zero("client_header_timeout 0;\n", "must be greater than 0")]
+    #[case::send_zero("send_timeout 0s;\n", "must be greater than 0")]
+    #[case::keepalive_requests_zero("keepalive_requests 0;\n", "must be at least 1")]
+    #[case::buffers_missing_size("large_client_header_buffers 4;\n", "takes two arguments")]
+    #[case::buffers_zero_count("large_client_header_buffers 0 8k;\n", "at least 1")]
+    #[case::buffers_bad_size("large_client_header_buffers 4 8q;\n", "unknown size unit")]
+    #[case::bad_time("client_header_timeout soon;\n", "is not a time")]
+    #[case::bad_time_unit("client_header_timeout 3d;\n", "unknown time unit")]
+    #[case::duplicate(
+        "client_header_timeout 1s;\nclient_header_timeout 2s;\n",
+        "duplicate directive"
+    )]
+    fn invalid_connection_values_name_the_directive_and_its_line(
+        #[case] line: &str,
+        #[case] expected: &str,
+    ) {
+        let text = message(parse(line, ""));
+        assert!(text.contains(expected), "{text}");
+        assert!(text.contains("test.conf:"), "{text}");
+    }
+
+    #[test]
+    fn connection_directives_inside_a_site_are_rejected() {
+        for name in [
+            "client_header_timeout 5s;",
+            "keepalive_timeout 5s;",
+            "keepalive_requests 5;",
+            "send_timeout 5s;",
+            "large_client_header_buffers 4 8k;",
+        ] {
+            let text = message(parse("", &format!("    {name}\n")));
+            assert!(
+                text.contains("only valid at the top level"),
+                "{name}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn site_timers_override_the_top_level_values_for_that_site() -> Result<(), ConfigError> {
+        let config = parse(
+            "client_body_timeout 30s;\nclient_max_body_size 2m;\nproxy_read_timeout 9s;\n",
+            "    client_body_timeout 5s;\n    client_max_body_size 0;\n    proxy_connect_timeout 1s;\n    proxy_send_timeout 2s;\n",
+        )?;
+        let timeouts = config.sites[0].timeouts;
+        assert_eq!(timeouts.client_body_timeout, Duration::from_secs(5));
+        assert_eq!(timeouts.max_body_bytes, None);
+        assert_eq!(timeouts.proxy_connect_timeout, Duration::from_secs(1));
+        assert_eq!(timeouts.proxy_read_timeout, Duration::from_secs(9));
+        assert_eq!(timeouts.proxy_send_timeout, Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn a_site_without_overrides_inherits_the_top_level_values() -> Result<(), ConfigError> {
+        let config = parse("client_body_timeout 30s;\nclient_max_body_size 2m;\n", "")?;
+        let timeouts = config.sites[0].timeouts;
+        assert_eq!(timeouts.client_body_timeout, Duration::from_secs(30));
+        assert_eq!(timeouts.max_body_bytes, Some(2 * 1024 * 1024));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::zero_is_unlimited("0", None)]
+    #[case::bytes("512", Some(512))]
+    #[case::kilobytes("8k", Some(8 * 1024))]
+    #[case::megabytes("10m", Some(10 * 1024 * 1024))]
+    fn client_max_body_size_takes_nginx_size_units(
+        #[case] text: &str,
+        #[case] expected: Option<usize>,
+    ) -> Result<(), ConfigError> {
+        let config = parse(&format!("client_max_body_size {text};\n"), "")?;
+        assert_eq!(config.sites[0].timeouts.max_body_bytes, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_timers_must_be_positive_in_a_site() {
+        let text = message(parse("", "    proxy_read_timeout 0;\n"));
+        assert!(
+            text.contains("\"proxy_read_timeout\" must be greater than 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn max_body_is_replaced_by_client_max_body_size() {
+        let text = message(Config::parse_str_with_lookup(
+            &format!(
+                "listen 127.0.0.1:8080;\ndecision {{\n    backend http;\n    url http://stub:9000/decide;\n    max_body 1m;\n}}\n{SITE}"
+            ),
+            "test.conf",
+            |_| None,
+        ));
+        assert!(
+            text.contains("replaced by \"client_max_body_size\""),
+            "{text}"
+        );
+        assert!(text.contains("test.conf:5:"), "{text}");
     }
 }
