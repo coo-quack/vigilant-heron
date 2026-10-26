@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added: `vigilant-heron test-request <file> [--client <address>]` reports what the
+  router would do with one raw HTTP/1.1 request before deployment: the site, the access
+  list, `deny_path`, the rules that match, and whether the request would go to the
+  decision backend. It runs the server's own checks, never calls the upstream or the
+  backend, and does not simulate `limit_req` or `limit_conn` counts. See
+  [Check a request with test-request](/cli#check-a-request-with-test-request).
 - Fixed: a stale pid file could make `-s`, `stop`, `restart` and `start` act on an
   unrelated process. When a router died without removing its pid file and the OS
   gave its pid to another process, `-s stop` or `stop` signalled that process, and

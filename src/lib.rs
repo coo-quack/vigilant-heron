@@ -24,6 +24,7 @@ mod policy;
 mod prefilter;
 mod proxy;
 mod realip;
+mod request_check;
 mod router;
 mod rules;
 mod sanitize;
@@ -44,6 +45,7 @@ pub use config::{
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
+pub use request_check::{CheckError, Outcome, RequestCheck, check_request};
 pub use server::{serve, serve_reloadable};
 pub use system_one::{ApiToken, ClefModel};
 

@@ -232,6 +232,19 @@ impl<'a> RuleInput<'a> {
 }
 
 impl Rule {
+    /// The path readings that satisfy the rule's `path` condition, for `test-request`.
+    /// Empty when the rule has no path condition.
+    pub(crate) fn path_readings(&self, input: &RuleInput<'_>) -> Vec<String> {
+        self.path.as_ref().map_or_else(Vec::new, |path| {
+            input
+                .paths
+                .iter()
+                .filter(|view| path.matches(view.as_str()))
+                .cloned()
+                .collect()
+        })
+    }
+
     /// Returns true when every condition of the rule matches the request.
     ///
     /// The path conditions are combined with `scope`. A condition that names an

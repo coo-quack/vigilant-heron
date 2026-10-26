@@ -196,7 +196,7 @@ fn failure_outcome(
     }
 }
 
-fn site_action(site: &SiteConfig) -> Action {
+pub(crate) fn site_action(site: &SiteConfig) -> Action {
     match &site.action {
         SiteAction::Block => Action::Block,
         SiteAction::Redirect(location) => Action::Redirect(location.clone()),

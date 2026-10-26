@@ -17,6 +17,8 @@ follow nginx's, so `-t`, `-T` and `-s` do what they do in nginx.
 | `start` | Check the configuration, then run the router in the background. See [Run in the background](#run-in-the-background-start-stop-restart). |
 | `stop` | Stop the background router and wait until it has exited. |
 | `restart` | Check the configuration, then stop and start the background router. |
+| `test-request <file>` | Report what the router would do with one raw HTTP request, without calling the decision backend. See [Check a request with test-request](#check-a-request-with-test-request). |
+| `--client <address>` | The client address that `test-request` uses for the access list. The default is `127.0.0.1`. |
 
 An unknown option, a missing value, or an invalid `-s` word prints the reason and
 the usage to stderr, and exits 1. `-h` and `-v` win over the other options. `-s`
@@ -156,6 +158,82 @@ headers. Token values never appear, because the configuration names only the
 variables. An include must be
 written alone on one line, ending in `;`, so that `-T` can replace it. Otherwise
 `-T` reports an include error at its line.
+
+## Check a request with test-request
+
+`test-request` shows what the router would do with one sample request, before you
+deploy a rule or a configuration change. It reads the configuration the same way
+`-t` does, and reports the decision. Nothing is bound or forwarded, and neither the
+upstream nor the decision backend is contacted.
+
+Because the configuration is checked as `-t` checks it, the variable named by
+`api_token_env` must be set. Any value works, since the backend is not called.
+
+```console
+$ vigilant-heron -c examples/vigilant-heron.conf test-request examples/requests/sqli-get.http
+request: GET "/products?id=1%20UNION%20SELECT%20password%20FROM%20users" (Host: "www.example.com", client: 127.0.0.1)
+site: example.com (shadow off)
+limits: not simulated (counts depend on earlier requests); limit_req zones: none; limit_conn zones: none
+access list: allowed
+deny_path: no match
+rules: vh-sqli-001 matched (block): UNION SELECT in a query string
+result: blocked with 403 by rule vh-sqli-001
+$ echo $?
+0
+```
+
+The request file holds the request line, the header lines, a blank line and an
+optional body, as sent on the wire. Lines end in LF or CRLF. A POST looks like this:
+
+```http
+POST /api/comments HTTP/1.1
+Host: www.example.com
+Content-Type: application/json
+Content-Length: 31
+
+{"text":"Nice product, thanks"}
+```
+
+The example files are in `examples/requests/`. Use `-` to read the request from
+standard input:
+
+```console
+$ printf 'GET /healthz HTTP/1.1\nHost: www.example.com\n\n' | vigilant-heron -c vigilant-heron.conf test-request -
+```
+
+For a request that no rule decides, the report says that it would be sent to the
+decision backend, and names the backend. The verdict is not known without calling the
+backend, so the report gives the thresholds that would block it:
+
+```console
+$ vigilant-heron -c examples/vigilant-heron.conf test-request examples/requests/normal-post.http
+...
+rules: no block or skip rule matched
+static asset skip: does not apply
+result: would be sent to the decision backend (jev, model jev-latest); the verdict is not known without calling it
+otherwise the request would be forwarded to http://upstream:80/; a verdict of attack 0.87 or more, or ai_instruction 0.8 or more, would be blocked with 403
+if the backend fails, the request would be allowed by on_decision_error
+```
+
+The checks run in the order the server runs them, and the same code makes the
+decisions:
+
+1. The Host picks the site. An invalid Host is refused with 400, and a Host that
+   matches no site gets `default_status`.
+2. The access list, for the client address given by `--client`.
+3. `client_max_body_size`, for a body that is too large.
+4. `deny_path`, then block rules, then skip rules, then the static asset skip.
+
+In a shadow site, the report says what would have happened, and that the request
+would be forwarded. The limits (`limit_req` and `limit_conn`) depend on the requests
+that came before, so `test-request` lists the zones that would apply and does not
+count anything. The `realip` settings are not applied: the client address is the one
+given by `--client`, or `127.0.0.1`.
+
+The command exits 0 whenever the report is printed, whatever the verdict. A file that
+cannot be read, a request that is not valid HTTP/1.1, or an invalid configuration
+prints the reason to stderr and exits 1. `test-request` cannot be combined with `-t`,
+`-T`, `-s`, `start`, `stop` or `restart`.
 
 ## Signal the running router with -s
 
