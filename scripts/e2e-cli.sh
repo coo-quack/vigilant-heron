@@ -174,7 +174,7 @@ if match is None:
 config = match.group(1)
 replacements = [
     ("listen 127.0.0.1:8080;", "listen 127.0.0.1:%s;" % vh_port),
-    ("pid /tmp/vigilant-heron.pid;", "pid %s;" % pid),
+    ("pid vigilant-heron.pid;", "pid %s;" % pid),
     ("upstream http://127.0.0.1:3000;", "upstream http://127.0.0.1:%s;" % up_port),
     ("backend jev;", "backend jev;\n    url http://127.0.0.1:%s/v1/systemone;" % stub_port),
 ]

@@ -44,20 +44,18 @@ fn check_configuration(path: &Path) -> anyhow::Result<Config> {
         .map_err(|error| anyhow!("{error}\nconfiguration file {} test failed", path.display()))
 }
 
-/// Reads the pid of a live process named by the pid file. A missing, malformed or
-/// stale file gives `None`. A process owned by another user still counts as live.
+/// Reads the pid of a live process named by the pid file. A missing or stale file gives
+/// `None`. A process owned by another user still counts as live. A malformed file, or one
+/// that [`pidfile::read_pid`] does not trust, is an error, and nothing is signalled.
 fn live_pid(pid_file: &Path) -> anyhow::Result<Option<i32>> {
-    let text = match std::fs::read_to_string(pid_file) {
-        Ok(text) => text,
+    let raw = match pidfile::read_pid(pid_file) {
+        Ok(raw) => raw,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).with_context(|| format!("reading {}", pid_file.display())),
+        Err(error) => {
+            return Err(error).with_context(|| format!("the pid file {}", pid_file.display()));
+        }
     };
-    let Ok(raw) = text.trim().parse::<i32>() else {
-        return Ok(None);
-    };
-    let Some(pid) = Pid::from_raw(raw) else {
-        return Ok(None);
-    };
+    let pid = Pid::from_raw(raw).ok_or_else(|| anyhow!("invalid process id {raw}"))?;
     match test_kill_process(pid) {
         Ok(()) | Err(Errno::PERM) => Ok(Some(raw)),
         Err(Errno::SRCH) => Ok(None),

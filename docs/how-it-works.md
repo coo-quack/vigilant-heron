@@ -157,20 +157,23 @@ sent:
   model uses to judge a request, such as `host`, `user-agent`, `content-type`,
   `accept`, `referer`, `origin` and `x-forwarded-for`, are sent.
 - Form and JSON bodies are scanned for sensitive fields. A field is sensitive
-  when its name contains one of `password`, `passwd`, `pwd`, `secret`, `token`,
-  `apikey`, `card`, `cvv`, `ssn`, `passphrase`, `passcode`, `credential`,
-  `private_key` or `access_key` (case and `_`, `-`, `.` ignored), or when one of
-  its words is `pass`, `pin`, `otp`, `auth`, `session`, `cookie` or `jwt`. A word
-  is a run of letters and digits, split at other characters and at a lowercase to
-  uppercase change, so `author`, `shipping` and `passenger` are not sensitive. The
+  when its name contains one of these parts, matched anywhere in the name, with
+  case and `_`, `-`, `.` ignored: `password`, `passwd`, `secret`, `token`,
+  `apikey`, `passphrase`, `passcode`, `credential`, `private_key`, `access_key`,
+  `credit_card` and `card_number`. It is also sensitive when one of its words is
+  `pass`, `pin`, `otp`, `auth`, `session`, `cookie`, `jwt`, `pwd`, `card`, `cvv`,
+  `cvc` or `ssn`. Those short words match only as whole words. A word is a run of
+  letters and digits, split at other characters and at a lowercase to uppercase
+  change, so `card_id`, `userSSN` and `new_pwd` are sensitive, while `author`,
+  `shipping`, `passenger`, `class_name`, `business_name` and `postcard` are not. The
   value is replaced by `[REDACTED]`. A field named in `redact_field` is also
   replaced, when its name equals that name, case-insensitively. Text that is
   neither form data nor valid JSON is scanned for `key=value` pairs and
   `"key": value` pairs with the same rules.
-- The query string is scanned by the same name rule. A parameter whose decoded
-  name is sensitive, or is named in `redact_field`, has its value replaced by
-  `[REDACTED]`. The other parameters are sent exactly as the client sent them, in
-  the same order.
+- The query string is scanned by the same name rule. Both `&` and `;` separate
+  parameters. A parameter whose decoded name is sensitive, or is named in
+  `redact_field`, has its value replaced by `[REDACTED]`. The other parameters and
+  the separators are sent exactly as the client sent them, in the same order.
 - Only the first `inspect_body` bytes of the body are sent, cut on a UTF-8 boundary.
   `body_truncated` is set when the body was longer.
 

@@ -20,31 +20,36 @@ const DROPPED_HEADERS: [&str; 5] = [
     "x-auth-token",
 ];
 
-/// Parts that mark a field as sensitive when they occur anywhere in its name.
+/// Parts that mark a field as sensitive when they occur anywhere in its name. These are
+/// long enough that an ordinary name rarely contains one.
 ///
 /// The name is compared without its non-alphanumeric characters and in lowercase,
 /// so `api_key`, `API-KEY` and `apikey` all match `apikey`.
-const SENSITIVE_KEY_PARTS: [&str; 14] = [
+const SENSITIVE_KEY_PARTS: [&str; 12] = [
     "password",
     "passwd",
-    "pwd",
     "secret",
     "token",
     "apikey",
-    "card",
-    "cvv",
-    "ssn",
     "passphrase",
     "passcode",
     "credential",
     "privatekey",
     "accesskey",
+    "creditcard",
+    "cardnumber",
 ];
 
 /// Short words that mark a field as sensitive only when a whole word of its name
 /// is one of them. A substring match would redact `shipping` (`pin`), `author`
-/// (`auth`) and `passenger` (`pass`).
-const SENSITIVE_WORDS: [&str; 7] = ["pass", "pin", "otp", "auth", "session", "cookie", "jwt"];
+/// (`auth`), `passenger` (`pass`), `class_name` and `business_name` (`ssn`) and
+/// `discard` (`card`).
+///
+/// Words are split as described in [`key_words`]: `card_id`, `userSSN` and `new_pwd`
+/// are sensitive, `postcard` is not.
+const SENSITIVE_WORDS: [&str; 12] = [
+    "pass", "pin", "otp", "auth", "session", "cookie", "jwt", "pwd", "card", "cvv", "cvc", "ssn",
+];
 
 /// The JSON body posted to the decision backend.
 #[derive(Debug, Serialize)]
@@ -131,20 +136,40 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
 
 /// Redacts the values of sensitive parameters in a query string.
 ///
-/// A parameter is redacted by the same rule as a body field, applied to its decoded
-/// name. The other parameters are copied as they were sent, so their order and
-/// encoding are kept. A parameter without `=` has no value and is copied as it is.
+/// Both `&` and `;` separate parameters, because some upstreams split on `;` too. A
+/// parameter is redacted by the same rule as a body field, applied to its decoded
+/// name. The other parameters and the separators are copied as they were sent, so
+/// their order and encoding are kept. A parameter without `=` has no value and is
+/// copied as it is.
 fn redact_query(query: &str, redact_fields: &[String]) -> String {
-    query
-        .split('&')
-        .map(|parameter| match parameter.split_once('=') {
-            Some((name, _)) if is_redacted_key(&decode_name(name), redact_fields) => {
-                format!("{name}={REDACTED}")
-            }
-            _ => parameter.to_owned(),
-        })
-        .collect::<Vec<String>>()
-        .join("&")
+    let mut redacted = String::with_capacity(query.len());
+    let mut parameter = String::new();
+    for c in query.chars() {
+        if is_parameter_separator(c) {
+            redacted.push_str(&redact_parameter(&parameter, redact_fields));
+            redacted.push(c);
+            parameter.clear();
+        } else {
+            parameter.push(c);
+        }
+    }
+    redacted.push_str(&redact_parameter(&parameter, redact_fields));
+    redacted
+}
+
+/// Whether a character separates two query parameters.
+fn is_parameter_separator(c: char) -> bool {
+    c == '&' || c == ';'
+}
+
+/// Redacts the value of one query parameter when its name is sensitive.
+fn redact_parameter(parameter: &str, redact_fields: &[String]) -> String {
+    match parameter.split_once('=') {
+        Some((name, _)) if is_redacted_key(&decode_name(name), redact_fields) => {
+            format!("{name}={REDACTED}")
+        }
+        _ => parameter.to_owned(),
+    }
 }
 
 /// Decodes a parameter name the way form data does (`+` is a space, `%XX` is a byte).
@@ -179,7 +204,8 @@ pub(crate) fn sanitize_headers(headers: &HeaderMap, extra: &[String]) -> Vec<(St
 ///
 /// The name is sensitive when one of [`SENSITIVE_KEY_PARTS`] occurs in it, or when
 /// one of its words is one of [`SENSITIVE_WORDS`]. Words are split at every
-/// non-alphanumeric character and at a lowercase-to-uppercase change.
+/// non-alphanumeric character and at a lowercase-to-uppercase change. The parts are
+/// matched anywhere in the name, the words only as whole words.
 pub(crate) fn is_sensitive_key(key: &str) -> bool {
     let compact: String = key
         .chars()
@@ -579,6 +605,16 @@ mod tests {
     #[case::name_without_value("token&flag", "token&flag")]
     #[case::empty_value_is_redacted("api_key=", "api_key=[REDACTED]")]
     #[case::ordinary_names_are_kept("pinned_note=1&shipping=2", "pinned_note=1&shipping=2")]
+    #[case::semicolon_separates_parameters("password=x;id=1", "password=[REDACTED];id=1")]
+    #[case::semicolon_hides_no_payload(
+        "a=1;token=t&class_name=<p>",
+        "a=1;token=[REDACTED]&class_name=<p>"
+    )]
+    #[case::semicolon_keeps_ordinary_names(
+        "class_name=1;business_name=2",
+        "class_name=1;business_name=2"
+    )]
+    #[case::trailing_separators_are_kept("token=t;&", "token=[REDACTED];&")]
     fn sensitive_query_parameters_are_redacted(#[case] query: &str, #[case] expected: &str) {
         assert_eq!(redact_query(query, &[]), expected);
     }
@@ -646,6 +682,15 @@ mod tests {
     #[case::secret_key("secret_key")]
     #[case::jwt("jwt")]
     #[case::cookie("cookie")]
+    #[case::card_id_word("card_id")]
+    #[case::ssn_word("user_ssn")]
+    #[case::ssn_camel("userSSN")]
+    #[case::ssn_after_underscore("user_SSN")]
+    #[case::new_pwd("new_pwd")]
+    #[case::cvc("cvc")]
+    #[case::credit_card_part("credit_card")]
+    #[case::card_number_part("card_number_full")]
+    #[case::cvv_part("cvvCode")]
     fn sensitive_key_names_are_detected(#[case] key: &str) {
         assert!(is_sensitive_key(key));
     }
@@ -659,6 +704,14 @@ mod tests {
     #[case::passenger("passenger")]
     #[case::pinned("pinned_note")]
     #[case::footprint("footprint")]
+    #[case::class_name("class_name")]
+    #[case::business_name("business_name")]
+    #[case::process_name("process_name")]
+    #[case::address_number("address_number")]
+    #[case::classname("classname")]
+    #[case::discard("discard")]
+    #[case::postcard_size("postcard_size")]
+    #[case::postcard_camel("postcardSize")]
     fn ordinary_key_names_are_not_sensitive(#[case] key: &str) {
         assert!(!is_sensitive_key(key));
     }

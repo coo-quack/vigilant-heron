@@ -22,10 +22,12 @@ the request line, headers and up to `inspect_body_bytes` of the body to the
 configured decision backend. It drops `Cookie`, `Authorization`,
 `Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token`, any other header with a
 credential-like name (such as `X-Csrf-Token` or `X-Session-Id`) and any header
-listed in `redact_headers`. It replaces the values of password-, pass-, token-,
-card-, PIN-, OTP-, session- and credential-like form, JSON and query-string
-parameters, and of the fields named in `redact_field`, with `[REDACTED]` before
-sending. Multipart
+listed in `redact_headers`. It replaces the values of password-, token-,
+secret-, credential- and card-number-like form, JSON and query-string parameters,
+and of names with a whole word such as `pass`, `pin`, `otp`, `session`, `card`,
+`cvv` or `ssn`, and of the fields named in `redact_field`, with `[REDACTED]`
+before sending. Those short words match only as whole words, so `class_name`
+and `business_name` are sent. Multipart
 (`multipart/form-data`) bodies are only lexically redacted, so a sensitive field
 inside one can still reach the backend in some layouts. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the

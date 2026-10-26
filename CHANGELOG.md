@@ -13,7 +13,20 @@
 - The query string sent to the decision backend is redacted. A parameter whose
   decoded name is sensitive, by the same rule as body fields, or named in
   `redact_field`, has its value replaced by `[REDACTED]`. Other parameters are sent
-  as the client sent them.
+  as the client sent them. `;` separates parameters as `&` does, so
+  `password=x;id=1` hides the password and sends `id=1`.
+- Security (F2): short sensitive parts no longer match inside ordinary names.
+  `ssn`, `card`, `cvv` and `pwd` now match only as whole words, so `class_name`,
+  `business_name`, `process_name`, `address_number` and `discard` are sent to the
+  decision backend unredacted. `card_id`, `user_ssn`, `userSSN`, `cvv` and `new_pwd`
+  are still redacted. `creditcard` and `cardnumber` match as parts of a name.
+- Security (F1): the commands that signal the router (`-s`, `start`, `stop` and
+  `restart`) refuse a pid file in a directory that other users can write, such as
+  `/tmp`, when another user owns the file. A pid that is not a positive decimal
+  number, such as `0` or `-1`, is refused with an error. Before, `-1` could signal
+  every process of the user. The host guide now writes the pid file to a relative
+  path, `pid vigilant-heron.pid;`, which is resolved from the directory the command
+  runs in.
 - Headers with a credential-like name are no longer sent to the decision backend,
   for example `x-csrf-token`, `x-xsrf-token`, `x-amz-security-token`,
   `x-access-token` and `x-session-id`. `host`, `user-agent`, `accept`, `referer`,

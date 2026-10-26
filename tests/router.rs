@@ -446,6 +446,39 @@ async fn backend_receives_the_query_with_sensitive_parameters_redacted() -> Test
 }
 
 #[tokio::test]
+async fn backend_receives_ordinary_parameters_unredacted_and_a_semicolon_password_redacted()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    // class_name contains "ssn" and must stay visible to the model; the password after
+    // a semicolon must be redacted even though the upstream may split on ';'.
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/report?class_name=gadget-sale&password=hunter2;id=7",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    assert_eq!(
+        event["event"]["untrusted"]["query"],
+        "class_name=gadget-sale&password=[REDACTED];id=7"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn backend_meta_host_is_the_configured_site_name_not_the_client_host() -> TestResult {
     let upstream = Upstream::start().await?;
     let stub = StubDecider::start().await?;

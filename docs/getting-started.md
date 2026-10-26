@@ -25,7 +25,7 @@ Save this as `vigilant-heron.conf`. It listens on port 8080 and forwards request
 
 ```nginx
 listen 127.0.0.1:8080;              # the address the router listens on
-pid /tmp/vigilant-heron.pid;        # where the router writes its process id
+pid vigilant-heron.pid;             # where the router writes its process id
 
 decision {
     backend jev;                    # the decision model; it reads its key from TYPESAFE_API_KEY
@@ -37,6 +37,7 @@ site example.com {
 }
 ```
 
+- `pid` is a relative path, so it is resolved from the directory you run the command in. This guide runs every command from the directory that holds `vigilant-heron.conf`, so the pid file is written there.
 - `upstream` is your application. Here it is the test server from step 2.
 - `mode shadow` means the router forwards every request and only records what it would have blocked.
 
