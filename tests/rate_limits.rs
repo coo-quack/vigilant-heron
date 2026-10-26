@@ -595,3 +595,53 @@ async fn an_exhausted_req_zone_answers_with_the_configured_status() -> TestResul
     proxy.stop().await?;
     Ok(())
 }
+
+/// A request that a limit refuses is answered at once, without the delay that another
+/// limit of the same location would have added.
+#[tokio::test]
+async fn a_refused_request_is_answered_without_the_delay_of_another_limit() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path("refused-delay");
+    let _ = std::fs::remove_file(&log);
+    // `slow` delays the second request by one second; `strict` refuses it.
+    let top = "limit_req_zone $client_ip zone=slow:1m rate=1r/s;\nlimit_req_zone $client_ip zone=strict:1m rate=1r/m;";
+    let site = "location /wp-login.php {\n        limit_req zone=slow burst=1;\n        limit_req zone=strict burst=0;\n        limit_req_status 429;\n    }";
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        top,
+        site,
+    ))
+    .await?;
+
+    let first = send(
+        &proxy.base(),
+        Method::POST,
+        LOGIN,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(first.status, StatusCode::OK);
+
+    let started = std::time::Instant::now();
+    let refused = send(
+        &proxy.base(),
+        Method::POST,
+        LOGIN,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    let elapsed = started.elapsed();
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the refused request waited {elapsed:?}; the delay of one second must not apply"
+    );
+    proxy.stop().await
+}
