@@ -3,10 +3,11 @@
 
 mod common;
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::{StubBehavior, StubDecider, TestResult, send, start_proxy};
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::Full;
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -18,33 +19,50 @@ use tokio::net::{TcpListener, TcpStream};
 /// Starts an upstream that answers Upgrade requests with 101 and echoes the bytes after it.
 /// A request without Upgrade gets 200 with the body `plain`. Returns its address.
 async fn start_echo_upstream() -> Result<std::net::SocketAddr, common::BoxError> {
+    Ok(start_recording_upstream().await?.0)
+}
+
+/// The headers of each request that an upstream received, in arrival order.
+type Received = Arc<Mutex<Vec<HeaderMap>>>;
+
+/// Like [`start_echo_upstream`], and also keeps the headers of every request it receives.
+async fn start_recording_upstream() -> Result<(std::net::SocketAddr, Received), common::BoxError> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let seen: Received = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
+            let recorded = Arc::clone(&recorded);
             tokio::spawn(async move {
-                let service = service_fn(|mut request: Request<Incoming>| async move {
-                    if request.headers().contains_key(http::header::UPGRADE) {
-                        let on_upgrade = hyper::upgrade::on(&mut request);
-                        tokio::spawn(async move {
-                            if let Ok(upgraded) = on_upgrade.await {
-                                let (mut read, mut write) =
-                                    tokio::io::split(TokioIo::new(upgraded));
-                                let _ = tokio::io::copy(&mut read, &mut write).await;
-                            }
-                        });
-                        let response = Response::builder()
-                            .status(StatusCode::SWITCHING_PROTOCOLS)
-                            .header(http::header::UPGRADE, "websocket")
-                            .header(http::header::CONNECTION, "Upgrade")
-                            .body(Full::new(Bytes::new()))
-                            .unwrap_or_default();
-                        Ok::<_, std::convert::Infallible>(response)
-                    } else {
-                        Ok(Response::new(Full::new(Bytes::from_static(b"plain"))))
+                let service = service_fn(|mut request: Request<Incoming>| {
+                    let recorded = Arc::clone(&recorded);
+                    async move {
+                        if let Ok(mut seen) = recorded.lock() {
+                            seen.push(request.headers().clone());
+                        }
+                        if request.headers().contains_key(http::header::UPGRADE) {
+                            let on_upgrade = hyper::upgrade::on(&mut request);
+                            tokio::spawn(async move {
+                                if let Ok(upgraded) = on_upgrade.await {
+                                    let (mut read, mut write) =
+                                        tokio::io::split(TokioIo::new(upgraded));
+                                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                                }
+                            });
+                            let response = Response::builder()
+                                .status(StatusCode::SWITCHING_PROTOCOLS)
+                                .header(http::header::UPGRADE, "websocket")
+                                .header(http::header::CONNECTION, "Upgrade")
+                                .body(Full::new(Bytes::new()))
+                                .unwrap_or_default();
+                            Ok::<_, std::convert::Infallible>(response)
+                        } else {
+                            Ok(Response::new(Full::new(Bytes::from_static(b"plain"))))
+                        }
                     }
                 });
                 let _ = http1::Builder::new()
@@ -54,7 +72,7 @@ async fn start_echo_upstream() -> Result<std::net::SocketAddr, common::BoxError>
             });
         }
     });
-    Ok(addr)
+    Ok((addr, seen))
 }
 
 /// A configuration for one site with `site_lines`, and `top_lines` at the top level.
@@ -363,5 +381,77 @@ async fn a_tunnel_outlives_the_client_header_timeout() -> TestResult {
     tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut echoed)).await??;
     assert_eq!(echoed, sent, "an active tunnel must not receive a 408");
     drop(socket);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn upgrade_headers_reach_the_upstream_only_when_proxy_websocket_is_on() -> TestResult {
+    let (upstream, seen) = start_recording_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let on = start_proxy(&config(
+        &stub.decide_url(),
+        upstream,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+    let (socket, head) = handshake(on.addr, "/on").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    drop(socket);
+    on.stop().await?;
+
+    let off = start_proxy(&config(&stub.decide_url(), upstream, "", "")).await?;
+    let (plain, head) = handshake(off.addr, "/off").await?;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    drop(plain);
+    off.stop().await?;
+
+    let requests = seen.lock().map_err(|_| "upstream lock poisoned")?.clone();
+    let with = requests
+        .first()
+        .ok_or("the upstream got no request with proxy_websocket on")?;
+    assert_eq!(
+        with.get(http::header::UPGRADE)
+            .and_then(|v| v.to_str().ok()),
+        Some("websocket")
+    );
+    assert!(
+        with.get(http::header::CONNECTION)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.to_ascii_lowercase().contains("upgrade")),
+        "{with:?}"
+    );
+    let without = requests
+        .get(1)
+        .ok_or("the upstream got no request with proxy_websocket off")?;
+    assert!(
+        !without.contains_key(http::header::UPGRADE),
+        "the upgrade header was forwarded with proxy_websocket off: {without:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_websocket_in_a_location_tunnels_only_that_location() -> TestResult {
+    let upstream = start_echo_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream,
+        "",
+        "location /ws {\n        proxy_websocket on;\n    }",
+    ))
+    .await?;
+
+    let (mut socket, head) = handshake(proxy.addr, "/ws").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+    socket.write_all(b"ping").await?;
+    let mut echoed = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut echoed)).await??;
+    assert_eq!(&echoed, b"ping");
+    drop(socket);
+
+    let (_other, other_head) = handshake(proxy.addr, "/other").await?;
+    assert!(other_head.starts_with("HTTP/1.1 200"), "{other_head}");
     proxy.stop().await
 }

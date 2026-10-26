@@ -76,12 +76,13 @@ pub(crate) fn path_views(raw: &str) -> Vec<String> {
     views
 }
 
-/// Percent-decodes a raw request path once and removes dot segments. Case is kept.
+/// Percent-decodes a raw request path once, removes dot segments and NUL bytes. Case is kept.
 ///
-/// This is view 1 of [`path_views`]. The result is used only for matching. The
-/// request is forwarded with its raw path.
+/// This is the first view of [`path_views`], so `decoded_path(raw)` is always
+/// `path_views(raw)[0]`. The result is used only for matching. The request is
+/// forwarded with its raw path.
 pub(crate) fn decoded_path(raw: &str) -> String {
-    decoded_view(raw, false, false)
+    decoded_view(raw, false, false).replace('\0', "")
 }
 
 /// Views 1 to 4: decode once, read `\` as `/` when `backslash`, resolve dot segments, cut
@@ -154,11 +155,18 @@ fn remove_dot_segments(path: &str, strip: bool) -> String {
 
 /// Screens a request against the site's deny paths, rules and static assets.
 ///
+/// `lowered` are the lowercase path views of the request, see [`path_views`]. The caller
+/// computes them once and passes the same ones to the policy.
+///
 /// Block rules are checked before skip rules, so a skip rule never lets through
 /// a request that a block rule matches.
-pub(crate) fn screen(site: &SiteConfig, input: &RuleInput<'_>, body_is_empty: bool) -> Screening {
-    let lowered: Vec<String> = input.paths.iter().map(|path| path.to_lowercase()).collect();
-    if denied(site, &lowered) {
+pub(crate) fn screen(
+    site: &SiteConfig,
+    input: &RuleInput<'_>,
+    lowered: &[String],
+    body_is_empty: bool,
+) -> Screening {
+    if denied(site, lowered) {
         return Screening::Rule(None);
     }
     if let Some(rule) = first_match(&site.rules.block, input) {
@@ -169,7 +177,7 @@ pub(crate) fn screen(site: &SiteConfig, input: &RuleInput<'_>, body_is_empty: bo
         tracing::debug!(rule = %rule.id, description = %rule.description, "skip rule matched");
         return Screening::SkipRule(Arc::clone(&rule.id));
     }
-    if static_skip(site, input, &lowered, body_is_empty) {
+    if static_skip(site, input, lowered, body_is_empty) {
         return Screening::Skip;
     }
     Screening::Inspect
@@ -193,10 +201,9 @@ pub(crate) fn denied_by<'a>(site: &'a SiteConfig, views: &[String]) -> Option<&'
 
 /// Returns true when a `fail_closed_path` entry is a prefix of any view. Views must be lowercase.
 pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
-    site.fail_closed_paths.iter().any(|prefix| {
-        let prefix = prefix.to_lowercase();
-        views.iter().any(|view| view.starts_with(prefix.as_str()))
-    })
+    site.fail_closed_lowered
+        .iter()
+        .any(|prefix| views.iter().any(|view| view.starts_with(prefix.as_str())))
 }
 
 /// Returns true when a plain read of a static asset may skip the backend.
@@ -282,7 +289,7 @@ mod tests {
         let query = has_query.then_some("x=1");
         let client = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         let input = RuleInput::new(method, raw_path, query, &headers, &[], client);
-        screen(site, &input, body_is_empty)
+        screen(site, &input, &lower_views(raw_path), body_is_empty)
     }
 
     /// The lowercase views of a raw path, as the pipeline passes them to the checks.
@@ -325,6 +332,11 @@ mod tests {
     #[test]
     fn percent_decoding_happens_only_once() {
         assert_eq!(decoded_path("/%2578"), "/%78");
+    }
+
+    #[test]
+    fn nul_bytes_are_removed_from_the_decoded_path() {
+        assert_eq!(decoded_path("/%00admin"), "/admin");
     }
 
     #[rstest]
@@ -410,6 +422,22 @@ mod tests {
             prop_assert!(!normalized.contains("//"));
             prop_assert!(!normalized.contains("/./"));
             prop_assert!(!normalized.contains("/../"));
+        }
+
+        #[test]
+        fn decoded_path_is_the_first_path_view(raw in any::<String>()) {
+            let views = path_views(&raw);
+            let decoded = decoded_path(&raw);
+            prop_assert_eq!(views.first(), Some(&decoded));
+        }
+
+        #[test]
+        fn decoded_path_is_the_first_path_view_for_escape_heavy_input(
+            raw in r"[a-zA-Z0-9/.%;\\]{0,40}|(%00|%2e|%2f|%3b|%5c|/|\.|;|\\){0,12}"
+        ) {
+            let views = path_views(&raw);
+            let decoded = decoded_path(&raw);
+            prop_assert_eq!(views.first(), Some(&decoded));
         }
     }
 

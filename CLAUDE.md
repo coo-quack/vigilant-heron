@@ -46,6 +46,7 @@ src/
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
   limits.rs      # limit_req / limit_conn zones, leaky bucket, connection counts, location selection; runs first
   rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
+  rules/tests.rs # Unit tests of the rule parser, built-in signatures, normalization and matching
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
@@ -66,6 +67,7 @@ tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
   jev.rs         # In-process tests of the Jev backend against a fake endpoint
+  strands.rs     # In-process tests of the Strands Decider backend against a stub of its System One endpoint
   failures.rs    # Failure settings, rule-first guarantee, queued requests with one slot
   limits.rs      # Timers, header limits, body limit and upstream timeouts, with short timers
   logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off

@@ -20,6 +20,14 @@
 - Fixed: `docker build -t vigilant-heron .` without `--target` built the e2e stub
   decision backend instead of the router. The router is now the Dockerfile's last
   stage.
+- Fixed: a request path with a NUL byte could select a different `location` for
+  the block response, the headers and the WebSocket tunnel than for the limits,
+  because the decoded path kept the NUL byte and the other readings did not. NUL
+  bytes are now removed from every reading, so `/%00admin` selects the same
+  location everywhere.
+- Fixed: the `suggest-skip-rules` report now says that a learned rule forwards
+  matching requests without the model, so the model no longer judges their
+  headers or body. Block rules, built-in and your own, still run first.
 
 ## v0.1.0 (2026-10-26)
 

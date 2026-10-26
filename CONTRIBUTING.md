@@ -184,14 +184,11 @@ both platforms, checks the binaries, and pushes, tags and releases nothing.
 
 ## Repository Rules
 
-While the repository is private on the GitHub Free plan, branch protection,
-rulesets and auto-merge are not available. So CI must be checked by hand: every
-PR is merged only after all its checks are green, and no PR is merged with a
-failing or missing check.
-
-The job names in the CI workflow (`audit`, `lint`, `fmt`, `test`, `e2e`,
-`deadcode`) stay registered in coo-quack/iac, so they keep working when the
-repository goes public and rulesets can require them.
+Branch protection on `develop` and `main` is managed in coo-quack/iac. It
+requires these CI jobs to pass before a PR can be merged: `audit`, `lint`, `fmt`,
+`test`, `e2e`, `deadcode`, `duplication`, `bench` and `release-build`. Rulesets
+add reviews: a change to a path listed in `.github/CODEOWNERS` needs its owner's
+approval on both branches, and a PR to `main` needs one approving review.
 
 ## Pull Requests
 

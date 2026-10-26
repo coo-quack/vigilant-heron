@@ -958,6 +958,51 @@ fn start_replaces_a_stale_pid_file() -> Result<(), std::io::Error> {
 }
 
 #[test]
+fn a_pid_file_that_cannot_be_locked_is_warned_about_and_the_router_still_serves()
+-> Result<(), std::io::Error> {
+    let fixture = Fixture::new("pid-unlockable")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    let log = fixture.dir.join("error.log");
+    // The directory of the pid file does not exist, so the lock file cannot be created.
+    let pid = fixture.dir.join("missing").join("router.pid");
+    fixture.write(&router_config(
+        port,
+        &pid,
+        upstream.port,
+        &format!("default_status 421;\nerror_log {} info;", log.display()),
+    ))?;
+    let _router = Child(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&fixture.conf)
+            .env_remove("VIGILANT_HERON_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    assert!(
+        wait_for(port, "unknown.test", "/", 421).is_some(),
+        "the router did not serve with an unlockable pid file"
+    );
+    // The error log is written by its own task, so the line may come a moment after the answer.
+    let deadline = Instant::now() + READY;
+    loop {
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        if logged.contains("cannot lock the pid file") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "no warning in the error log: {logged}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[test]
 fn start_warns_when_error_log_goes_to_stderr() -> Result<(), std::io::Error> {
     let fixture = Fixture::new("start-warns")?;
     fixture.write(&router_config(

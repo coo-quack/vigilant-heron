@@ -196,3 +196,25 @@ fn sigusr1_reopens_the_error_log_after_it_was_moved() -> TestResult {
     assert!(!read(&moved).contains("configuration reload failed"));
     Ok(())
 }
+
+#[test]
+fn a_reload_that_changes_a_restart_setting_warns_that_it_needs_a_restart() -> TestResult {
+    let dir = test_dir("restart-warning")?;
+    let log = dir.join("error.log");
+    let with_limit = |limit: u32| {
+        format!(
+            "max_connections {limit};\n{}",
+            config(&format!("{} info", log.display()))
+        )
+    };
+    let server = Server::start(&dir, &with_limit(10))?;
+    wait_for(&log, "vigilant-heron is listening")?;
+
+    server.write_config(&with_limit(20))?;
+    server.reload()?;
+    wait_for(
+        &log,
+        "max_connections changed; a restart is needed for it to take effect",
+    )?;
+    Ok(())
+}

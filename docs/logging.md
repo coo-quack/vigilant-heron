@@ -92,13 +92,17 @@ written as `$name` or `${name}`.
 | `$http_<name>` | A request header, with `_` for `-` |
 
 The `$reason` values are `model`, `below_threshold`, `rule`, `skip`, `skip_rule`,
-`access_denied`, `invalid_host`, `fail_closed_path`, `rate_limited_allowed`,
-`rate_limited_blocked`, `decision_error_allowed`, `decision_error_blocked`, and the
+`access_denied`, `invalid_host`, `unknown_host`, `fail_closed_path`,
+`rate_limited_allowed`, `rate_limited_blocked`, `client_busy_allowed`,
+`client_busy_blocked`, `decision_error_allowed`, `decision_error_blocked`, and the
 limit and timer reasons such as `limit_req`, `limit_conn`, `header_timeout`,
-`body_timeout`, `body_too_large`, `unreadable_body` and `uri_too_long`.
+`header_too_large`, `body_timeout`, `body_too_large`, `unreadable_body` and
+`uri_too_long`.
 
-The `$decision_error` values are `rate_limited`, `backend_busy`, `timeout`,
-`http_status` and `parse`.
+The `$decision_error` values are `rate_limited`, `backend_busy`, `client_busy`,
+`timeout`, `connection`, `http_status`, `body`, `parse`, `request`, `invalid_score`,
+`rejected` and `invalid_response`. [How it works](/how-it-works#failure-behavior)
+says what each one means.
 
 `$http_<name>` cannot name a credential. `cookie`, `authorization`,
 `proxy-authorization`, `x-api-key`, `x-auth-token` and every name in

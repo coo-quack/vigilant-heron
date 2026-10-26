@@ -653,6 +653,8 @@ async fn pipeline(
     let matched = index.and_then(|index| state.sites.get(index));
     let decoded = prefilter::decoded_path(parts.uri.path());
     let views = prefilter::path_views(parts.uri.path());
+    // The lowercase views are computed once, for the screening and the policy.
+    let lowered: Vec<String> = views.iter().map(|view| view.to_lowercase()).collect();
     // The location of the decoded path sets the block response, the headers and the tunnel.
     let location = matched.and_then(|site| limits::select_location(&site.locations, &decoded));
     // Every location that any reading of the path selects is limited.
@@ -802,7 +804,7 @@ async fn pipeline(
             sniffed.prefix.as_ref(),
             trace.client_addr,
         );
-        let screening = prefilter::screen(site, &input, sniffed.is_empty_body());
+        let screening = prefilter::screen(site, &input, &lowered, sniffed.is_empty_body());
         let rule_id = match &screening {
             Screening::Rule(id) => id.clone(),
             Screening::SkipRule(id) => Some(Arc::clone(id)),
@@ -820,7 +822,6 @@ async fn pipeline(
         .await;
         (assessment, rule_id)
     };
-    let lowered: Vec<String> = views.iter().map(|view| view.to_lowercase()).collect();
     let mut decision = policy::decide(site, &lowered, &assessment);
     if decision.would_have.is_none() {
         decision.would_have = screened.would_have.map(Action::Reject);

@@ -846,7 +846,11 @@ fn screen_request(
     }
     let client = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
     let input = RuleInput::new(&method, path, query, &map, body, client);
-    prefilter::screen(site, &input, body.is_empty())
+    let lowered: Vec<String> = prefilter::path_views(path)
+        .iter()
+        .map(|view| view.to_lowercase())
+        .collect();
+    prefilter::screen(site, &input, &lowered, body.is_empty())
 }
 
 const USER_RULES: &str = "\
