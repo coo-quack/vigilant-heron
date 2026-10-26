@@ -408,15 +408,21 @@ pub(crate) fn upstream_headers(
     headers
 }
 
-/// The `Upgrade` value of a request that asks to switch protocols: its `Connection`
-/// header lists `upgrade` and it has a non-empty `Upgrade` header.
-pub(crate) fn upgrade_request(headers: &HeaderMap) -> Option<HeaderValue> {
-    let asks = headers
+/// The trimmed, comma-separated tokens of every `Connection` header, in the order received.
+/// A header that is not valid text contributes nothing.
+fn connection_tokens(headers: &HeaderMap) -> impl Iterator<Item = &str> {
+    headers
         .get_all(CONNECTION)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
-        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+        .map(str::trim)
+}
+
+/// The `Upgrade` value of a request that asks to switch protocols: its `Connection`
+/// header lists `upgrade` and it has a non-empty `Upgrade` header.
+pub(crate) fn upgrade_request(headers: &HeaderMap) -> Option<HeaderValue> {
+    let asks = connection_tokens(headers).any(|token| token.eq_ignore_ascii_case("upgrade"));
     if !asks {
         return None;
     }
@@ -445,12 +451,8 @@ pub(crate) fn forwarded_headers(original: &HeaderMap, peer: IpAddr) -> HeaderMap
 
 /// Removes hop-by-hop headers, including those named in `Connection`.
 pub(crate) fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    let listed: Vec<String> = headers
-        .get_all(CONNECTION)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(|token| token.trim().to_ascii_lowercase())
+    let listed: Vec<String> = connection_tokens(headers)
+        .map(str::to_ascii_lowercase)
         .filter(|token| !token.is_empty())
         .collect();
     let removed: Vec<HeaderName> = headers

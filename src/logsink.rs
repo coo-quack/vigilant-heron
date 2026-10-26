@@ -123,9 +123,8 @@ enum Output {
         socket: UdpSocket,
         tag: String,
     },
-    Unavailable {
-        destination: Destination,
-    },
+    /// A syslog destination whose server could not be reached when it was opened.
+    Unavailable,
 }
 
 impl Output {
@@ -142,9 +141,7 @@ impl Output {
                     socket,
                     tag: tag.clone(),
                 },
-                None => Self::Unavailable {
-                    destination: destination.clone(),
-                },
+                None => Self::Unavailable,
             },
         }
     }
@@ -187,12 +184,11 @@ impl Output {
                     tracing::error!(destination = label, %error, "cannot send access log line to syslog");
                 }
             }
-            Self::Unavailable { destination } => {
+            Self::Unavailable => {
                 tracing::error!(
                     destination = label,
                     "syslog server unavailable; line dropped"
                 );
-                let _ = destination;
             }
         }
     }

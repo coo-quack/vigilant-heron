@@ -235,27 +235,27 @@ impl LimitOverrides {
             }
             "limit_req_status" => {
                 once(seen, directive)?;
-                self.req_status = Some(parse_status(directive, "limit_req_status")?);
+                self.req_status = Some(parse_status(directive)?);
             }
             "limit_conn_status" => {
                 once(seen, directive)?;
-                self.conn_status = Some(parse_status(directive, "limit_conn_status")?);
+                self.conn_status = Some(parse_status(directive)?);
             }
             "limit_req_dry_run" => {
                 once(seen, directive)?;
-                self.req_dry_run = Some(parse_on_off(directive, "limit_req_dry_run")?);
+                self.req_dry_run = Some(parse_on_off(directive)?);
             }
             "limit_conn_dry_run" => {
                 once(seen, directive)?;
-                self.conn_dry_run = Some(parse_on_off(directive, "limit_conn_dry_run")?);
+                self.conn_dry_run = Some(parse_on_off(directive)?);
             }
             "limit_req_log_level" => {
                 once(seen, directive)?;
-                self.req_log = Some(parse_log_level(directive, "limit_req_log_level")?);
+                self.req_log = Some(parse_log_level(directive)?);
             }
             "limit_conn_log_level" => {
                 once(seen, directive)?;
-                self.conn_log = Some(parse_log_level(directive, "limit_conn_log_level")?);
+                self.conn_log = Some(parse_log_level(directive)?);
             }
             other => {
                 return Err(invalid(
@@ -286,7 +286,7 @@ impl LimitOverrides {
     }
 }
 
-fn parse_status(directive: &Directive, name: &str) -> Result<StatusCode, ConfigError> {
+fn parse_status(directive: &Directive) -> Result<StatusCode, ConfigError> {
     let text = one_arg(directive)?;
     let code = text.parse::<u16>().ok().and_then(|code| {
         StatusCode::from_u16(code)
@@ -296,28 +296,34 @@ fn parse_status(directive: &Directive, name: &str) -> Result<StatusCode, ConfigE
     code.ok_or_else(|| {
         invalid(
             directive,
-            format!("\"{name}\" must be a 4xx or 5xx code, got {text}"),
+            format!(
+                "\"{}\" must be a 4xx or 5xx code, got {text}",
+                directive.name
+            ),
         )
     })
 }
 
-fn parse_on_off(directive: &Directive, name: &str) -> Result<bool, ConfigError> {
+fn parse_on_off(directive: &Directive) -> Result<bool, ConfigError> {
     match one_arg(directive)? {
         "on" => Ok(true),
         "off" => Ok(false),
         other => Err(invalid(
             directive,
-            format!("\"{name}\" must be on or off, got {other}"),
+            format!("\"{}\" must be on or off, got {other}", directive.name),
         )),
     }
 }
 
-fn parse_log_level(directive: &Directive, name: &str) -> Result<LimitLog, ConfigError> {
+fn parse_log_level(directive: &Directive) -> Result<LimitLog, ConfigError> {
     let text = one_arg(directive)?;
     LimitLog::parse(text).ok_or_else(|| {
         invalid(
             directive,
-            format!("\"{name}\" must be info, notice, warn or error, got {text}"),
+            format!(
+                "\"{}\" must be info, notice, warn or error, got {text}",
+                directive.name
+            ),
         )
     })
 }

@@ -41,9 +41,7 @@ use crate::config::{
     AccessLogConfig, BackendConfig, Config, ConnectionConfig, MAX_REQUEST_ID_BYTES, Mode,
     SiteConfig,
 };
-use crate::decision::{
-    Backend, ClientSlots, DecisionBackend, HttpDecisionBackend, Limits, decision_client,
-};
+use crate::decision::{Backend, ClientSlots, HttpDecisionBackend, Limits, decision_client};
 use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
@@ -76,7 +74,7 @@ struct Sink {
 }
 
 /// Shared state for every connection.
-pub(crate) struct AppState<B> {
+pub(crate) struct AppState {
     router: Router,
     /// The top-level access list, used for requests that match no site.
     access: Vec<AccessEntry>,
@@ -94,7 +92,7 @@ pub(crate) struct AppState<B> {
     slots_limit: usize,
     /// Decision calls in flight per client address (`max_concurrency_per_client`).
     client_slots: Arc<ClientSlots>,
-    backend: B,
+    backend: Backend,
     default_status: StatusCode,
     realip: RealIp,
     request_id_header: Option<HeaderName>,
@@ -108,7 +106,7 @@ pub(crate) struct AppState<B> {
     top_limits: LimitSet,
 }
 
-impl AppState<Backend> {
+impl AppState {
     /// Builds the state of `config`. A reload (`previous` is the state it replaces)
     /// keeps the decision slots while `max_concurrency` is unchanged, and the
     /// per-client table while `max_concurrency_per_client` is unchanged, so calls
@@ -218,7 +216,7 @@ impl AppState<Backend> {
 /// slots of each limit whose value is unchanged, so calls in flight still count.
 fn decision_slots(
     config: &Config,
-    previous: Option<&AppState<Backend>>,
+    previous: Option<&AppState>,
 ) -> (Arc<Semaphore>, Arc<ClientSlots>) {
     let slots = match previous {
         Some(old) if old.slots_limit == config.decision.max_concurrency => Arc::clone(&old.slots),
@@ -458,7 +456,7 @@ fn reload(
     load: &dyn Fn() -> Result<Config, ConfigError>,
     applied: &dyn Fn(&Config),
     startup: &Startup,
-    current: &watch::Sender<Arc<AppState<Backend>>>,
+    current: &watch::Sender<Arc<AppState>>,
 ) {
     let config = match load() {
         Ok(config) => config,
@@ -491,7 +489,7 @@ struct Connection {
 }
 
 async fn serve_connection(
-    current: watch::Receiver<Arc<AppState<Backend>>>,
+    current: watch::Receiver<Arc<AppState>>,
     settings: ConnectionSettings,
     stream: TcpStream,
     peer: SocketAddr,
@@ -580,8 +578,8 @@ struct Trace<'a> {
 ///
 /// An error ends the connection without a response. It is returned for a block
 /// with `block_status 444`, after the request has been logged.
-async fn handle<B: DecisionBackend>(
-    state: &AppState<B>,
+async fn handle(
+    state: &AppState,
     connection: &Connection,
     peer: SocketAddr,
     mut request: Request<Incoming>,
@@ -641,8 +639,8 @@ async fn handle<B: DecisionBackend>(
     clippy::too_many_lines,
     reason = "the per-request pipeline reads top to bottom; splitting it would scatter the rule-first order"
 )]
-async fn pipeline<B: DecisionBackend>(
-    state: &AppState<B>,
+async fn pipeline(
+    state: &AppState,
     parts: &Parts,
     body: Incoming,
     done: &Arc<AtomicBool>,
@@ -795,9 +793,10 @@ async fn pipeline<B: DecisionBackend>(
     let (assessment, rule_id) = if access_denied {
         (Assessment::AccessDenied, None)
     } else {
-        let input = RuleInput::new(
+        let input = RuleInput::with_views(
             &parts.method,
             raw_path,
+            &views,
             parts.uri.query(),
             &parts.headers,
             sniffed.prefix.as_ref(),
@@ -875,11 +874,7 @@ async fn pipeline<B: DecisionBackend>(
         client_ip: trace.client_ip,
         remote_addr: trace.remote_addr,
         site: site_name(site),
-        host: parts
-            .headers
-            .get(HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
+        host: raw_host(parts),
         method: parts.method.as_str(),
         path: raw_path,
         query: parts.uri.query(),
@@ -1133,8 +1128,8 @@ fn body_failure(
     }
 }
 
-async fn assess<B: DecisionBackend>(
-    state: &AppState<B>,
+async fn assess(
+    state: &AppState,
     parts: &Parts,
     sniffed: &Sniffed,
     client_ip: &str,
@@ -1190,7 +1185,7 @@ async fn assess<B: DecisionBackend>(
 /// Every line of the realip header is read, in the order received, and joined with
 /// commas, so a trusted proxy that appends its own line is seen after the client's
 /// lines. A line that is not valid text makes the whole header untrusted.
-fn client_addr<B>(state: &AppState<B>, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
+fn client_addr(state: &AppState, headers: &HeaderMap, peer: SocketAddr) -> IpAddr {
     let lines: Option<Vec<&str>> = headers
         .get_all(&state.realip.header)
         .iter()
@@ -1211,7 +1206,7 @@ fn host_name(parts: &Parts) -> String {
 }
 
 /// Reads the configured request-id header, lossily decoded and cut to 128 bytes.
-fn request_id<B>(state: &AppState<B>, headers: &HeaderMap) -> Option<String> {
+fn request_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
     let name = state.request_id_header.as_ref()?;
     let value = String::from_utf8_lossy(headers.get(name)?.as_bytes()).into_owned();
     let (value, _cut) = truncate_utf8(value, MAX_REQUEST_ID_BYTES);
@@ -1270,73 +1265,22 @@ fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
     fields
 }
 
-/// Answers a request that never reached a decision, and logs it as a rejection.
-///
-/// `closing` adds `Connection: close`, for a request whose body was not read in full.
-fn reject(
-    parts: &Parts,
-    trace: &Trace<'_>,
-    site: &str,
-    status: StatusCode,
-    reason: &str,
-    sinks: &[Sink],
-    closing: bool,
-) -> Response<ResponseBody> {
-    let record = AccessRecord {
-        time: SystemTime::now(),
-        request_id: trace.request_id,
-        client_ip: trace.client_ip,
-        remote_addr: trace.remote_addr,
-        site,
-        host: parts
-            .headers
-            .get(HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or(""),
-        method: parts.method.as_str(),
-        path: parts.uri.path(),
-        query: parts.uri.query(),
-        status: status.as_u16(),
-        action: "reject",
-        reason,
-        rule_id: "",
-        would_have: None,
-        attack: None,
-        ai_instruction: None,
-        category: None,
-        decision_error: None,
-        retry_after: None,
-        input_tokens: None,
-        upstream_status: None,
-        upstream_error: None,
-        latency_ms: latency(trace.started),
-        limit_req_status: *lock(&trace.limit_req),
-        limit_conn_status: *lock(&trace.limit_conn),
-    };
-    write_access(sinks, &record, &parts.headers);
-    let mut response = status_response(status, "");
-    if closing {
-        close(&mut response);
-    }
-    response
-}
-
-/// Logs a response the transport sent on its own, such as a 408 or a 414.
-fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, started: Instant) {
-    let remote = peer.ip().to_string();
-    let record = AccessRecord {
+/// The record of a request answered before a decision. Only the status, the reason and
+/// the latency are set; a caller fills in the request fields with struct update syntax.
+fn rejection_record(status: u16, reason: &str, started: Instant) -> AccessRecord<'_> {
+    AccessRecord {
         time: SystemTime::now(),
         request_id: None,
-        client_ip: &remote,
-        remote_addr: &remote,
+        client_ip: "",
+        remote_addr: "",
         site: "",
         host: "",
         method: "",
         path: "",
         query: None,
-        status: rejection.status,
+        status,
         action: "reject",
-        reason: rejection.reason,
+        reason,
         rule_id: "",
         would_have: None,
         attack: None,
@@ -1350,6 +1294,58 @@ fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, start
         latency_ms: latency(started),
         limit_req_status: None,
         limit_conn_status: None,
+    }
+}
+
+/// The `Host` header as sent, or an empty string when it is missing or not text.
+fn raw_host(parts: &Parts) -> &str {
+    parts
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+}
+
+/// Answers a request that never reached a decision, and logs it as a rejection.
+///
+/// `closing` adds `Connection: close`, for a request whose body was not read in full.
+fn reject(
+    parts: &Parts,
+    trace: &Trace<'_>,
+    site: &str,
+    status: StatusCode,
+    reason: &str,
+    sinks: &[Sink],
+    closing: bool,
+) -> Response<ResponseBody> {
+    let record = AccessRecord {
+        request_id: trace.request_id,
+        client_ip: trace.client_ip,
+        remote_addr: trace.remote_addr,
+        site,
+        host: raw_host(parts),
+        method: parts.method.as_str(),
+        path: parts.uri.path(),
+        query: parts.uri.query(),
+        limit_req_status: *lock(&trace.limit_req),
+        limit_conn_status: *lock(&trace.limit_conn),
+        ..rejection_record(status.as_u16(), reason, trace.started)
+    };
+    write_access(sinks, &record, &parts.headers);
+    let mut response = status_response(status, "");
+    if closing {
+        close(&mut response);
+    }
+    response
+}
+
+/// Logs a response the transport sent on its own, such as a 408 or a 414.
+fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, started: Instant) {
+    let remote = peer.ip().to_string();
+    let record = AccessRecord {
+        client_ip: &remote,
+        remote_addr: &remote,
+        ..rejection_record(rejection.status, rejection.reason, started)
     };
     write_access(sinks, &record, &HeaderMap::new());
 }

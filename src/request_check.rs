@@ -227,6 +227,10 @@ fn status_of(block: &BlockResponse) -> u16 {
 }
 
 /// Builds the check. The order of the checks follows `server::pipeline`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the checks read top to bottom in the order of server::pipeline; splitting them would scatter that order"
+)]
 fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCheck {
     let mut lines = Vec::new();
     let router = Router::new(&config.sites);
@@ -329,9 +333,10 @@ fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCh
     // The inspected prefix of the body, as the server sniffs it.
     let inspected = config.decision.inspect_body_bytes.min(request.body.len());
     let prefix = request.body.get(..inspected).unwrap_or_default();
-    let input = RuleInput::new(
+    let input = RuleInput::with_views(
         &request.method,
         path,
+        &views,
         request.uri.query(),
         &request.headers,
         prefix,
