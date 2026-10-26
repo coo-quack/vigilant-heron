@@ -25,6 +25,7 @@ Shadow mode records what it would have done without blocking.
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
 - `pnpm run dup` — duplicated code in src/ (jscpd)
+- `cargo bench --locked --bench hot_path` — benchmarks (the `bench` job runs them once with `-- --test`)
 
 ## Project Structure
 
@@ -59,6 +60,8 @@ src/
   server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
   error.rs       # Error types
   test_support.rs # Builds sites and configurations for the unit tests
+benches/
+  hot_path.rs    # Criterion benchmarks of the hot path through the public API (check_request, suggest_skip_rules, config loading)
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
@@ -108,7 +111,7 @@ Top-level and documentation files:
 
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
