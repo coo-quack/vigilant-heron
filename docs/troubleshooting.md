@@ -99,6 +99,8 @@ See [Installation](/install#putting-it-behind-nginx-or-cloudflare) for the full 
 pid /tmp/vigilant-heron.pid;
 ```
 
+The commands also refuse a pid file that another user owns inside a shared directory such as `/tmp`, so put the pid file in a directory that only the router's user can write.
+
 ## Still stuck?
 
 [Open an issue](https://github.com/coo-quack/vigilant-heron/issues) on GitHub. Include the output of `vigilant-heron -t`, the version from `vigilant-heron --version`, and the access log lines for the request, with any keys or tokens removed.

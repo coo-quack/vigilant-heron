@@ -169,7 +169,8 @@ router to finish the work the signal asks for.
 | Message | Cause |
 |---|---|
 | `cannot read the pid file <path>` | The router is not running with this configuration, or it has exited without removing the file. |
-| `does not hold a process id` | The file was edited by hand or is damaged. |
+| `does not hold a process id` | The file was edited by hand or is damaged. A positive decimal process id is required. |
+| `is not trusted` | The file sits in a shared directory such as `/tmp` and another user owns it, so its contents are ignored. Put the pid file in a directory that only the router's user can write. |
 | `no process <n> is running: the pid file <path> is stale` | The router has stopped, or the file was left by a crash. Delete the file. |
 
 Each of these exits 1.

@@ -58,7 +58,7 @@ file. The write replaces any file already there, through a temporary file in the
 same directory. If the file cannot be written, the router logs a warning and keeps
 running, and `-s` then reports the missing file. Read at startup only: a reload
 does not move the file. The `-s` command reads the same path from the file it is
-given, so change it in the file before restarting.
+given, so change it in the file before restarting. Put the pid file in a directory that only the router's user can write: the commands refuse a pid file that another user owns inside a shared directory such as `/tmp`.
 
 The default directory must be writable by the user that runs the router. The
 Docker image runs as `nonroot`, which cannot write to `/run`, so set a path in
@@ -558,7 +558,7 @@ Extra header names removed before the event is sent to the backend. Repeatable. 
 ### `redact_field`
 
 - **Syntax:** `redact_field <name> ...;`
-- **Default:** none. Field names with password-, token-, card-like or other sensitive words are redacted already (see [How it works](/how-it-works)).
+- **Default:** none. Field names with password-, token-, card-number-like or other sensitive parts and words are redacted already (see [How it works](/how-it-works)).
 - **Context:** decision.
 
 Extra form, JSON and query-string field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. Repeatable.

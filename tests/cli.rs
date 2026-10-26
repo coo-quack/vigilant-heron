@@ -500,6 +500,23 @@ fn signal_with_a_pid_file_that_is_not_a_number_fails_with_exit_one() -> Result<(
 }
 
 #[test]
+fn signal_with_a_pid_file_holding_minus_one_fails_and_signals_nothing() -> Result<(), std::io::Error>
+{
+    // -1 would mean every process the user may signal, so nothing may be sent.
+    let fixture = Fixture::new("signal-minus-one")?;
+    fixture.write(&router_config(1, &fixture.pid, 9, ""))?;
+    std::fs::write(&fixture.pid, "-1\n")?;
+    let output = fixture.signal("reload")?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("does not hold a process id"),
+        "{}",
+        text(&output)
+    );
+    Ok(())
+}
+
+#[test]
 fn signal_with_a_stale_pid_file_fails_with_exit_one() -> Result<(), std::io::Error> {
     let fixture = Fixture::new("signal-stale")?;
     fixture.write(&router_config(1, &fixture.pid, 9, ""))?;

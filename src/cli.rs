@@ -4,11 +4,14 @@
 //! `rustix`, which is already in the dependency tree and makes the call without
 //! `unsafe` code and without running a `kill` binary, which the distroless image lacks.
 
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow, bail};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
+
+use crate::pidfile;
 
 /// What `-s` asks the running router to do, as nginx's `-s` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,24 +203,19 @@ pub(crate) fn send_signal(
     let pid_path = vigilant_heron::process_settings(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?
         .pid_file;
-    let text = std::fs::read_to_string(&pid_path).with_context(|| {
-        format!(
-            "cannot read the pid file {}; is the router running with this configuration?",
-            pid_path.display()
-        )
+    // The file is checked by `pidfile::read_pid`, which refuses one that another user
+    // owns in a shared directory, so the signal never goes to a pid it did not trust.
+    let raw = pidfile::read_pid(&pid_path).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            anyhow!(
+                "cannot read the pid file {}; is the router running with this configuration?",
+                pid_path.display()
+            )
+        } else {
+            anyhow!("the pid file {}: {error}", pid_path.display())
+        }
     })?;
-    let raw: i32 = text.trim().parse().with_context(|| {
-        format!(
-            "the pid file {} does not hold a process id",
-            pid_path.display()
-        )
-    })?;
-    let pid = Pid::from_raw(raw).ok_or_else(|| {
-        anyhow!(
-            "the pid file {} holds an invalid process id {raw}",
-            pid_path.display()
-        )
-    })?;
+    let pid = Pid::from_raw(raw).ok_or_else(|| anyhow!("invalid process id {raw}"))?;
     match kill_process(pid, command.signal()) {
         Ok(()) => Ok(()),
         Err(Errno::SRCH) => bail!(
