@@ -18,13 +18,15 @@ cargo fmt --all                                            # Format
 cargo fmt --all -- --check                                 # fmt job
 cargo clippy --workspace --all-targets --locked -- -D warnings  # lint job
 RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked  # lint job
-cargo test --workspace --locked                            # test job
+cargo test --workspace --locked                            # Tests
+cargo llvm-cov --workspace --locked --fail-under-lines 90  # test job: tests and line coverage
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
 ```
 
-`cargo install --locked cargo-deny cargo-machete` installs the two tools.
+`cargo install --locked cargo-deny cargo-machete cargo-llvm-cov` installs the three
+tools, and `rustup component add llvm-tools` adds what `cargo llvm-cov` needs.
 
 ## Rules the CI enforces
 
@@ -40,6 +42,8 @@ cargo machete                                              # deadcode job
 - Every public item has a doc comment; fallible functions document their
   errors under `# Errors`.
 - Comments and documentation are written in English.
+- Line coverage of the tests stays at 90% or more. The `test` job runs the tests
+  under `cargo llvm-cov` and fails below that, so new code needs its tests.
 
 ## Tests
 
