@@ -16,6 +16,8 @@ env:
   CARGO_DENY_VERSION: 0.20.2
   CARGO_MACHETE_VERSION: 0.9.2
   CARGO_LLVM_COV_VERSION: 0.9.1
+  # Keep in step with mutants.yml.
+  CARGO_MUTANTS_VERSION: 27.1.0
 
 jobs:
   # Advisories, licenses, banned crates and registry sources (deny.toml).
@@ -179,3 +181,72 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "vigilant-heron") | .version')
           bash scripts/check-release-binaries.sh "$RUNNER_TEMP/dist" "$version"
+
+  # Mutation testing of the lines this PR changes (cargo mutants --in-diff, with
+  # .cargo/mutants.toml). It fails when a test misses a mutant, so changed code
+  # comes with tests that notice a change. A PR that changes no Rust code has no
+  # mutants and passes at once. The weekly mutants.yml covers the whole tree.
+  mutants-diff:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: mutants-diff-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-mutants
+          key: cargo-mutants-${{ runner.os }}-${{ env.CARGO_MUTANTS_VERSION }}
+      - run: command -v cargo-mutants || cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+      - name: Diff against the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/pr.diff"
+      - id: run
+        run: |
+          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --jobs 2 --cargo-arg=--locked \
+            --output "$RUNNER_TEMP/mutants" || echo "status=$?" >> "$GITHUB_OUTPUT"
+      - name: Summarise missed and timed-out mutants
+        if: always()
+        run: |
+          out="$RUNNER_TEMP/mutants/mutants.out"
+          {
+            echo "## Mutation testing of this PR's changes"
+            for kind in missed timeout caught unviable; do
+              n=0
+              if [ -f "$out/$kind.txt" ]; then n=$(wc -l < "$out/$kind.txt" | tr -d ' '); fi
+              echo "- $kind: $n"
+            done
+            for kind in missed timeout; do
+              if [ -s "$out/$kind.txt" ]; then
+                echo
+                echo "### $kind"
+                echo '```text'
+                cat "$out/$kind.txt"
+                echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: mutants-diff
+          path: ${{ runner.temp }}/mutants/mutants.out
+          if-no-files-found: ignore
+      - name: Fail when cargo-mutants found a problem
+        if: steps.run.outputs.status != ''
+        env:
+          STATUS: ${{ steps.run.outputs.status }}
+        run: |
+          echo "cargo-mutants exited with status $STATUS: see the job summary" >&2
+          exit 1
