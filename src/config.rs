@@ -421,6 +421,8 @@ pub struct SiteConfig {
     pub(crate) deny_paths_lowered: Vec<String>,
     /// Path prefixes that are always blocked when the decision fails.
     pub fail_closed_paths: Vec<String>,
+    /// `fail_closed_paths` in lowercase, in the same order, for matching against lowercase views.
+    pub(crate) fail_closed_lowered: Vec<String>,
     /// What happens when the backend rate-limits the request or no slot is free in time.
     pub on_rate_limit: FailureAction,
     /// What happens when a client already holds its `max_concurrency_per_client` share.
@@ -2094,6 +2096,10 @@ fn parse_site(
         instruction_threshold,
         deny_paths_lowered: deny_paths.iter().map(|path| path.to_lowercase()).collect(),
         deny_paths,
+        fail_closed_lowered: fail_closed_paths
+            .iter()
+            .map(|path| path.to_lowercase())
+            .collect(),
         fail_closed_paths,
         on_rate_limit,
         on_client_busy,

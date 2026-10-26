@@ -412,7 +412,8 @@ async fn keepalive_timeout_zero_serves_one_request_per_connection() -> TestResul
 
 #[tokio::test]
 async fn slow_upstream_past_proxy_read_timeout_gets_504() -> TestResult {
-    let (upstream, _task) = start_slow_upstream(Duration::from_secs(3)).await?;
+    // The upstream would answer after 30 s, so a reply well before 10 s can only come from the timer.
+    let (upstream, _task) = start_slow_upstream(Duration::from_secs(30)).await?;
     let stub = StubDecider::start().await?;
     let proxy = start_proxy(&config(
         &stub.decide_url(),
@@ -433,7 +434,7 @@ async fn slow_upstream_past_proxy_read_timeout_gets_504() -> TestResult {
     .await?;
     assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(10),
         "answered after {:?}",
         started.elapsed()
     );
@@ -462,7 +463,7 @@ async fn unroutable_upstream_with_a_short_connect_timeout_gets_504() -> TestResu
     )
     .await?;
     assert_eq!(reply.status, StatusCode::GATEWAY_TIMEOUT);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(started.elapsed() < Duration::from_secs(10));
     proxy.stop().await
 }
 

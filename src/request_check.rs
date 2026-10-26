@@ -320,10 +320,11 @@ fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCh
     // The location of the decoded path sets the block response, as in the server.
     let block = limits::select_location(&site.locations, &decoded)
         .map_or(&site.block, |location| &location.block);
+    let lowered: Vec<String> = views.iter().map(|view| view.to_lowercase()).collect();
     let target = Target {
         config,
         site,
-        lowered: views.iter().map(|view| view.to_lowercase()).collect(),
+        lowered,
         block,
         upstream: site.upstream.to_string(),
     };
@@ -357,7 +358,7 @@ fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCh
         prefix,
         client,
     );
-    let screening = prefilter::screen(site, &input, request.body.is_empty());
+    let screening = prefilter::screen(site, &input, &target.lowered, request.body.is_empty());
     let verdict = screen_lines(&target, &input, &screening, &mut lines);
     finish(lines, site_label, verdict)
 }

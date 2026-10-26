@@ -28,7 +28,7 @@ features:
     details: Requests the rules do not decide go to a model such as Jev, Clef, or your own. It returns two scores, and thresholds you set decide what gets blocked.
   - icon: 🐦
     title: Shadow mode
-    details: Run a site in shadow mode first. Every request is forwarded, and the log records what would have been blocked.
+    details: Run a site in shadow mode first. Requests are forwarded, and the log records what would have been blocked. Malformed requests and oversized bodies are still refused.
   - icon: 🚦
     title: Request limits
     details: Limit requests and connections per client address or per path, before the body is read, with a dry-run mode for trying a limit out.

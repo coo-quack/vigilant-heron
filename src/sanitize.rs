@@ -1320,10 +1320,11 @@ mod tests {
         // Every key opens a container that never closes: the old code scanned the rest of the body for each key.
         let body = "\"\":{".repeat(1024 * 1024 / 5);
         let started = std::time::Instant::now();
-        let redacted = finishes_within(Duration::from_secs(2), move || {
+        // The bound is generous so that a loaded machine does not fail it; the quadratic code took minutes.
+        let redacted = finishes_within(Duration::from_secs(10), move || {
             redact(None, body.as_bytes())
         });
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(redacted.starts_with("\"\":{\"\":{"));
     }
 

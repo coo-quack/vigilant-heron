@@ -271,6 +271,8 @@ Follow these steps.
 A learned rule is a decision to stop asking the model about that shape. Review the
 evidence before you copy a rule, and check the sample requests with `test-request`.
 
+A learned rule forwards matching requests without the model, so the model no longer judges their headers or body. Block rules, built-in and your own, still run first.
+
 The command reads only the log. It does not read the configuration, so `-c` cannot
 be given. It contacts nothing and writes no file.
 

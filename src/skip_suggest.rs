@@ -429,6 +429,9 @@ fn evidence(candidate: &Candidate) -> String {
     )
 }
 
+/// Printed under the candidate count: what a learned rule leaves to the model.
+const LEARNED_SKIP_NOTE: &str = "A learned rule forwards matching requests without the model, so the model no longer judges their headers or body. Block rules, built-in and your own, still run first.";
+
 impl fmt::Display for SuggestReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let options = &self.options;
@@ -448,6 +451,9 @@ impl fmt::Display for SuggestReport {
         )?;
         writeln!(f)?;
         writeln!(f, "Candidates: {}", self.candidates.len())?;
+        if !self.candidates.is_empty() {
+            writeln!(f, "{LEARNED_SKIP_NOTE}")?;
+        }
         if self.candidates.is_empty() && self.needs_review.is_empty() {
             writeln!(f, "No shape meets the thresholds.")?;
         }
@@ -831,6 +837,17 @@ mod tests {
             text.contains("Already skipped by a rule or the static skip: 0 shapes, 0 requests."),
             "{text}"
         );
+    }
+
+    #[test]
+    fn the_report_notes_that_learned_rules_skip_the_model_for_headers_and_body() {
+        let lines = spread(50, 10, 3, "0.1", "0.1");
+        let text = run(&lines).to_string();
+        assert!(text.contains("Candidates: 1\nA learned rule forwards matching requests without the model, so the model no longer judges their headers or body. Block rules, built-in and your own, still run first.\n") , "{text}");
+        let empty = suggest_skip_rules("".as_bytes(), &SuggestOptions::default())
+            .unwrap_or_else(|error| panic!("reading from memory failed: {error}"))
+            .to_string();
+        assert!(!empty.contains("forwards matching requests"), "{empty}");
     }
 
     #[test]

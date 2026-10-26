@@ -102,15 +102,27 @@ A client over its share can also be a legitimate user. Behind a shared address, 
 
 Two more rules apply to failures:
 
-- A failure on a `fail_closed_path` prefix is always blocked, whatever the two
-  settings say.
+- A failure on a `fail_closed_path` prefix gets the site's `action`, whatever the
+  two settings say: a block, or a redirect (302) where the site redirects.
 - A rule decision is not affected by any of these settings.
 
 The decision log records the outcome in `reason`, one of `rate_limited_allowed`,
 `rate_limited_blocked`, `client_busy_allowed`, `client_busy_blocked`,
 `decision_error_allowed`, `decision_error_blocked` or `fail_closed_path`. The cause
-is in `decision_error`: `rate_limited`, `backend_busy`, `client_busy`, `timeout`,
-`http_status` or `parse`.
+is in `decision_error`:
+
+- **`rate_limited`**: the backend answered HTTP 429.
+- **`backend_busy`**: no local concurrency slot became free within `queue_timeout`.
+- **`client_busy`**: the client already held its `max_concurrency_per_client` share.
+- **`timeout`**: the backend did not answer within `timeout`.
+- **`connection`**: the HTTP exchange failed before an answer arrived.
+- **`http_status`**: the backend answered with a non-2xx status other than 429.
+- **`body`**: the answer's body could not be read.
+- **`parse`**: the JSON of the answer or of the request is malformed.
+- **`request`**: the decision request could not be built.
+- **`rejected`**: the backend answered with `success: false`.
+- **`invalid_response`**: the answer lacks an answer with the expected id, or an answer has the wrong type.
+- **`invalid_score`**: a returned score is not a probability.
 
 ```nginx
 site example.com {
@@ -132,9 +144,27 @@ whatever the verdict, and the access log and the optional debug header show what
 would have happened:
 
 - `would_have` is `block` or `redirect` for a decision by the rules, the access
-  list or the model, and `reject` for a limit. It is empty when the request would
-  have been forwarded anyway.
+  list or the model, and `reject` for a limit. A failed decision also sets it when
+  the failure settings would have blocked it: `block` or `redirect` for a
+  `fail_closed_path` and for a rate-limited or other decision error that its
+  setting blocks, and `reject` for a client over its share when `on_client_busy`
+  is `block`. It is empty when the request would have been forwarded anyway.
 - `action` and `reason` show the decision that was made.
+
+Some refusals happen before the request is judged, and shadow mode does not
+change them. They are refused in every mode, and nothing is recorded as
+`would_have`:
+
+- A `Host` header that is not valid gets 400 (`invalid_host`).
+- A request whose `Host` matches no site gets `default_status` (`unknown_host`).
+  A denied client with no matching site gets 403 (`access_denied`). With no site,
+  there is no mode to apply.
+- A request line or header block over the limits gets 414 (`uri_too_long`) or 400
+  (`header_too_large`), and a header block that is not complete in time gets 408
+  (`header_timeout`).
+- A body over `client_max_body_size` gets 413 (`body_too_large`). A body that is
+  too slow gets 408 (`body_timeout`), and one that cannot be read gets 400
+  (`unreadable_body`).
 
 Rules, the access list and the limits are included. In shadow mode a limit is a
 dry run and a denial is recorded, not enforced. Use shadow mode to measure what a

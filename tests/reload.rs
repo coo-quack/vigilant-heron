@@ -107,6 +107,21 @@ async fn unknown_host_status(base: &str) -> Result<StatusCode, BoxError> {
     )
 }
 
+/// Polls until the server has taken the reload request that was sent, for up to five seconds.
+///
+/// The reload channel holds one message. Its slot is free again once the serving task has
+/// received the message, and the reload is applied in that same step.
+async fn wait_until_reload_taken(running: &Running) -> TestResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while running.reload.capacity() == 0 {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the reload request was never taken".into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
 /// Polls until the unknown-host answer is `expected`, for up to five seconds.
 async fn wait_for_status(base: &str, expected: StatusCode) -> TestResult {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -150,7 +165,7 @@ async fn a_broken_file_keeps_the_previous_configuration() -> TestResult {
 
     write(&file, "listen 127.0.0.1:0;\nunknown_directive 1;\n")?;
     running.request_reload().await?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    wait_until_reload_taken(&running).await?;
     assert_eq!(
         unknown_host_status(&running.base).await?,
         StatusCode::MISDIRECTED_REQUEST
