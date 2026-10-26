@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fixed: a `proxy_websocket` tunnel was read as if it were HTTP requests. After the
+  `101 Switching Protocols`, a tunnelled chunk of more than 8 KiB without a line
+  break (a binary WebSocket frame, for example) was answered with 414 and the
+  connection was closed, and a tunnel open longer than `client_header_timeout`
+  (60s by default) received a 408 while it was still active. Tunnelled bytes are
+  now copied as they arrive, with no header limits and no header timer.
 - Added: decision backend `strands` (`decision.backend strands;`) for a self-hosted
   Strands Decider server, which speaks the System One protocol. `model` defaults to
   `strands-decider`, `url` is required, and `api_token_env` is optional: without it,

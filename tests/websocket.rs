@@ -307,3 +307,61 @@ async fn an_in_flight_request_finishes_before_shutdown_returns() -> TestResult {
     tokio::time::timeout(Duration::from_secs(5), stopping).await???;
     Ok(())
 }
+
+#[tokio::test]
+async fn a_tunnelled_binary_frame_larger_than_a_header_buffer_passes_through() -> TestResult {
+    let upstream = start_echo_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+
+    let (mut socket, head) = handshake(proxy.addr, "/binary").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    // One binary frame with no CR or LF, longer than one header buffer: a header scan would refuse it.
+    let frame = vec![0xAB_u8; 9000];
+    socket.write_all(&frame).await?;
+    let mut echoed = vec![0u8; frame.len()];
+    tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut echoed)).await??;
+    assert!(
+        echoed == frame,
+        "the echoed bytes differ from the frame sent"
+    );
+    drop(socket);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_tunnel_outlives_the_client_header_timeout() -> TestResult {
+    let upstream = start_echo_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream,
+        "client_header_timeout 200ms;",
+        "proxy_websocket on;",
+    ))
+    .await?;
+
+    let (mut socket, head) = handshake(proxy.addr, "/long").await?;
+    assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+    // Six bytes 100 ms apart: the tunnel lives 600 ms, three times the header timeout.
+    let mut sent = Vec::new();
+    for round in 0..6u8 {
+        let byte = [b'a' + round];
+        let _ = socket.write_all(&byte).await;
+        sent.push(byte[0]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let mut echoed = vec![0u8; sent.len()];
+    tokio::time::timeout(Duration::from_secs(5), socket.read_exact(&mut echoed)).await??;
+    assert_eq!(echoed, sent, "an active tunnel must not receive a 408");
+    drop(socket);
+    proxy.stop().await
+}
