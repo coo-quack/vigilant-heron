@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 (2026-10-27)
 
 - Added: `check_request_with`, the library form of `check_request` that takes an
   already loaded `Config`, so a caller that checks many requests loads the
