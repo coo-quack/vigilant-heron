@@ -8,13 +8,13 @@
 //!
 //! Signals go through `rustix`, as in [`crate::cli`], so no `unsafe` code is needed.
 
-use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::pidfile;
 use anyhow::{Context, anyhow, bail};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
@@ -106,11 +106,10 @@ pub(crate) fn start(config_path: &Path) -> anyhow::Result<ExitCode> {
     if let Some(pid) = live_pid(&pid_file)? {
         bail!("already running (pid {pid})");
     }
-    let log_path =
-        pid_file.with_file_name(format!(".vigilant-heron-start-{}.log", std::process::id()));
+    let log_path = startup_log_path(&pid_file);
     let log = RemoveOnDrop(log_path.clone());
-    let startup_log =
-        File::create(&log_path).with_context(|| format!("creating {}", log_path.display()))?;
+    let startup_log = pidfile::create_exclusive(&log_path)
+        .with_context(|| format!("creating {}", log_path.display()))?;
     let mut child =
         Command::new(std::env::current_exe().context("finding the vigilant-heron binary")?)
             .arg("-c")
@@ -181,6 +180,12 @@ fn warn_about_lost_output(config: &Config) {
             "vigilant-heron: warning: access_log writes to a standard stream, which a background router does not keep; set access_log to a file"
         );
     }
+}
+
+/// The startup log of this `start`, next to the pid file. The name carries this
+/// process's id, so concurrent starts do not share one.
+fn startup_log_path(pid_file: &Path) -> PathBuf {
+    pid_file.with_file_name(format!(".vigilant-heron-start-{}.log", std::process::id()))
 }
 
 fn pid_of(raw: u32) -> anyhow::Result<Pid> {
@@ -288,6 +293,24 @@ mod tests {
     #[test]
     fn stop_waits_thirty_seconds_plus_the_margin_without_a_shutdown_timeout() {
         assert_eq!(stop_limit(None), Duration::from_secs(35));
+    }
+
+    #[test]
+    fn a_symlink_planted_at_the_startup_log_is_not_followed() -> std::io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("vh-lifecycle-log-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let victim = dir.join("victim.txt");
+        std::fs::write(&victim, "keep")?;
+        let log = startup_log_path(&dir.join("router.pid"));
+        std::os::unix::fs::symlink(&victim, &log)?;
+
+        let result = pidfile::create_exclusive(&log).map(drop);
+        let kept = std::fs::read_to_string(&victim)?;
+        let _ = std::fs::remove_dir_all(&dir);
+        result?;
+        assert_eq!(kept, "keep", "the victim was written through the symlink");
+        Ok(())
     }
 
     #[test]
