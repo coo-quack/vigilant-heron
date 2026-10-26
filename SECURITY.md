@@ -228,7 +228,7 @@ failure and on the site settings:
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
   `"block"` (the default) applies the site's `action`, `"allow"` forwards the
   request.
-- `fail_closed_paths` always blocks a failure on a matching path, whatever the
+- `fail_closed_path` always blocks a failure on a matching path, whatever the
   group or setting.
 - Deterministic rules (the access list, `deny_path` and block rules) are decided
   before the backend is called. The failure settings do not affect them, so a
@@ -240,7 +240,7 @@ outage does not block legitimate traffic. A client over its share is refused by
 default, because that is the case the per-client cap exists for. The cost is that an attacker who makes the
 backend unavailable on purpose can get requests past the model, and a site that
 keeps `on_rate_limit "allow"` or `on_decision_error "allow"` accepts that. Keep
-`fail_closed_paths` on sensitive paths, which block whatever the setting.
+`fail_closed_path` on sensitive paths, which block whatever the setting.
 
 Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in its own group, so only that client follows `on_client_busy` (`block` by default), and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, keep `on_client_busy "block"`, set `on_rate_limit "block"`, and limit each client with `limit_req` and `limit_conn`.
 

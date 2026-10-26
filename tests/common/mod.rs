@@ -378,3 +378,67 @@ site shadow.test {{
 "#
     )
 }
+
+/// A decision backend whose answers wait for permits: each call takes one permit
+/// before it answers, so a test decides when the call at the backend may finish.
+pub(crate) struct GatedDecider {
+    /// Address the gated backend listens on.
+    pub(crate) addr: SocketAddr,
+    gate: Arc<tokio::sync::Semaphore>,
+    calls: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+
+impl GatedDecider {
+    /// Starts the backend on an ephemeral loopback port. No call finishes until `release` is called.
+    pub(crate) async fn start() -> Result<Self, BoxError> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let handler_gate = Arc::clone(&gate);
+        let handler_calls = Arc::clone(&calls);
+        let task = spawn_server(listener, move |request: Request<Incoming>| {
+            let gate = Arc::clone(&handler_gate);
+            let calls = Arc::clone(&handler_calls);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let _ = request.into_body().collect().await;
+                if let Ok(permit) = gate.acquire().await {
+                    permit.forget();
+                }
+                json_response(
+                    StatusCode::OK,
+                    &json!({"attack": 0.01, "ai_instruction": 0.01}),
+                )
+            }
+        });
+        Ok(Self {
+            addr,
+            gate,
+            calls,
+            task,
+        })
+    }
+
+    /// URL the proxy should use as `decision.url`.
+    pub(crate) fn decide_url(&self) -> String {
+        format!("http://{}/decide", self.addr)
+    }
+
+    /// Lets `count` calls that are waiting, or that arrive later, finish.
+    pub(crate) fn release(&self, count: usize) {
+        self.gate.add_permits(count);
+    }
+
+    /// Number of decision requests received so far.
+    pub(crate) fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for GatedDecider {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}

@@ -4,6 +4,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -14,6 +15,7 @@ use http::{Method, Request, StatusCode};
 use hyper::body::Incoming;
 use serde_json::json;
 use tokio::net::TcpListener;
+use tokio::sync::{Semaphore, mpsc};
 
 /// A unique log file path under the temp directory.
 fn log_path(name: &str) -> PathBuf {
@@ -381,32 +383,69 @@ async fn a_dry_run_site_passes_the_request_and_logs_the_dry_run_status() -> Test
     Ok(())
 }
 
-/// Starts an upstream that holds `/slow` for half a second before it answers, and returns its URL.
-///
-/// The server runs detached until the test process exits.
-async fn slow_upstream() -> Result<String, BoxError> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let _detached = spawn_server(listener, |request: Request<Incoming>| async move {
-        if request.uri().path() == "/slow" {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        json_response(StatusCode::OK, &json!({"ok": true}))
-    });
-    Ok(format!("http://{addr}"))
+/// An upstream that holds each `/slow` request until the test releases it. It reports
+/// each arrival, so a test knows a request is in flight before it sends the next one.
+struct GatedUpstream {
+    base: String,
+    arrivals: mpsc::UnboundedReceiver<()>,
+    gate: Arc<Semaphore>,
+}
+
+impl GatedUpstream {
+    async fn start() -> Result<Self, BoxError> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (arrived, arrivals) = mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+        let handler_gate = Arc::clone(&gate);
+        let _detached = spawn_server(listener, move |request: Request<Incoming>| {
+            let arrived = arrived.clone();
+            let gate = Arc::clone(&handler_gate);
+            async move {
+                if request.uri().path() == "/slow" {
+                    let _ = arrived.send(());
+                    if let Ok(permit) = gate.acquire().await {
+                        permit.forget();
+                    }
+                }
+                json_response(StatusCode::OK, &json!({"ok": true}))
+            }
+        });
+        Ok(Self {
+            base: format!("http://{addr}"),
+            arrivals,
+            gate,
+        })
+    }
+
+    /// Waits until a `/slow` request has reached the upstream.
+    async fn arrived(&mut self) -> TestResult {
+        self.arrivals.recv().await.ok_or("the upstream stopped")?;
+        Ok(())
+    }
+
+    /// Lets `count` held requests, or the next ones that arrive, answer.
+    fn release(&self, count: usize) {
+        self.gate.add_permits(count);
+    }
+}
+
+/// Starts a `/slow` upstream that holds each request until the test releases it.
+async fn slow_upstream() -> Result<GatedUpstream, BoxError> {
+    GatedUpstream::start().await
 }
 
 #[tokio::test]
 async fn a_second_concurrent_request_from_the_same_client_gets_503_then_the_count_is_released()
 -> TestResult {
     let decider = StubDecider::start().await?;
-    let slow_url = slow_upstream().await?;
+    let mut slow = slow_upstream().await?;
     let log = log_path("conn");
     let _ = std::fs::remove_file(&log);
     let top = "limit_conn_zone $client_ip zone=perip:1m;";
     let site =
         "location /slow {\n        limit_conn perip 1;\n        limit_conn_status 503;\n    }";
-    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow.base, top, site)).await?;
     let base = proxy.base();
     let first_base = base.clone();
     let first = tokio::spawn(async move {
@@ -420,7 +459,7 @@ async fn a_second_concurrent_request_from_the_same_client_gets_503_then_the_coun
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    slow.arrived().await?;
     let second = send(
         &base,
         Method::GET,
@@ -431,9 +470,11 @@ async fn a_second_concurrent_request_from_the_same_client_gets_503_then_the_coun
     )
     .await?;
     assert_eq!(second.status, StatusCode::SERVICE_UNAVAILABLE);
+    slow.release(1);
     let first = first.await??;
     assert_eq!(first.status, StatusCode::OK);
     // The first request is finished, so its count is released.
+    slow.release(1);
     let third = send(
         &base,
         Method::GET,
@@ -451,13 +492,13 @@ async fn a_second_concurrent_request_from_the_same_client_gets_503_then_the_coun
 #[tokio::test]
 async fn a_client_that_disconnects_mid_request_releases_its_connection_count() -> TestResult {
     let decider = StubDecider::start().await?;
-    let slow_url = slow_upstream().await?;
+    let mut slow = slow_upstream().await?;
     let log = log_path("disconnect");
     let _ = std::fs::remove_file(&log);
     let top = "limit_conn_zone $client_ip zone=perip:1m;";
     let site =
         "location /slow {\n        limit_conn perip 1;\n        limit_conn_status 503;\n    }";
-    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow.base, top, site)).await?;
     let base = proxy.base();
     let aborted_base = base.clone();
     let aborted = tokio::spawn(async move {
@@ -471,21 +512,33 @@ async fn a_client_that_disconnects_mid_request_releases_its_connection_count() -
         )
         .await
     });
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    slow.arrived().await?;
     // The client gives up while the upstream is still holding the request.
     aborted.abort();
     // Once the upstream has answered and the request is gone, the count is free again.
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let next = send(
-        &base,
-        Method::GET,
-        "/slow",
-        "example.com",
-        &[],
-        Bytes::new(),
-    )
-    .await?;
-    assert_eq!(next.status, StatusCode::OK);
+    // One permit answers the aborted request, and each poll adds one before it sends, so
+    // a poll that the count still refuses leaves its permit for a later poll.
+    slow.release(1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        slow.release(1);
+        let next = send(
+            &base,
+            Method::GET,
+            "/slow",
+            "example.com",
+            &[],
+            Bytes::new(),
+        )
+        .await?;
+        if next.status == StatusCode::OK {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the count of the aborted request was never released".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     proxy.stop().await?;
     Ok(())
 }
@@ -510,16 +563,16 @@ fn spawn_slow(base: &str, key: &str) -> tokio::task::JoinHandle<Result<common::R
 #[tokio::test]
 async fn an_exhausted_conn_zone_answers_with_the_configured_status() -> TestResult {
     let decider = StubDecider::start().await?;
-    let slow_url = slow_upstream().await?;
+    let mut slow = slow_upstream().await?;
     let log = log_path("conn-exhausted");
     let _ = std::fs::remove_file(&log);
     // A 64-byte zone holds one state, so a second key has nowhere to go while the first is in progress.
     let top = "limit_conn_zone $http_x_key zone=c:64;";
     let site = "location /slow {\n        limit_conn c 1;\n        limit_conn_status 429;\n    }";
-    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow.base, top, site)).await?;
     let base = proxy.base();
     let first = spawn_slow(&base, "a");
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    slow.arrived().await?;
     let other = send(
         &base,
         Method::GET,
@@ -530,6 +583,7 @@ async fn an_exhausted_conn_zone_answers_with_the_configured_status() -> TestResu
     )
     .await?;
     assert_eq!(other.status, StatusCode::TOO_MANY_REQUESTS);
+    slow.release(1);
     assert_eq!(first.await??.status, StatusCode::OK);
     proxy.stop().await?;
     Ok(())
@@ -538,25 +592,21 @@ async fn an_exhausted_conn_zone_answers_with_the_configured_status() -> TestResu
 #[tokio::test]
 async fn an_exhausted_conn_zone_in_dry_run_lets_the_request_through() -> TestResult {
     let decider = StubDecider::start().await?;
-    let slow_url = slow_upstream().await?;
+    let mut slow = slow_upstream().await?;
     let log = log_path("conn-exhausted-dry");
     let _ = std::fs::remove_file(&log);
     let top = "limit_conn_zone $http_x_key zone=c:64;";
     let site = "location /slow {\n        limit_conn c 1;\n        limit_conn_status 429;\n        limit_conn_dry_run on;\n    }";
-    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow.base, top, site)).await?;
     let base = proxy.base();
     let first = spawn_slow(&base, "a");
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let other = send(
-        &base,
-        Method::GET,
-        "/slow",
-        "example.com",
-        &[("x-key", "b")],
-        Bytes::new(),
-    )
-    .await?;
-    assert_eq!(other.status, StatusCode::OK);
+    slow.arrived().await?;
+    // The dry run forwards the request, so it reaches the upstream and is held there too.
+    let other = spawn_slow(&base, "b");
+    slow.arrived().await?;
+    slow.release(2);
+    assert_eq!(other.await??.status, StatusCode::OK);
+    // The access line is written when the request ends, so it is read after the release.
     let line = wait_for_line(&log, "REJECTED_DRY_RUN").await?;
     assert!(line.starts_with("200 "), "{line}");
     assert_eq!(first.await??.status, StatusCode::OK);
@@ -567,18 +617,21 @@ async fn an_exhausted_conn_zone_in_dry_run_lets_the_request_through() -> TestRes
 #[tokio::test]
 async fn an_exhausted_req_zone_answers_with_the_configured_status() -> TestResult {
     let decider = StubDecider::start().await?;
-    let slow_url = slow_upstream().await?;
+    let mut slow = slow_upstream().await?;
     let log = log_path("req-exhausted");
     let _ = std::fs::remove_file(&log);
     // One state. The second request of key "a" waits for its turn, and that wait holds the state.
     let top = "limit_req_zone $http_x_key zone=r:128 rate=1r/s;";
     let site =
         "location /slow {\n        limit_req zone=r burst=1;\n        limit_req_status 429;\n    }";
-    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow_url, top, site)).await?;
+    let proxy = start_proxy(&config(&log, &decider.decide_url(), &slow.base, top, site)).await?;
     let base = proxy.base();
     let first = spawn_slow(&base, "a");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    slow.arrived().await?;
     let waiting = spawn_slow(&base, "a");
+    // No event marks the moment the second request enters its one-second delay, so this
+    // wait is the one timed step left. The delay is long enough that the check below
+    // still runs while the state is held.
     tokio::time::sleep(Duration::from_millis(200)).await;
     let other = send(
         &base,
@@ -590,8 +643,59 @@ async fn an_exhausted_req_zone_answers_with_the_configured_status() -> TestResul
     )
     .await?;
     assert_eq!(other.status, StatusCode::TOO_MANY_REQUESTS);
+    slow.release(2);
     assert_eq!(first.await??.status, StatusCode::OK);
     assert_eq!(waiting.await??.status, StatusCode::OK);
     proxy.stop().await?;
     Ok(())
+}
+
+/// A request that a limit refuses is answered at once, without the delay that another
+/// limit of the same location would have added.
+#[tokio::test]
+async fn a_refused_request_is_answered_without_the_delay_of_another_limit() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path("refused-delay");
+    let _ = std::fs::remove_file(&log);
+    // `slow` delays the second request by one second; `strict` refuses it.
+    let top = "limit_req_zone $client_ip zone=slow:1m rate=1r/s;\nlimit_req_zone $client_ip zone=strict:1m rate=1r/m;";
+    let site = "location /wp-login.php {\n        limit_req zone=slow burst=1;\n        limit_req zone=strict burst=0;\n        limit_req_status 429;\n    }";
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        top,
+        site,
+    ))
+    .await?;
+
+    let first = send(
+        &proxy.base(),
+        Method::POST,
+        LOGIN,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(first.status, StatusCode::OK);
+
+    let started = std::time::Instant::now();
+    let refused = send(
+        &proxy.base(),
+        Method::POST,
+        LOGIN,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    let elapsed = started.elapsed();
+    assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the refused request waited {elapsed:?}; the delay of one second must not apply"
+    );
+    proxy.stop().await
 }

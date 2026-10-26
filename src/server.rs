@@ -89,6 +89,9 @@ pub(crate) struct AppState<B> {
     backend_redact: Vec<String>,
     /// Body field names redacted before the event is sent to the backend (`redact_field`).
     backend_redact_fields: Vec<String>,
+    /// The decision slots shared by all calls, and the `max_concurrency` they were built with.
+    slots: Arc<Semaphore>,
+    slots_limit: usize,
     /// Decision calls in flight per client address (`max_concurrency_per_client`).
     client_slots: Arc<ClientSlots>,
     backend: B,
@@ -106,15 +109,20 @@ pub(crate) struct AppState<B> {
 }
 
 impl AppState<Backend> {
-    /// Builds the state of `config`. Zones named like a zone of `previous`, with the
-    /// same size, keep their counts.
-    fn from_config(config: Config, previous: &[Arc<ZoneStore>]) -> Result<Self, ServeError> {
+    /// Builds the state of `config`. A reload (`previous` is the state it replaces)
+    /// keeps the decision slots while `max_concurrency` is unchanged, and the
+    /// per-client table while `max_concurrency_per_client` is unchanged, so calls
+    /// admitted before the reload still count against the limits. Zones named like a
+    /// zone of `previous`, with the same size, keep their counts.
+    fn from_config(config: Config, previous: Option<&Self>) -> Result<Self, ServeError> {
         let client = decision_client()?;
         let url = config.decision.url.clone();
+        let (slots, client_slots) = decision_slots(&config, previous);
+        let previous_zones = previous.map_or(&[][..], |old| old.zones.as_slice());
         let limits = Limits {
             timeout: config.decision.timeout,
             queue_timeout: config.decision.queue_timeout,
-            slots: Arc::new(Semaphore::new(config.decision.max_concurrency)),
+            slots: Arc::clone(&slots),
         };
         let backend = match &config.decision.backend {
             BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, limits)),
@@ -175,7 +183,9 @@ impl AppState<Backend> {
             inspect_body_bytes: config.decision.inspect_body_bytes,
             backend_redact,
             backend_redact_fields: config.decision.redact_fields.clone(),
-            client_slots: ClientSlots::new(config.decision.max_concurrency_per_client),
+            slots,
+            slots_limit: config.decision.max_concurrency,
+            client_slots,
             backend,
             default_status: config.default_status,
             realip: config.realip,
@@ -186,7 +196,7 @@ impl AppState<Backend> {
                 .zones
                 .into_iter()
                 .map(|zone| {
-                    let shared = previous.iter().find(|old| {
+                    let shared = previous_zones.iter().find(|old| {
                         old.name() == zone.name.as_str() && old.capacity() == zone.capacity
                     });
                     Arc::new(match shared {
@@ -198,6 +208,25 @@ impl AppState<Backend> {
             top_limits: config.limits,
         })
     }
+}
+
+/// The decision slots of a state built from `config`. A reload reuses the previous
+/// slots of each limit whose value is unchanged, so calls in flight still count.
+fn decision_slots(
+    config: &Config,
+    previous: Option<&AppState<Backend>>,
+) -> (Arc<Semaphore>, Arc<ClientSlots>) {
+    let slots = match previous {
+        Some(old) if old.slots_limit == config.decision.max_concurrency => Arc::clone(&old.slots),
+        _ => Arc::new(Semaphore::new(config.decision.max_concurrency)),
+    };
+    let client_slots = match previous {
+        Some(old) if old.client_slots.limit() == config.decision.max_concurrency_per_client => {
+            Arc::clone(&old.client_slots)
+        }
+        _ => ClientSlots::new(config.decision.max_concurrency_per_client),
+    };
+    (slots, client_slots)
 }
 
 /// Connection settings that stay the same for the whole run: a reload does not change them.
@@ -328,7 +357,7 @@ async fn run(
         keepalive_requests: config.connection.keepalive_requests,
     };
     let startup = Startup::of(&config);
-    let initial = Arc::new(AppState::from_config(config, &[])?);
+    let initial = Arc::new(AppState::from_config(config, None)?);
     let (current_tx, current_rx) = watch::channel(initial);
     let (stop_tx, stop_rx) = watch::channel(false);
     // Each connection and each tunnel holds a clone of `open_tx`; the drain ends when none is left.
@@ -436,7 +465,7 @@ fn reload(
     };
     startup.report_changes(&config);
     let previous = current.borrow().clone();
-    match AppState::from_config(config.clone(), &previous.zones) {
+    match AppState::from_config(config.clone(), Some(previous.as_ref())) {
         Ok(state) => {
             current.send_replace(Arc::new(state));
             applied(&config);
