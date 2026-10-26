@@ -122,15 +122,25 @@ pub(crate) fn start(config_path: &Path) -> anyhow::Result<ExitCode> {
             .spawn()
             .context("starting the router")?;
     let pid = child.id();
+    // Once `try_wait` has reaped the child, its pid may belong to another process, so it is not signalled.
+    let mut reaped = false;
     let started = wait_until(START_TIMEOUT, POLL, || {
         if pid_file_holds(&pid_file, pid) {
             return true;
         }
-        child.try_wait().is_ok_and(|status| status.is_some())
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                reaped = true;
+                true
+            }
+            _ => false,
+        }
     });
     let startup_messages = std::fs::read_to_string(&log.0).unwrap_or_default();
     if !pid_file_holds(&pid_file, pid) {
-        let _ = kill_process(pid_of(pid)?, Signal::TERM);
+        if !reaped {
+            let _ = kill_process(pid_of(pid)?, Signal::TERM);
+        }
         let detail = startup_messages.trim();
         if started {
             bail!("the router exited while starting: {detail}");
