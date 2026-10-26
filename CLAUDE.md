@@ -45,6 +45,7 @@ src/
   rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   sanitize.rs    # Backend event: header drop, body redaction, truncation
   decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
@@ -75,6 +76,7 @@ tests/
   websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
   reload.rs      # serve_reloadable: valid, broken, zone state kept or reset, in-flight requests finish
   request_check.rs # test-request agrees with the running router on outcome, reason and rule id
+  skip_suggest.rs # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack

@@ -1572,3 +1572,57 @@ fn test_request_refuses_a_malformed_request_file_with_exit_one() -> Result<(), s
     assert!(stderr.contains("line 2"), "{stderr}");
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// suggest-skip-rules: learn skip-rule candidates from a json access log
+// ---------------------------------------------------------------------------
+
+/// A `json` access log in which `GET /` with shape `p=<num>` is judged 50 times by 10
+/// clients on 3 days, with low scores and no block.
+fn learnable_access_log() -> String {
+    use std::fmt::Write as _;
+    let mut log = String::new();
+    for i in 0..50 {
+        let _ = writeln!(
+            log,
+            "{{\"time\":\"2026-01-{:02}T10:00:00Z\",\"client_ip\":\"192.0.2.{}\",\"site\":\"example.com\",\"method\":\"GET\",\"path\":\"/\",\"query_shape\":\"p=<num>\",\"action\":\"allow\",\"reason\":\"model\",\"would_have\":\"\",\"attack\":\"0.05\",\"ai_instruction\":\"0.02\"}}",
+            1 + i % 3,
+            1 + i % 10
+        );
+    }
+    log
+}
+
+#[test]
+fn suggest_skip_rules_prints_the_learned_candidate_and_its_rule() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-skip-rules")?;
+    let log = write_file(&dir, "access.json", &learnable_access_log())?;
+    let output = run(&["suggest-skip-rules", log.to_str().unwrap_or_default()])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("Candidates: 1"), "{stdout}");
+    assert!(stdout.contains("rule learned-1 {"), "{stdout}");
+    assert!(stdout.contains("query ~ \"^p=[0-9]{1,20}$\";"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn suggest_skip_rules_refuses_the_config_flag() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-skip-rules-config")?;
+    let log = write_file(&dir, "access.json", &learnable_access_log())?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = run(&[
+        "suggest-skip-rules",
+        log.to_str().unwrap_or_default(),
+        "-c",
+        conf.to_str().unwrap_or_default(),
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("suggest-skip-rules reads only the access log; -c is not used"),
+        "{stderr}"
+    );
+    Ok(())
+}

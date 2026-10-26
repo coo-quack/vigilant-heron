@@ -14,7 +14,7 @@ use anyhow::{Context, anyhow};
 use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
 use pidfile::PidFile;
 use tokio::signal::unix::{SignalKind, signal};
-use vigilant_heron::{Config, ErrorLogHandle, install_error_log, serve_reloadable};
+use vigilant_heron::{Config, ErrorLogHandle, SuggestOptions, install_error_log, serve_reloadable};
 
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
 
@@ -63,6 +63,7 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
         Command::TestRequest { file, client } => {
             Ok(test_request(&resolve_config(config), &file, client))
         }
+        Command::SuggestSkipRules { file, options } => Ok(suggest_skip_rules(&file, &options)),
         Command::Start => lifecycle::start(&resolve_config(config)),
         Command::Stop => lifecycle::stop(&resolve_config(config)),
         Command::Restart => lifecycle::restart(&resolve_config(config)),
@@ -126,7 +127,7 @@ fn test_configuration(path: &Path, dump: bool) -> ExitCode {
 /// against the configuration, and prints the report to stdout. Errors go to stderr, exit 1.
 fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
     let mut stderr = std::io::stderr();
-    let raw = match read_request(file) {
+    let raw = match read_input(file) {
         Ok(raw) => raw,
         Err(error) => {
             let _ = writeln!(
@@ -157,8 +158,41 @@ fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
     }
 }
 
-/// Reads a request file whole, or standard input for `-`.
-fn read_request(file: &Path) -> std::io::Result<Vec<u8>> {
+/// Runs `suggest-skip-rules`: reads the access log from `file` (or stdin for `-`), prints the
+/// suggested rules to stdout, and never reads the configuration. Errors go to stderr, exit 1.
+fn suggest_skip_rules(file: &Path, options: &SuggestOptions) -> ExitCode {
+    let mut stderr = std::io::stderr();
+    let report = if file == Path::new("-") {
+        vigilant_heron::suggest_skip_rules(std::io::stdin().lock(), options)
+    } else {
+        std::fs::File::open(file).and_then(|opened| {
+            vigilant_heron::suggest_skip_rules(std::io::BufReader::new(opened), options)
+        })
+    };
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "vigilant-heron: cannot read the access log {}: {error}",
+                file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stdout = std::io::stdout();
+    if stdout
+        .write_all(report.to_string().as_bytes())
+        .and_then(|()| stdout.flush())
+        .is_err()
+    {
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Reads a file whole, or standard input for `-`.
+fn read_input(file: &Path) -> std::io::Result<Vec<u8>> {
     if file == Path::new("-") {
         let mut raw = Vec::new();
         std::io::stdin().lock().read_to_end(&mut raw)?;
