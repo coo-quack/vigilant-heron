@@ -5,6 +5,7 @@
 //! `unsafe` code and without running a `kill` binary, which the distroless image lacks.
 
 use std::io::ErrorKind;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow, bail};
@@ -50,7 +51,7 @@ impl SignalCommand {
 }
 
 /// The one action a command line asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Command {
     /// No action option: run the router.
     Serve,
@@ -67,6 +68,13 @@ pub(crate) enum Command {
     Stop,
     /// `restart`: check the configuration, stop the background router, then start it.
     Restart,
+    /// `test-request <file>`: screen one sample request and print the report, without calling the backend.
+    TestRequest {
+        /// The raw request file, or `-` for standard input.
+        file: PathBuf,
+        /// The client address the access list sees.
+        client: IpAddr,
+    },
     /// `-h`, `--help`.
     Help,
     /// `-v`, `--version`.
@@ -86,6 +94,7 @@ pub(crate) struct Options {
 pub(crate) const USAGE: &str = "\
 Usage: vigilant-heron [-h] [-v] [-t] [-T] [-c <path>] [-s <signal>]
        vigilant-heron start|stop|restart [-c <path>]
+       vigilant-heron test-request <file> [-c <path>] [--client <address>]
 
 Options:
   -h, --help            show this help and exit
@@ -100,6 +109,10 @@ Options:
   stop                  stop the background router and wait for it to exit
   restart               stop, then start, after checking the file
                         use -s reload for configuration changes: it keeps connections
+  test-request <file>   report what the router would do with a raw HTTP/1.1 request
+                        in <file> (- reads stdin), without calling the decision backend
+  --client <address>    client address for the access list with test-request
+                        (default 127.0.0.1; real_ip settings are not applied)
 ";
 
 /// Reads the command line. The first error is returned as text for the usage message.
@@ -110,7 +123,11 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut dump = false;
     let mut signal: Option<SignalCommand> = None;
     let mut lifecycle: Option<&str> = None;
+    let mut request_check = false;
     let mut config = None;
+    let mut client: Option<IpAddr> = None;
+    // Bare arguments: the request file of test-request. Any other use is an error.
+    let mut operands: Vec<&str> = Vec::new();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -120,6 +137,12 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
                 }
                 lifecycle = Some(arg.as_str());
             }
+            "test-request" => {
+                if request_check {
+                    return Err("test-request is given more than once".to_owned());
+                }
+                request_check = true;
+            }
             "-h" | "--help" => help = true,
             "-v" | "--version" => version = true,
             "-t" => test = true,
@@ -128,6 +151,7 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
                 dump = true;
             }
             "-c" | "--config" => config = Some(path_value(arg, rest.next())?),
+            "--client" => client = Some(address_value(arg, rest.next())?),
             "-s" => {
                 if signal.is_some() {
                     return Err("-s is given more than once".to_owned());
@@ -138,16 +162,34 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
                 })?;
                 signal = Some(parsed);
             }
-            other => match other.strip_prefix("--config=") {
-                Some(value) => config = Some(path_value("--config", Some(&value.to_owned()))?),
-                None => return Err(format!("unknown option \"{other}\"")),
+            "-" => operands.push("-"),
+            other => match (
+                other.strip_prefix("--config="),
+                other.strip_prefix("--client="),
+            ) {
+                (Some(value), _) => config = Some(path_value("--config", Some(&value.to_owned()))?),
+                (_, Some(value)) => {
+                    client = Some(address_value("--client", Some(&value.to_owned()))?);
+                }
+                _ if other.starts_with('-') => return Err(format!("unknown option \"{other}\"")),
+                _ => operands.push(other),
             },
+        }
+    }
+    if !help && !version && !request_check {
+        if let Some(operand) = operands.first() {
+            return Err(format!("unknown option \"{operand}\""));
+        }
+        if client.is_some() {
+            return Err("--client can only be used with test-request".to_owned());
         }
     }
     let command = if help {
         Command::Help
     } else if version {
         Command::Version
+    } else if request_check {
+        test_request_command(&operands, client, lifecycle, test, signal.is_some())?
     } else if let Some(word) = lifecycle {
         if test {
             return Err(format!("{word} cannot be combined with -t or -T"));
@@ -173,12 +215,48 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
     Ok(Options { config, command })
 }
 
+/// The command of `test-request <file>`. The file is the one bare operand, and the
+/// word may not be combined with the other actions.
+fn test_request_command(
+    operands: &[&str],
+    client: Option<IpAddr>,
+    lifecycle: Option<&str>,
+    test: bool,
+    signal: bool,
+) -> Result<Command, String> {
+    if let Some(word) = lifecycle {
+        return Err(format!("test-request cannot be combined with {word}"));
+    }
+    if test {
+        return Err("test-request cannot be combined with -t or -T".to_owned());
+    }
+    if signal {
+        return Err("test-request cannot be combined with -s".to_owned());
+    }
+    let file = match operands {
+        [only] => PathBuf::from(only),
+        [] => return Err("test-request needs a request file (or - for stdin)".to_owned()),
+        _ => return Err("give only one request file".to_owned()),
+    };
+    Ok(Command::TestRequest {
+        file,
+        client: client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+    })
+}
+
 /// Reads the value of an option that takes a path.
 fn path_value(option: &str, value: Option<&String>) -> Result<PathBuf, String> {
     match value {
         Some(path) if !path.is_empty() => Ok(PathBuf::from(path)),
         _ => Err(format!("{option} needs a path")),
     }
+}
+
+/// Reads the value of `--client`, an IPv4 or IPv6 address.
+fn address_value(option: &str, value: Option<&String>) -> Result<IpAddr, String> {
+    let text = value.ok_or_else(|| format!("{option} needs an address"))?;
+    text.parse::<IpAddr>()
+        .map_err(|_| format!("invalid address \"{text}\" for {option}"))
 }
 
 /// Chooses the config path: `--config` wins, then the environment, then the default.
@@ -274,8 +352,54 @@ mod tests {
     #[case::help_wins_over_version(&["-v", "-h"], Options { config: None, command: Command::Help })]
     #[case::help_wins_over_test(&["-t", "-h"], Options { config: None, command: Command::Help })]
     #[case::version_wins_over_signal(&["-s", "stop", "-v"], Options { config: None, command: Command::Version })]
+    #[case::test_request_with_file(&["test-request", "req.txt"], Options { config: None, command: test_request("req.txt", LOCALHOST) })]
+    #[case::test_request_file_before_word(&["req.txt", "test-request"], Options { config: None, command: test_request("req.txt", LOCALHOST) })]
+    #[case::test_request_with_config(&["-c", "/a.conf", "test-request", "req.txt"], Options { config: Some(PathBuf::from("/a.conf")), command: test_request("req.txt", LOCALHOST) })]
+    #[case::test_request_with_client(&["test-request", "req.txt", "--client", "203.0.113.7"], Options { config: None, command: test_request("req.txt", "203.0.113.7".parse().unwrap_or(LOCALHOST)) })]
+    #[case::test_request_with_client_equals(&["test-request", "--client=2001:db8::1", "req.txt"], Options { config: None, command: test_request("req.txt", "2001:db8::1".parse().unwrap_or(LOCALHOST)) })]
+    #[case::test_request_from_stdin(&["test-request", "-"], Options { config: None, command: test_request("-", LOCALHOST) })]
+    #[case::help_wins_over_test_request(&["test-request", "-h"], Options { config: None, command: Command::Help })]
     fn a_valid_command_line_parses(#[case] input: &[&str], #[case] expected: Options) {
         assert_eq!(parse_args(&args(input)), Ok(expected));
+    }
+
+    fn test_request(file: &str, client: IpAddr) -> Command {
+        Command::TestRequest {
+            file: PathBuf::from(file),
+            client,
+        }
+    }
+
+    const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn test_request_defaults_the_client_to_the_loopback_address() {
+        assert_eq!(
+            parse_args(&args(&["test-request", "req.txt"])).map(|options| options.command),
+            Ok(test_request("req.txt", LOCALHOST))
+        );
+    }
+
+    #[rstest]
+    #[case::without_a_file(&["test-request"], "test-request needs a request file (or - for stdin)")]
+    #[case::two_files(&["test-request", "a.txt", "b.txt"], "give only one request file")]
+    #[case::with_test(&["test-request", "req.txt", "-t"], "test-request cannot be combined with -t or -T")]
+    #[case::with_dump(&["-T", "test-request", "req.txt"], "test-request cannot be combined with -t or -T")]
+    #[case::with_signal(&["test-request", "req.txt", "-s", "reload"], "test-request cannot be combined with -s")]
+    #[case::with_start(&["start", "test-request", "req.txt"], "test-request cannot be combined with start")]
+    #[case::with_stop(&["test-request", "req.txt", "stop"], "test-request cannot be combined with stop")]
+    #[case::with_restart(&["restart", "test-request", "req.txt"], "test-request cannot be combined with restart")]
+    #[case::word_twice(&["test-request", "test-request", "req.txt"], "test-request is given more than once")]
+    #[case::bare_file_without_the_word(&["req.txt"], "unknown option \"req.txt\"")]
+    #[case::client_without_the_word(&["--client", "127.0.0.1"], "--client can only be used with test-request")]
+    #[case::client_with_start(&["start", "--client=127.0.0.1"], "--client can only be used with test-request")]
+    #[case::client_without_address(&["test-request", "req.txt", "--client"], "--client needs an address")]
+    #[case::client_not_an_address(&["test-request", "req.txt", "--client", "example.com"], "invalid address \"example.com\" for --client")]
+    fn test_request_rejects_combinations_and_bad_operands(
+        #[case] input: &[&str],
+        #[case] message: &str,
+    ) {
+        assert_eq!(parse_args(&args(input)), Err(message.to_owned()));
     }
 
     #[rstest]

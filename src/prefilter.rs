@@ -173,10 +173,18 @@ pub(crate) fn screen(site: &SiteConfig, input: &RuleInput<'_>, body_is_empty: bo
 ///
 /// Any view matching is a denial, so an interpretation the upstream may use cannot escape it.
 pub(crate) fn denied(site: &SiteConfig, views: &[String]) -> bool {
-    site.deny_paths.iter().any(|denied| {
-        let prefix = denied.to_lowercase();
-        views.iter().any(|view| view.starts_with(prefix.as_str()))
-    })
+    denied_by(site, views).is_some()
+}
+
+/// Returns the first `deny_path` entry, as configured, that is a prefix of any view. Views must be lowercase.
+pub(crate) fn denied_by<'a>(site: &'a SiteConfig, views: &[String]) -> Option<&'a str> {
+    site.deny_paths
+        .iter()
+        .find(|denied| {
+            let prefix = denied.to_lowercase();
+            views.iter().any(|view| view.starts_with(prefix.as_str()))
+        })
+        .map(String::as_str)
 }
 
 /// Returns true when a `fail_closed_path` entry is a prefix of any view. Views must be lowercase.

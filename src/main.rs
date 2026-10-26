@@ -5,7 +5,8 @@ mod lifecycle;
 mod pidfile;
 
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -59,6 +60,9 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Test { dump } => Ok(test_configuration(&resolve_config(config), dump)),
+        Command::TestRequest { file, client } => {
+            Ok(test_request(&resolve_config(config), &file, client))
+        }
         Command::Start => lifecycle::start(&resolve_config(config)),
         Command::Stop => lifecycle::stop(&resolve_config(config)),
         Command::Restart => lifecycle::restart(&resolve_config(config)),
@@ -116,6 +120,51 @@ fn test_configuration(path: &Path, dump: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs `test-request`: reads the raw request from `file` (or stdin for `-`), checks it
+/// against the configuration, and prints the report to stdout. Errors go to stderr, exit 1.
+fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
+    let mut stderr = std::io::stderr();
+    let raw = match read_request(file) {
+        Ok(raw) => raw,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "vigilant-heron: cannot read the request file {}: {error}",
+                file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    match vigilant_heron::check_request(config, &raw, client) {
+        Ok(check) => {
+            let report = check.to_string();
+            let mut stdout = std::io::stdout();
+            if stdout
+                .write_all(report.as_bytes())
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "vigilant-heron: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reads a request file whole, or standard input for `-`.
+fn read_request(file: &Path) -> std::io::Result<Vec<u8>> {
+    if file == Path::new("-") {
+        let mut raw = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut raw)?;
+        return Ok(raw);
+    }
+    std::fs::read(file)
 }
 
 /// Builds the multi-thread runtime. Without `worker_threads`, tokio uses one worker per CPU core.
