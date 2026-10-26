@@ -53,23 +53,30 @@ publish = false
 workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
-bytes = "1.12.1"
-form_urlencoded = "1.2.2"
-http = "1.5.0"
-http-body-util = "0.1.5"
-hyper = { version = "1.12.0", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1"] }
-percent-encoding = "2.3.2"
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
-toml = "1.1.8"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
+anyhow = "=1.0.104"
+bytes = "=1.12.1"
+form_urlencoded = "=1.2.2"
+http = "=1.5.0"
+http-body = "=1.1.0"
+http-body-util = "=0.1.5"
+hyper = { version = "=1.12.0", features = ["http1", "server", "client"] }
+hyper-rustls = { version = "=0.27.10", default-features = false, features = ["ring", "tls12", "http1", "logging", "native-tokio"] }
+hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1"] }
+percent-encoding = "=2.3.2"
+regex = "=1.13.1"
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "=0.8.5"
+rustix = { version = "=1.1.5", default-features = false, features = ["std", "process", "fs"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+thiserror = "=2.0.21"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs", "io-std"] }
+tower-service = "=0.3.3"
+
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
 
 [dev-dependencies]
-proptest = "1.12.0"
-rstest = "0.28.0"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
+proptest = "=1.12.0"
+rstest = "=0.28.0"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }

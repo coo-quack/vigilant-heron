@@ -18,3 +18,29 @@ Thumbs.db
 *.local
 .env
 .env.*
+
+# coverage
+*.profraw
+*.profdata
+lcov.info
+/coverage/
+tarpaulin-report.*
+
+# tooling
+/.playwright-cli/
+/CLAUDE-SECURITY-*/
+
+# local e2e overrides (never committed)
+e2e/*.local.toml
+
+# Cargo.lock and proptest-regressions/ are committed on purpose: the lock file
+# pins builds, and proptest records failing seeds there so they are replayed.
+
+# evaluation output (eval/run.py)
+eval/results/
+__pycache__/
+
+# documentation site (docs/)
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/

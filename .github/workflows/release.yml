@@ -1,0 +1,163 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build both platforms without pushing the image, tagging or creating a release"
+        type: boolean
+        default: true
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.check.outputs.version }}
+      dry_run: ${{ steps.check.outputs.dry_run }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "vigilant-heron") | .version')
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "could not read the vigilant-heron version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "$DRY_RUN_INPUT" = "true" ]; then
+            echo "dry_run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            # A real release publishes the image and tags; only main may do that.
+            echo "a release that publishes runs only from main, not $GITHUB_REF" >&2
+            exit 1
+          else
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+          fi
+          if git ls-remote --tags origin "v$VERSION" | grep -q "v$VERSION"; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Tests and the advisory check (the same tools and steps as the ci.yml audit
+  # job) run without write access, and the checkout keeps no credential.
+  verify:
+    needs: check
+    # A dry run always verifies. A real run verifies only when the version tag is new.
+    if: needs.check.outputs.dry_run == 'true' || needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Keep in step with ci.yml.
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}
+      - run: command -v cargo-deny || cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - run: cargo deny --locked check
+      # The documentation site's dependencies (docs/, package.json). pnpm comes
+      # from corepack, which reads the packageManager field.
+      - run: corepack enable pnpm
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.1'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
+
+  # Publishes the image, tag and release. The checkout keeps no credential, so
+  # the token below is not left in .git/config.
+  publish:
+    needs: [check, verify]
+    # A dry run always builds. A real run builds only when the version tag is new.
+    if: needs.check.outputs.dry_run == 'true' || needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: runtime
+          push: ${{ needs.check.outputs.dry_run != 'true' }}
+          tags: |
+            ghcr.io/coo-quack/vigilant-heron:latest
+            ghcr.io/coo-quack/vigilant-heron:${{ needs.check.outputs.version }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=release-docker-cache
+          cache-to: type=gha,mode=max,scope=release-docker-cache
+
+      - name: Create git tag
+        if: needs.check.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: v${{ needs.check.outputs.version }}
+        run: |
+          if git ls-remote --tags origin "$VERSION" | grep -q "$VERSION"; then
+            echo "Tag $VERSION already exists, skipping"
+          else
+            gh api "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/$VERSION" \
+              -f sha="$GITHUB_SHA"
+          fi
+
+      - name: Extract changelog
+        id: changelog
+        run: |
+          VERSION="${{ needs.check.outputs.version }}"
+          NOTES=$(awk "/^## v${VERSION}/{found=1; next} found && /^## v/{exit} found{print}" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="Release v${VERSION}"
+          fi
+          echo "$NOTES" > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Create GitHub Release
+        if: needs.check.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="v${{ needs.check.outputs.version }}"
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists, skipping"
+          else
+            gh release create "$VERSION" \
+              --title "$VERSION" \
+              --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi

@@ -1,4 +1,17 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["github>coo-quack/renovate-config"]
+  "extends": ["github>coo-quack/renovate-config"],
+  "packageRules": [
+    {
+      "description": "The rust image in the Dockerfile and the toolchain pinned in rust-toolchain.toml move in one PR",
+      "groupName": "Rust toolchain",
+      "matchManagers": ["rust-toolchain"]
+    },
+    {
+      "description": "The rust image in the Dockerfile and the toolchain pinned in rust-toolchain.toml move in one PR",
+      "groupName": "Rust toolchain",
+      "matchManagers": ["dockerfile"],
+      "matchPackageNames": ["rust"]
+    }
+  ]
 }

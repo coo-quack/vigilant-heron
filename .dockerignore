@@ -3,3 +3,5 @@ target/
 .github/
 .worktrees/
 *.md
+node_modules/
+docs/

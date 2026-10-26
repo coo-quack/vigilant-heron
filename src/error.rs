@@ -3,10 +3,13 @@
 use http::StatusCode;
 
 /// Errors found while loading or validating a configuration.
+///
+/// Every error that comes from the file names the file and the line, so the
+/// message reads `file:line: problem`.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// The configuration file could not be read.
-    #[error("cannot read config file {}: {source}", path.display())]
+    /// A configuration file could not be read.
+    #[error("cannot read configuration file {}: {source}", path.display())]
     Read {
         /// Path that was read.
         path: std::path::PathBuf,
@@ -14,100 +17,44 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// The text is not valid TOML or does not match the expected shape.
-    #[error("config is not valid TOML for this schema: {0}")]
-    Parse(#[from] toml::de::Error),
-    /// No `[[sites]]` table was given.
-    #[error("config must declare at least one [[sites]] table")]
-    NoSites,
-    /// A site has an empty `hosts` list.
-    #[error("sites[{site}] has no hosts")]
-    EmptyHosts {
-        /// Zero-based index into `sites`.
-        site: usize,
+    /// The text is not valid configuration syntax.
+    #[error("{file}:{line}: {message}")]
+    Syntax {
+        /// File the text came from, as named by the user.
+        file: String,
+        /// One-based line number.
+        line: usize,
+        /// What is wrong.
+        message: String,
     },
-    /// A site lists a host that normalizes to nothing.
-    #[error("sites[{site}] has an invalid host {value:?}")]
-    InvalidHost {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Host exactly as written in the config.
-        value: String,
+    /// An `include` names a missing file, is nested too deeply, or forms a cycle.
+    #[error("{file}:{line}: {message}")]
+    Include {
+        /// File that holds the `include` directive.
+        file: String,
+        /// One-based line number of the directive.
+        line: usize,
+        /// What is wrong.
+        message: String,
     },
-    /// The same normalized host appears twice.
-    #[error("host {host:?} is listed more than once")]
-    DuplicateHost {
-        /// Normalized host name.
-        host: String,
+    /// A directive has a value or context the configuration does not allow.
+    #[error("{file}:{line}: {message}")]
+    Invalid {
+        /// File that holds the directive.
+        file: String,
+        /// One-based line number of the directive.
+        line: usize,
+        /// What is wrong, naming the directive.
+        message: String,
     },
-    /// A threshold is outside `0..=1` or is NaN.
-    #[error("sites[{site}].{name} must be between 0 and 1, got {value}")]
-    ThresholdOutOfRange {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Name of the threshold key.
-        name: &'static str,
-        /// Value that was rejected.
-        value: f64,
-    },
-    /// `action = "redirect"` without `redirect_to`.
-    #[error("sites[{site}] uses action = \"redirect\" and needs redirect_to")]
-    MissingRedirectTo {
-        /// Zero-based index into `sites`.
-        site: usize,
-    },
-    /// `redirect_to` given together with `action = "block"`.
-    #[error("sites[{site}] sets redirect_to but action is \"block\"")]
-    UnexpectedRedirectTo {
-        /// Zero-based index into `sites`.
-        site: usize,
-    },
-    /// `redirect_to` cannot be sent as a `Location` header value.
-    #[error("sites[{site}].redirect_to is not a valid header value: {value:?}")]
-    InvalidRedirectTo {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Value that was rejected.
-        value: String,
-    },
-    /// An upstream is not an absolute `http://` URI.
-    #[error("sites[{site}].upstream must be an absolute http:// URI, got {value:?}")]
-    InvalidUpstream {
-        /// Zero-based index into `sites`.
-        site: usize,
-        /// Value that was rejected.
-        value: String,
-    },
-    /// `decision.url` is not an absolute `http://` URI.
-    #[error("decision.url must be an absolute http:// URI, got {value:?}")]
-    InvalidDecisionUrl {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// `client_ip_header` is not a valid header name.
-    #[error("client_ip_header is not a valid header name: {value:?}")]
-    InvalidClientIpHeader {
-        /// Value that was rejected.
-        value: String,
-    },
-    /// `decision.timeout_ms` is zero.
-    #[error("decision.timeout_ms must be greater than 0")]
-    ZeroTimeout,
-    /// `decision.inspect_body_bytes` is larger than `decision.max_body_bytes`.
-    #[error(
-        "decision.inspect_body_bytes ({inspect}) must not exceed decision.max_body_bytes ({max})"
-    )]
-    InspectExceedsMax {
-        /// Configured inspection size.
-        inspect: usize,
-        /// Configured body size limit.
-        max: usize,
-    },
-    /// `default.status` is not a 4xx or 5xx code.
-    #[error("default.status must be a 4xx or 5xx code, got {status}")]
-    InvalidDefaultStatus {
-        /// Status that was rejected.
-        status: u16,
+    /// The `error_log` file cannot be opened.
+    #[error("cannot open error log {destination}: {source}")]
+    ErrorLog {
+        /// The destination that could not be opened, as the file names it.
+        destination: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -117,6 +64,9 @@ pub enum ServeError {
     /// The listener failed to accept a connection.
     #[error("accepting a connection failed")]
     Accept(#[source] std::io::Error),
+    /// The TLS client for the decision backend could not be set up.
+    #[error("TLS setup for the decision backend failed")]
+    Tls(#[source] rustls::Error),
 }
 
 /// A value that is not a probability.
@@ -133,6 +83,15 @@ pub(crate) enum DecisionError {
     /// The backend did not answer in time.
     #[error("decision backend did not answer within the timeout")]
     Timeout,
+    /// No local concurrency slot became free within the timeout.
+    #[error("no decision slot became free within the timeout")]
+    Busy,
+    /// The backend answered HTTP 429. `Retry-After` is kept for the log only.
+    #[error("decision backend rate-limited the request")]
+    RateLimited {
+        /// Raw `Retry-After` header, when the backend sent one.
+        retry_after: Option<String>,
+    },
     /// The HTTP exchange failed before a response arrived.
     #[error("decision backend request failed")]
     Transport(#[source] hyper_util::client::legacy::Error),
@@ -151,15 +110,64 @@ pub(crate) enum DecisionError {
     /// A returned score is not a probability.
     #[error(transparent)]
     Probability(#[from] ProbabilityError),
+    /// The backend reported `success: false`.
+    #[error("decision backend reported success = false")]
+    Rejected,
+    /// The response has no answer with this id.
+    #[error("decision backend returned no answer for {id}")]
+    MissingAnswer {
+        /// Question id that was expected.
+        id: &'static str,
+    },
+    /// An answer has a different type than its question.
+    #[error("decision backend returned the wrong answer type for {id}")]
+    AnswerType {
+        /// Question id whose answer was malformed.
+        id: &'static str,
+    },
 }
 
-/// Why an upstream request could not be sent.
+impl DecisionError {
+    /// Returns the specific cause written to the decision log.
+    pub(crate) fn cause(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Busy => "backend_busy",
+            Self::RateLimited { .. } => "rate_limited",
+            Self::Transport(_) => "connection",
+            Self::Status(_) => "http_status",
+            Self::Body(_) => "body",
+            Self::Json(_) => "parse",
+            Self::Request(_) => "request",
+            Self::Probability(_) => "invalid_score",
+            Self::Rejected => "rejected",
+            Self::MissingAnswer { .. } | Self::AnswerType { .. } => "invalid_response",
+        }
+    }
+}
+
+/// Why an upstream request could not be sent or answered.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProxyError {
     /// The request target built from the upstream is not a valid URI.
     #[error("upstream request target is invalid")]
     Target(#[from] http::uri::InvalidUri),
-    /// The upstream could not be reached or did not answer.
+    /// No response head arrived within `proxy_read_timeout`.
+    #[error("upstream did not answer within proxy_read_timeout")]
+    ReadTimeout,
+    /// The connection to the upstream was not made within `proxy_connect_timeout`.
+    #[error("upstream connection timed out within proxy_connect_timeout")]
+    ConnectTimeout,
+    /// The connection to the upstream failed.
+    #[error("upstream connection failed")]
+    Connect(#[source] hyper_util::client::legacy::Error),
+    /// The upstream stopped accepting the request within `proxy_send_timeout`.
+    #[error("upstream write timed out within proxy_send_timeout")]
+    SendTimeout(#[source] hyper_util::client::legacy::Error),
+    /// The request failed after the connection was made.
     #[error("upstream request failed")]
     Request(#[source] hyper_util::client::legacy::Error),
+    /// The client's request body could not be forwarded in full.
+    #[error("client request body could not be forwarded")]
+    Body(crate::body::BodyFault),
 }
