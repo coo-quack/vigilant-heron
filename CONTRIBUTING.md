@@ -24,6 +24,7 @@ bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
 pnpm run dup                                               # duplication job
+cargo bench --bench hot_path                              # benchmarks (bench job runs them once with -- --test)
 docker buildx build --target binaries --platform linux/amd64,linux/arm64 \
   --output type=local,dest=dist .                         # release-build job; then, on Linux:
 bash scripts/check-release-binaries.sh dist "$(cargo pkgid | sed 's/.*[#@]//')"
@@ -87,6 +88,28 @@ cargo mutants --file src/skip_suggest.rs
 A full run takes hours, so run it for the file you are changing. Its output is
 written to `mutants.out/`, and the lines in `missed.txt` tell you which change
 the tests did not catch.
+
+## Benchmarks
+
+`benches/hot_path.rs` measures the request hot path through the public API:
+`check_request_with` for four kinds of request (a plain page, a page a skip rule
+forwards, a long request that goes through every built-in rule, and a request a
+built-in rule blocks) against a configuration loaded once, `suggest_skip_rules`
+over 10,000 access log lines, and loading the sample configuration.
+
+Timings on a laptop or a shared runner are noisy, so compare runs on the same
+machine. Save a baseline before a change, then compare after it:
+
+```bash
+cargo bench --bench hot_path -- --save-baseline before
+# make the change
+cargo bench --bench hot_path -- --baseline before
+```
+
+The `bench` CI job only runs the benchmarks once to check that they build and
+run. The `Bench` workflow (`.github/workflows/bench.yml`) runs them every Sunday
+at 18:43 UTC and uploads `target/criterion` as the `criterion-<run_id>`
+artifact, kept for 90 days, so results can be compared week to week.
 
 ## Branching Strategy
 
