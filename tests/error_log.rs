@@ -218,3 +218,113 @@ fn a_reload_that_changes_a_restart_setting_warns_that_it_needs_a_restart() -> Te
     )?;
     Ok(())
 }
+
+/// A configuration for the restart warnings: `listen` and `extra` at the top level, and the error log at `log`.
+fn restart_config(log: &Path, listen: &str, extra: &str) -> String {
+    format!(
+        "listen {listen};\n{extra}\ndecision {{\n    backend http;\n    url http://127.0.0.1:9/decide;\n}}\nerror_log {} info;\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n",
+        log.display()
+    )
+}
+
+/// Starts with `first`, reloads with `second`, and waits for the warning `message` in the error log.
+fn reload_warns(
+    name: &str,
+    first: &dyn Fn(&Path) -> String,
+    second: &dyn Fn(&Path) -> String,
+    message: &str,
+) -> TestResult {
+    let dir = test_dir(name)?;
+    let log = dir.join("error.log");
+    let server = Server::start(&dir, &first(&log))?;
+    wait_for(&log, "vigilant-heron is listening")?;
+
+    server.write_config(&second(&log))?;
+    server.reload()?;
+    wait_for(&log, message)?;
+    Ok(())
+}
+
+#[test]
+fn a_reload_that_changes_the_listen_address_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-listen",
+        &|log| restart_config(log, "127.0.0.1:0", ""),
+        &|log| restart_config(log, "127.0.0.2:0", ""),
+        "listen changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_the_pid_file_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-pid",
+        &|log| {
+            restart_config(
+                log,
+                "127.0.0.1:0",
+                &format!("pid {};", log.with_file_name("first.pid").display()),
+            )
+        },
+        &|log| {
+            restart_config(
+                log,
+                "127.0.0.1:0",
+                &format!("pid {};", log.with_file_name("second.pid").display()),
+            )
+        },
+        "pid changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_worker_threads_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-workers",
+        &|log| restart_config(log, "127.0.0.1:0", "worker_threads 1;"),
+        &|log| restart_config(log, "127.0.0.1:0", "worker_threads 2;"),
+        "worker_threads changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_worker_shutdown_timeout_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-shutdown",
+        &|log| restart_config(log, "127.0.0.1:0", "worker_shutdown_timeout 5s;"),
+        &|log| restart_config(log, "127.0.0.1:0", "worker_shutdown_timeout 6s;"),
+        "worker_shutdown_timeout changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_a_connection_timer_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-timers",
+        &|log| restart_config(log, "127.0.0.1:0", "client_header_timeout 2s;"),
+        &|log| restart_config(log, "127.0.0.1:0", "client_header_timeout 3s;"),
+        "connection timers and header limits changed; a restart is needed for them to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_no_restart_setting_warns_about_none() -> TestResult {
+    let dir = test_dir("restart-none")?;
+    let log = dir.join("error.log");
+    let text = restart_config(
+        &log,
+        "127.0.0.1:0",
+        &format!(
+            "pid {};\nworker_threads 1;\nworker_shutdown_timeout 5s;\nmax_connections 10;\nclient_header_timeout 2s;",
+            dir.join("restart-none.pid").display()
+        ),
+    );
+    let server = Server::start(&dir, &text)?;
+    wait_for(&log, "vigilant-heron is listening")?;
+
+    server.write_config(&text)?;
+    server.reload()?;
+    wait_for(&log, "configuration reloaded")?;
+    assert!(!read(&log).contains("restart is needed"), "{}", read(&log));
+    Ok(())
+}

@@ -455,3 +455,81 @@ async fn proxy_websocket_in_a_location_tunnels_only_that_location() -> TestResul
     assert!(other_head.starts_with("HTTP/1.1 200"), "{other_head}");
     proxy.stop().await
 }
+
+/// Reads one HTTP/1.1 response with a Content-Length body and returns its head.
+async fn read_one_response(stream: &mut TcpStream) -> Result<String, std::io::Error> {
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    while !raw.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).await? == 0 {
+            break;
+        }
+        raw.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&raw).into_owned();
+    let length = head
+        .lines()
+        .find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.strip_prefix("content-length: ").map(str::to_owned)
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body).await?;
+    Ok(head)
+}
+
+#[tokio::test]
+async fn an_upgrade_the_upstream_answers_with_200_keeps_the_connection_for_ordinary_requests()
+-> TestResult {
+    // The upstream does not switch protocols, so the connection stays an ordinary keep-alive one.
+    let upstream = common::Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream.addr,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+
+    let mut stream = TcpStream::connect(proxy.addr).await?;
+    stream
+        .write_all(b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        .await?;
+    let first = read_one_response(&mut stream).await?;
+    assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+
+    stream
+        .write_all(b"GET /again HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await?;
+    let second = read_one_response(&mut stream).await?;
+    assert!(second.starts_with("HTTP/1.1 200"), "{second}");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_upgrade_answered_with_200_loses_its_hop_by_hop_headers() -> TestResult {
+    // The upstream answers 200 with a hop-by-hop header. The proxy does not tunnel the answer, so it removes the header.
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let _task = common::spawn_server(listener, |_request: Request<Incoming>| async move {
+        let mut response = common::json_response(StatusCode::OK, &serde_json::json!({"ok": true}));
+        response
+            .headers_mut()
+            .insert("keep-alive", http::HeaderValue::from_static("timeout=5"));
+        response
+    });
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), addr, "", "proxy_websocket on;")).await?;
+
+    let mut stream = TcpStream::connect(proxy.addr).await?;
+    stream
+        .write_all(b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n")
+        .await?;
+    let head = read_one_response(&mut stream).await?;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(!head.to_ascii_lowercase().contains("keep-alive:"), "{head}");
+    proxy.stop().await
+}
