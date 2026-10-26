@@ -23,6 +23,7 @@ chmod 755 "$TMP"
 cleanup() {
   local status=$?
   docker rm -f "$NOPID_NAME" >/dev/null 2>&1 || true
+  docker image rm -f vigilant-heron:e2e-default >/dev/null 2>&1 || true
   if [ "$status" -ne 0 ]; then
     echo "----- $NOPID_NAME logs (tail) -----" >&2
     docker logs --tail 40 "$NOPID_NAME" >&2 2>&1 || true
@@ -81,6 +82,11 @@ expect_exit 0 docker run --rm "$IMAGE" -v
 require_contains "$TMP/last.out" "vigilant-heron version"
 expect_exit 0 docker run --rm "$IMAGE" -h
 require_contains "$TMP/last.out" "Usage:"
+
+echo "e2e-image: a build without --target is the router"
+expect_exit 0 docker build -q -t vigilant-heron:e2e-default .
+expect_exit 0 docker run --rm vigilant-heron:e2e-default -v
+require_contains "$TMP/last.out" "vigilant-heron version"
 
 echo "e2e-image: -t on the mounted configuration"
 expect_exit 0 docker run --rm -v "$ROUTER_DIR:/etc/vigilant-heron:ro" "$IMAGE" -t

@@ -1,14 +1,31 @@
 # Installation
 
-You can run vigilant-heron as a binary that you build from source, or as a Docker image that you build from the same repository. Both use the same configuration file.
+You can run vigilant-heron as a binary (downloaded from a GitHub Release, or built from source) or as the published Docker image, and all of them use the same configuration file.
 
 ## Requirements
 
-- **Operating system:** Linux or macOS. The `-s` signal command and the background commands need a Unix system.
-- **Rust toolchain** for a binary, or **Docker** for the image. The toolchain version is pinned in `rust-toolchain.toml` as 1.99.1. `rustup` installs it on the first `cargo` call.
+- **Operating system:** The release binaries are for Linux on x86_64 or aarch64 with glibc 2.39 or newer (Ubuntu 24.04, Debian 13, or later). On macOS or an older Linux, build from source. The `-s` signal command and the background commands need a Unix system.
+- **Rust toolchain** only to build from source, and **Docker** only for the image. The toolchain version is pinned in `rust-toolchain.toml` as 1.99.1. `rustup` installs it on the first `cargo` call.
 - **An API key** for the decision model. The default model, Jev, reads its key from the `TYPESAFE_API_KEY` environment variable. The router refuses to start when that variable is unset or blank. See [Decision backends](/decision-backends) for other models.
 - **Outbound HTTPS** from the router to the model's API (`api.typesafe.ai` by default).
 - **Network access** from the router to each `upstream` address.
+
+## Download a release binary
+
+Each release on the [Releases page](https://github.com/coo-quack/vigilant-heron/releases) has an archive per architecture and a `SHA256SUMS` file.
+
+```bash
+ARCH=$(uname -m)   # x86_64 or aarch64
+BASE=https://github.com/coo-quack/vigilant-heron/releases/latest/download
+curl -fsSLO "$BASE/vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz"
+curl -fsSLO "$BASE/SHA256SUMS"
+sha256sum --check --ignore-missing SHA256SUMS
+tar -xzf "vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz"
+sudo install -m 755 "vigilant-heron-$ARCH-unknown-linux-gnu/vigilant-heron" /usr/local/bin/
+vigilant-heron --version
+```
+
+Each archive holds the binary, `LICENSE` and `README.md`. To install a particular version, replace `latest/download` with `download/v0.1.0`, for example.
 
 ## Build from source
 
@@ -29,11 +46,15 @@ cargo install --locked --path .
 
 ## Docker image
 
-No image is published yet, so build it from the Dockerfile in the clone:
+The image is published at `ghcr.io/coo-quack/vigilant-heron` for `linux/amd64` and `linux/arm64`. Each version has its own tag, such as `0.1.0`, and `latest` follows the newest version:
 
 ```bash
-docker build -t vigilant-heron .
+docker pull ghcr.io/coo-quack/vigilant-heron:latest
 ```
+
+In production, use a version tag such as `:0.1.0`, so the image changes only when you change the tag.
+
+To build the image from a clone instead, run `docker build -t vigilant-heron .`, and use `vigilant-heron` in place of `ghcr.io/coo-quack/vigilant-heron:latest` in the commands below.
 
 The image runs as the `nonroot` user on distroless, and its binary is `/usr/local/bin/vigilant-heron`. The configuration must set two things for the container:
 
@@ -62,7 +83,7 @@ The image runs as the `nonroot` user on distroless, and its binary is `/usr/loca
    docker run --rm \
      -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
      -e TYPESAFE_API_KEY \
-     vigilant-heron \
+     ghcr.io/coo-quack/vigilant-heron:latest \
      -t -c /etc/vigilant-heron/vigilant-heron.conf
    ```
 
@@ -72,19 +93,19 @@ The image runs as the `nonroot` user on distroless, and its binary is `/usr/loca
    docker run -d --name vigilant-heron -p 8080:8080 \
      -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
      -e TYPESAFE_API_KEY \
-     vigilant-heron
+     ghcr.io/coo-quack/vigilant-heron:latest
    ```
 
    Without `-c`, the image starts with `/etc/vigilant-heron/vigilant-heron.conf`, so the mount above is all it needs.
 
 ### Docker Compose
 
-Save this as `compose.yaml` next to `vigilant-heron.conf`, after you have built the image with the command above:
+Save this as `compose.yaml` next to `vigilant-heron.conf`:
 
 ```yaml
 services:
   vigilant-heron:
-    image: vigilant-heron
+    image: ghcr.io/coo-quack/vigilant-heron:latest
     ports:
       - "8080:8080"
     volumes:
@@ -218,6 +239,8 @@ A reload keeps connections open. Use `sudo systemctl restart vigilant-heron` onl
 
 ## Updating
 
+- **Release binary:** download the new archive as in [Download a release binary](#download-a-release-binary), check the configuration with the new binary before you install it (`./vigilant-heron-$ARCH-unknown-linux-gnu/vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf`), install it, then restart the router; a reload does not load a new program.
+
 - **From source:** pull the new code, build it, and check the configuration:
 
   ```bash
@@ -228,15 +251,15 @@ A reload keeps connections open. Use `sudo systemctl restart vigilant-heron` onl
 
   Restart the router after you update the binary. A reload reads the configuration again, but it does not load a new program. Settings such as `listen` and `worker_threads` also take effect only at startup, as [Configuration](/configuration#reload-and-log-reopen) lists.
 
-- **Docker:** rebuild the image from the new code, and replace the container:
+- **Docker:** pull the new image, and replace the container:
 
   ```bash
-  docker build -t vigilant-heron .
+  docker pull ghcr.io/coo-quack/vigilant-heron:latest
   docker rm -f vigilant-heron
   docker run -d --name vigilant-heron -p 8080:8080 \
     -v "$PWD/vigilant-heron.conf:/etc/vigilant-heron/vigilant-heron.conf:ro" \
     -e TYPESAFE_API_KEY \
-    vigilant-heron
+    ghcr.io/coo-quack/vigilant-heron:latest
   ```
 
 Read the [Changelog](/changelog) before you update.
@@ -244,12 +267,13 @@ Read the [Changelog](/changelog) before you update.
 ## Uninstall
 
 - **Installed with `cargo install`:** run `cargo uninstall vigilant-heron`.
+- **Release binary:** delete `/usr/local/bin/vigilant-heron`.
 - **Built from source:** delete the clone and the binary you copied.
 - **Docker:** remove the container and the image:
 
   ```bash
   docker rm -f vigilant-heron
-  docker image rm vigilant-heron
+  docker image rm ghcr.io/coo-quack/vigilant-heron:latest
   ```
 
 - **systemd:** run `sudo systemctl disable --now vigilant-heron`, then delete the unit file.
