@@ -25,6 +25,9 @@ cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
 pnpm run dup                                               # duplication job
 cargo bench --bench hot_path                              # benchmarks (bench job runs them once with -- --test)
+docker buildx build --target binaries --platform linux/amd64,linux/arm64 \
+  --output type=local,dest=dist .                         # release-build job; then, on Linux:
+bash scripts/check-release-binaries.sh dist "$(cargo pkgid | sed 's/.*[#@]//')"
 ```
 
 `cargo install --locked cargo-deny cargo-machete cargo-llvm-cov` installs the three
@@ -182,5 +185,5 @@ repository goes public and rulesets can require them.
 ## Pull Requests
 
 - Follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `ci:`, `chore:`)
-- Keep the CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`)
-  unchanged: they are the required status checks registered in coo-quack/iac
+- Keep the CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`,
+  `duplication`, `bench`, `release-build`) unchanged: they are the required status checks registered in coo-quack/iac

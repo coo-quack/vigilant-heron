@@ -94,6 +94,7 @@ scripts/
   e2e.sh         # The whole e2e suite, run by the CI job e2e: binary phase, then the Compose stack
   e2e-cli.sh     # Binary phase: the release binary run as docs/getting-started.md shows
   e2e-image.sh   # Image phase: the Compose-built image with the e2e configuration
+  check-release-binaries.sh # glibc floor and version of the exported release binaries (release.yml and the release-build job)
 eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
@@ -149,6 +150,7 @@ README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents
   limited request never reaches the rules or the backend. In shadow mode they are
   dry runs.
 - Comments and documentation are in English.
-- CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`) are
-  registered as required checks in coo-quack/iac; do not rename them.
+- CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`,
+  `duplication`, `bench`, `release-build`) are registered as required checks in
+  coo-quack/iac; do not rename them.
 - Test expectations are never edited to match what the code happens to do.
