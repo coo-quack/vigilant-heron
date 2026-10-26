@@ -48,7 +48,7 @@ container runtime or systemd watch the process.
 - **`stop`** sends the graceful shutdown that `-s quit` sends, then waits until the
   router has exited. It prints `stopped (pid N)`. The wait is the
   [worker_shutdown_timeout](/configuration#worker_shutdown_timeout) plus 5 seconds,
-  or 30 seconds when that directive is not set. If the router is still running after
+  or 35 seconds (30 seconds plus 5) when that directive is not set. If the router is still running after
   the wait, `stop` exits 1 and says so. It does not kill the process. With no pid
   file, or with a stale one, `stop` prints `not running` and exits 0, as
   `systemctl stop` does.

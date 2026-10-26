@@ -20,7 +20,9 @@ settings.
 A denied client on an `enforce` site gets 403 with reason `access_denied`. The
 body is not read and the backend is not called. The site's `action` does not
 apply, as in nginx. On a `shadow` site the request is forwarded, and the log
-records `would_have=block`. A request whose `Host` matches no site is always 403.
+records `would_have=block`. A request whose `Host` matches no site gets `default_status`
+(421 by default) with reason `unknown_host`. A client that the top-level access list
+denies gets 403 with reason `access_denied` instead.
 
 ```nginx
 site admin.example.com {

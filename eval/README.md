@@ -14,7 +14,7 @@ standard library.
   203.0.113.x addresses.
 - `config.template.toml`: the router configuration. It uses the Clef backend,
   enforce mode, `block_threshold = 0.5`, `debug_headers = true`, and empty
-  `deny_paths`, `fail_closed_paths` and `static_extensions`. An empty
+  `deny_paths`, `fail_closed_path` and `static_extensions`. An empty
   `static_extensions` means no row can skip the backend.
 - `results/`: per-row results and router logs. Git-ignored.
 

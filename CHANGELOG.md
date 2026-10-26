@@ -18,6 +18,21 @@
   for example `x-csrf-token`, `x-xsrf-token`, `x-amz-security-token`,
   `x-access-token` and `x-session-id`. `host`, `user-agent`, `accept`, `referer`,
   `origin`, `x-forwarded-for` and the other headers the model uses are still sent.
+- A configuration reload keeps the decision slots. Calls admitted before a reload
+  still count against `max_concurrency` and `max_concurrency_per_client`, which a
+  reload used to exceed. The slots are reused while their limit is unchanged. A
+  changed limit gets new slots, and calls in flight keep the slots they hold.
+- `start` no longer signals a process it has already reaped when the router exits
+  while starting. The pid of a reaped process can belong to another process.
+- The pid file's temporary file and the startup log are created exclusively. A file
+  planted at those paths, such as a symlink in a shared directory like `/tmp`, is
+  no longer written through.
+- The docs said that a request whose `Host` matches no site is always 403. It gets
+  `default_status` (421 by default) with reason `unknown_host`, unless the top-level
+  access list denies it. The docs now say so. The security notes also used the
+  wrong name `fail_closed_paths`; the directive is `fail_closed_path`.
+- `stop` waits `worker_shutdown_timeout` plus 5 seconds, or 35 seconds when the
+  directive is not set. The docs now give that figure.
 - `start`, `stop` and `restart` run the router in the background on a host. `start`
   checks the file first, refuses when a router already runs, and prints
   `started (pid N)`. `stop` sends the graceful shutdown and waits until the process
@@ -176,7 +191,7 @@
   used the JSON protocol must set `backend = "http"`.
 - Failure settings per site: `on_rate_limit` (HTTP 429 and "no slot in time")
   and `on_decision_error` (everything else), each `"allow"` or `"block"`. The
-  decision log reports `reason` and `decision_error`. `fail_closed_paths` wins
+  decision log reports `reason` and `decision_error`. `fail_closed_path` wins
   over both.
 - Concurrency: `max_connections`, `worker_threads` and `decision.max_concurrency`
   bound client connections, runtime threads and decision-backend calls.
