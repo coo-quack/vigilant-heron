@@ -22,6 +22,7 @@ cargo test --workspace --locked                            # test job
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
+pnpm run dup                                               # duplication job
 ```
 
 `cargo install --locked cargo-deny cargo-machete` installs the two tools.
@@ -39,6 +40,8 @@ cargo machete                                              # deadcode job
   dependencies are caught by `cargo machete`.
 - Every public item has a doc comment; fallible functions document their
   errors under `# Errors`.
+- Duplicated code in `src/` may not grow beyond the `threshold` in
+  `.jscpd.json`. List the clones with `pnpm run dup`.
 - Comments and documentation are written in English.
 
 ## Tests
