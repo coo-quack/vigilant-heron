@@ -89,15 +89,22 @@ When bumping a version, open a PR from `develop` → `main` with:
 
 After merging into `main`, `release.yml` automatically:
 
-- Runs `cargo test --workspace --locked`
+- Runs the tests (`cargo test --workspace --locked`) and the advisory check
+  (`cargo deny` and `pnpm audit`, the same steps as the `audit` CI job) in the
+  `verify` job, which has read-only access and keeps no credential in its
+  checkout
 - Builds and pushes `ghcr.io/coo-quack/vigilant-heron:latest` and
-  `:X.Y.Z` for `linux/amd64` and `linux/arm64`
-- Creates the git tag `vX.Y.Z`
+  `:X.Y.Z` for `linux/amd64` and `linux/arm64` in the `publish` job, which runs
+  only after `verify` passes
+- Creates the git tag `vX.Y.Z` through the GitHub REST API
 - Creates a GitHub Release with the notes from `CHANGELOG.md`
 
+The `publish` job does not run the project's tests or its advisory check, and its
+checkout keeps no credential, so the write token is not left in `.git/config`.
+
 To check the multi-arch build without publishing, run the `Release` workflow by
-hand from `develop` (`dry_run` is `true` by default). It builds both platforms
-and pushes, tags and releases nothing.
+hand from `develop` (`dry_run` is `true` by default). It runs `verify`, builds
+both platforms and pushes, tags and releases nothing.
 
 `backport.yml` opens the `main` → `develop` sync PR after every merge into
 `main`; see the hotfix steps above.
