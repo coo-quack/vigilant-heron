@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 (2026-10-26)
 
 - Fixed: the opt-in virtual patches `vh-cve-2026-9103` (`/api/v1/login/auto_login`)
   and `vh-cve-2026-8481` (`/api/v1/validate/code`) compared the path case-sensitively,
