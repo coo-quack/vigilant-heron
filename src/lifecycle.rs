@@ -328,4 +328,16 @@ mod tests {
         assert!(!done);
         assert_eq!(calls.get(), 1);
     }
+
+    #[test]
+    fn a_pid_file_that_cannot_be_read_is_an_error_not_an_absent_router() -> anyhow::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("vh-live-pid-unreadable-{}", std::process::id()));
+        let path = dir.join("router.pid");
+        std::fs::create_dir_all(&path)?;
+        let result = live_pid(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_err());
+        Ok(())
+    }
 }

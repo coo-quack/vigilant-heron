@@ -1397,3 +1397,24 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn a_syntax_error_in_the_built_in_file_is_reported_at_its_line_and_message() {
+    let error = ConfigError::Syntax {
+        file: "builtin.conf".to_owned(),
+        line: 7,
+        message: "bad token".to_owned(),
+    };
+    assert_eq!(position(error), (7, "bad token".to_owned()));
+}
+
+#[test]
+fn a_read_error_in_the_built_in_file_is_reported_on_line_one() {
+    let error = ConfigError::Read {
+        path: std::path::PathBuf::from("builtin.conf"),
+        source: std::io::Error::other("boom"),
+    };
+    let (line, message) = position(error);
+    assert_eq!(line, 1);
+    assert!(message.contains("boom"), "{message}");
+}

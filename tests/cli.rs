@@ -1904,3 +1904,25 @@ fn test_request_says_a_shadow_site_forwards_what_the_backend_decides() -> Result
     assert!(!stdout.contains("shadow mode: a verdict"), "{stdout}");
     Ok(())
 }
+
+#[test]
+fn start_reports_a_router_that_exited_while_starting_without_waiting_out_the_timeout()
+-> Result<(), std::io::Error> {
+    let fixture = Fixture::new("start-exited")?;
+    let held = TcpListener::bind("127.0.0.1:0")?;
+    let port = held.local_addr()?.port();
+    fixture.write(&router_config(port, &fixture.pid, 9, ""))?;
+    let started = std::time::Instant::now();
+    let output = fixture.lifecycle("start")?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the router exited while starting"),
+        "a router that exits is reported as such, not as a missing pid file: {stderr}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the exit was not noticed until the startup timeout passed"
+    );
+    Ok(())
+}

@@ -565,6 +565,14 @@ mod tests {
         assert_eq!(parse_args(&args(input)), Ok(expected));
     }
 
+    #[rstest]
+    #[case::long_option(&["--bogus"], "unknown option \"--bogus\"")]
+    #[case::short_option(&["-x"], "unknown option \"-x\"")]
+    #[case::option_after_a_command(&["start", "--bogus"], "unknown option \"--bogus\"")]
+    fn a_dashed_word_that_is_no_option_is_refused(#[case] input: &[&str], #[case] message: &str) {
+        assert_eq!(parse_args(&args(input)), Err(message.to_owned()));
+    }
+
     fn test_request(file: &str, client: IpAddr) -> Command {
         Command::TestRequest {
             file: PathBuf::from(file),

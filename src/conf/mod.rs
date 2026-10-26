@@ -327,4 +327,92 @@ mod tests {
             let _ = wildcard_matches(&pattern, &text);
         }
     }
+
+    /// Writes `levels` files, each including the next, and returns the first one's path.
+    fn include_chain(name: &str, levels: usize) -> std::io::Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("vh-chain-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        for level in 0..levels {
+            let text = if level + 1 < levels {
+                format!("include level{}.conf;\n", level + 1)
+            } else {
+                "marker end;\n".to_owned()
+            };
+            fs::write(dir.join(format!("level{level}.conf")), text)?;
+        }
+        Ok(dir.join("level0.conf"))
+    }
+
+    #[test]
+    fn includes_nested_to_the_depth_limit_are_loaded() -> std::io::Result<()> {
+        // Eight include levels below the top file is the most that is allowed.
+        let path = include_chain("depth-allowed", MAX_INCLUDE_DEPTH + 1)?;
+        assert!(load_file(&path).is_ok());
+        assert!(dump_file(&path).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn includes_one_level_past_the_depth_limit_are_refused() -> std::io::Result<()> {
+        let path = include_chain("depth-refused", MAX_INCLUDE_DEPTH + 2)?;
+        let is_depth_error = |error: Option<ConfigError>| {
+            matches!(
+                error,
+                Some(ConfigError::Include { ref message, .. })
+                    if message.contains("nested deeper than 8 levels")
+            )
+        };
+        assert!(is_depth_error(load_file(&path).err()));
+        assert!(is_depth_error(dump_file(&path).err()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_glob_include_names_the_matching_files_in_order() -> std::io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("vh-glob-order-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("b.conf"), "")?;
+        fs::write(dir.join("a.conf"), "")?;
+        fs::write(dir.join("skipped.txt"), "")?;
+        let names = resolve_include(&dir.join("*.conf"), "*.conf").map(|paths| {
+            paths
+                .iter()
+                .filter_map(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(names, Ok(vec!["a.conf".to_owned(), "b.conf".to_owned()]));
+        Ok(())
+    }
+
+    /// The textbook matcher: `*` tries every split, `?` takes one character.
+    fn reference_match(pattern: &[char], text: &[char]) -> bool {
+        match pattern.split_first() {
+            None => text.is_empty(),
+            Some((&'*', rest)) => (0..=text.len())
+                .any(|split| reference_match(rest, text.get(split..).unwrap_or_default())),
+            Some((&'?', rest)) => {
+                !text.is_empty() && reference_match(rest, text.get(1..).unwrap_or_default())
+            }
+            Some((literal, rest)) => {
+                text.first() == Some(literal)
+                    && reference_match(rest, text.get(1..).unwrap_or_default())
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn wildcard_matching_agrees_with_the_reference_matcher(
+            pattern in "[ab*?]{0,8}",
+            text in "[ab]{0,8}",
+        ) {
+            let pattern_chars: Vec<char> = pattern.chars().collect();
+            let text_chars: Vec<char> = text.chars().collect();
+            assert_eq!(
+                wildcard_matches(&pattern, &text),
+                reference_match(&pattern_chars, &text_chars)
+            );
+        }
+    }
 }
