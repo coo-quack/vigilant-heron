@@ -24,6 +24,7 @@ bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
 pnpm run dup                                               # duplication job
+cargo mutants --in-diff pr.diff                            # mutants-diff job (see Mutation testing)
 cargo bench --bench hot_path                              # benchmarks (bench job runs them once with -- --test)
 docker buildx build --target binaries --platform linux/amd64,linux/arm64 \
   --output type=local,dest=dist .                         # release-build job; then, on Linux:
@@ -79,13 +80,23 @@ it opens or updates the issue "Weekly mutation testing: findings". When a later
 run is clean, it closes that issue. The full output is in the `mutants-*`
 artifacts of the run. The settings are in `.cargo/mutants.toml`.
 
-To run it on one file locally:
+Every PR also runs the `mutants-diff` job, which mutates only the lines the PR
+changes (`cargo mutants --in-diff`). It fails when a test misses one of those
+mutants, and the job summary lists them. A PR that changes no Rust code passes at
+once. To run the same check before you push:
+
+```bash
+git diff origin/develop...HEAD > pr.diff
+cargo mutants --in-diff pr.diff
+```
+
+To run it on one file:
 
 ```bash
 cargo mutants --file src/skip_suggest.rs
 ```
 
-A full run takes hours, so run it for the file you are changing. Its output is
+A full run takes hours, so run it for the code you are changing. Its output is
 written to `mutants.out/`, and the lines in `missed.txt` tell you which change
 the tests did not catch.
 
