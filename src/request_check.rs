@@ -92,8 +92,23 @@ pub fn check_request(
     client: IpAddr,
 ) -> Result<RequestCheck, CheckError> {
     let config = Config::load(config_path)?;
+    check_request_with(&config, raw, client)
+}
+
+/// Checks the request in `raw` against an already loaded `config`, for a client at
+/// `client`. [`check_request`] loads the configuration and calls this; a caller that
+/// checks many requests loads the configuration once.
+///
+/// # Errors
+///
+/// Returns [`CheckError::Request`] when `raw` is not a raw HTTP/1.1 request.
+pub fn check_request_with(
+    config: &Config,
+    raw: &[u8],
+    client: IpAddr,
+) -> Result<RequestCheck, CheckError> {
     let request = parse_request(raw)?;
-    Ok(report(&config, &request, client))
+    Ok(report(config, &request, client))
 }
 
 /// A request read from a file: the request line, the headers and the body.

@@ -44,3 +44,10 @@ __pycache__/
 node_modules/
 docs/.vitepress/cache/
 docs/.vitepress/dist/
+
+# cargo mutants output
+mutants.out/
+mutants.out.old/
+
+# release binaries exported by docker buildx (see CONTRIBUTING.md)
+dist/

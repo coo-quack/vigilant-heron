@@ -46,7 +46,7 @@ pub use config::{
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
-pub use request_check::{CheckError, Outcome, RequestCheck, check_request};
+pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_request_with};
 pub use server::{serve, serve_reloadable};
 pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
 pub use system_one::{ApiToken, ClefModel};
