@@ -24,12 +24,15 @@ struct Setup {
     decide_url: String,
     upstream_url: String,
     on_rate_limit: &'static str,
+    on_client_busy: &'static str,
     on_decision_error: &'static str,
     redirect: bool,
+    /// `enforce` or `shadow`.
+    mode: &'static str,
     max_concurrency: usize,
     queue_timeout_ms: u64,
     timeout_ms: u64,
-    /// When false, the configuration omits the two failure directives and uses their defaults.
+    /// When false, the configuration omits the failure directives and uses their defaults.
     explicit_failures: bool,
     /// Per-client cap on decision calls, when set.
     per_client: Option<usize>,
@@ -43,8 +46,10 @@ impl Setup {
             decide_url,
             upstream_url,
             on_rate_limit: "allow",
+            on_client_busy: "block",
             on_decision_error: "allow",
             redirect: false,
+            mode: "enforce",
             max_concurrency: 64,
             queue_timeout_ms: 0,
             timeout_ms: 2000,
@@ -89,7 +94,7 @@ default_status 421;
 
 site example.com {{
     upstream "{upstream}";
-    mode enforce;
+    mode {mode};
     {action}
     block_threshold 0.9;
     instruction_threshold 0.5;
@@ -105,10 +110,11 @@ site example.com {{
             access = access,
             queue = self.queue_timeout_ms,
             upstream = self.upstream_url,
+            mode = self.mode,
             failure_lines = if self.explicit_failures {
                 format!(
-                    "on_rate_limit {};\n    on_decision_error {};",
-                    self.on_rate_limit, self.on_decision_error
+                    "on_rate_limit {};\n    on_client_busy {};\n    on_decision_error {};",
+                    self.on_rate_limit, self.on_client_busy, self.on_decision_error
                 )
             } else {
                 String::new()
@@ -309,11 +315,20 @@ async fn saturated_request_is_a_rate_limit_and_follows_on_rate_limit(
     let proxy = start_proxy_config(setup.config()?).await?;
     let base = proxy.base();
 
-    // The holder takes the only slot and is answered only after the timeout.
+    // The holder takes the only slot and is answered only after the timeout. The two come
+    // from different clients, so the queued request is a backend_busy and not a client_busy.
     let holder_base = base.clone();
-    let holder = tokio::spawn(async move { get(&holder_base, "/articles/slowanswer").await });
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "saturated-holder",
+        )
+        .await
+    });
     wait_until_backend_busy(&fake).await?;
-    let queued = get(&base, "/articles/queued").await?;
+    let queued = get_as(&base, "/articles/queued", "203.0.113.2", "saturated-queued").await?;
     let holder = holder.await??;
 
     assert_eq!(
@@ -341,10 +356,19 @@ async fn saturated_backend_allows_an_ordinary_path_by_default() -> TestResult {
     let proxy = start_proxy_config(setup.config()?).await?;
     let base = proxy.base();
 
+    // Different clients, so the queued request is a backend_busy and not a client_busy.
     let holder_base = base.clone();
-    let holder = tokio::spawn(async move { get(&holder_base, "/articles/slowanswer").await });
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "default-holder",
+        )
+        .await
+    });
     wait_until_backend_busy(&fake).await?;
-    let queued = get(&base, "/articles/queued").await?;
+    let queued = get_as(&base, "/articles/queued", "203.0.113.2", "default-queued").await?;
     holder.await??;
 
     assert_eq!(
@@ -448,19 +472,24 @@ async fn wait_for_access_line(
 }
 
 /// One client holds its per-client share of the backend while it floods; another client
-/// must still be judged by the model, and the flooder's excess must follow `on_rate_limit`.
+/// must still be judged by the model, and the flooder's excess must follow `on_client_busy`
+/// and not `on_rate_limit`.
 #[rstest]
-#[case::allow_excess("allow", 200)]
-#[case::block_excess("block", 403)]
+// on_client_busy, on_rate_limit, expected status of the excess, reason of the excess
+#[case::busy_block_rate_allow("block", "allow", 429, "client_busy_blocked")]
+#[case::busy_allow_rate_block("allow", "block", 200, "client_busy_allowed")]
+#[case::busy_block_rate_block("block", "block", 429, "client_busy_blocked")]
 #[tokio::test]
 async fn one_client_flooding_cannot_push_another_client_into_busy(
+    #[case] on_client_busy: &'static str,
     #[case] on_rate_limit: &'static str,
     #[case] excess_expected: u16,
+    #[case] excess_reason: &'static str,
 ) -> TestResult {
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
     let log = std::env::temp_dir().join(format!(
-        "vh-failures-client-{}-{on_rate_limit}.log",
+        "vh-failures-client-{}-{on_client_busy}-{on_rate_limit}.log",
         std::process::id()
     ));
     let _ = std::fs::remove_file(&log);
@@ -469,6 +498,7 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
     setup.max_concurrency = 4;
     setup.per_client = Some(1);
     setup.timeout_ms = 1000;
+    setup.on_client_busy = on_client_busy;
     setup.on_rate_limit = on_rate_limit;
     setup.on_decision_error = "allow";
     setup.log = Some(log.clone());
@@ -499,10 +529,11 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
     assert_eq!(
         excess.status.as_u16(),
         excess_expected,
-        "the excess follows on_rate_limit"
+        "the excess follows on_client_busy"
     );
     let excess_line = wait_for_access_line(&log, "flood-excess").await?;
     assert_eq!(excess_line["decision_error"], "client_busy");
+    assert_eq!(excess_line["reason"], excess_reason);
 
     // Another client is judged by the model while the flooder holds its share.
     let calls_before_other = fake.calls.load(Ordering::SeqCst);
@@ -518,5 +549,139 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
     assert_eq!(other_line["reason"], "below_threshold");
 
     holder.await??;
+    proxy.stop().await
+}
+
+/// Without failure directives, a client over its share is answered 429 and the backend is
+/// not called.
+#[tokio::test]
+async fn client_busy_defaults_to_429_without_calling_the_backend() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.explicit_failures = false;
+    setup.max_concurrency = 4;
+    setup.per_client = Some(1);
+    setup.timeout_ms = 1000;
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "default-holder",
+        )
+        .await
+    });
+    wait_until_backend_busy(&fake).await?;
+    let calls_before = fake.calls.load(Ordering::SeqCst);
+    let excess = get_as(&base, "/articles/normal", "203.0.113.1", "default-excess").await?;
+    holder.await??;
+
+    assert_eq!(excess.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(excess.text().is_empty(), "the 429 has an empty body");
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        calls_before,
+        "the excess of a client over its share does not reach the backend"
+    );
+    proxy.stop().await
+}
+
+/// In shadow mode the excess of a client over its share is forwarded, and the access log
+/// records the 429 as the would-have action.
+#[tokio::test]
+async fn client_busy_in_shadow_mode_forwards_and_records_would_have_429() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let log = std::env::temp_dir().join(format!(
+        "vh-failures-shadow-busy-{}.log",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&log);
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.mode = "shadow";
+    setup.max_concurrency = 4;
+    setup.per_client = Some(1);
+    setup.timeout_ms = 1000;
+    setup.on_client_busy = "block";
+    setup.log = Some(log.clone());
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "shadow-holder",
+        )
+        .await
+    });
+    wait_until_backend_busy(&fake).await?;
+    let excess = get_as(&base, "/articles/normal", "203.0.113.1", "shadow-excess").await?;
+    holder.await??;
+
+    assert_eq!(
+        excess.status,
+        StatusCode::OK,
+        "shadow mode forwards the excess"
+    );
+    let line = wait_for_access_line(&log, "shadow-excess").await?;
+    assert_eq!(line["action"], "allow");
+    assert_eq!(line["would_have"], "reject");
+    assert_eq!(line["reason"], "client_busy_blocked");
+    assert_eq!(line["decision_error"], "client_busy");
+    proxy.stop().await
+}
+
+/// A fail-closed path answers 403 for a client over its share, not the 429 that
+/// `on_client_busy block` gives other paths.
+#[tokio::test]
+async fn fail_closed_path_wins_over_client_busy() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let log = std::env::temp_dir().join(format!(
+        "vh-failures-closed-busy-{}.log",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&log);
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.max_concurrency = 4;
+    setup.per_client = Some(1);
+    setup.timeout_ms = 1000;
+    setup.on_client_busy = "block";
+    setup.log = Some(log.clone());
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "closed-holder",
+        )
+        .await
+    });
+    wait_until_backend_busy(&fake).await?;
+    let excess = get_as(
+        &base,
+        "/wp-login.php/normal",
+        "203.0.113.1",
+        "closed-excess",
+    )
+    .await?;
+    holder.await??;
+
+    assert_eq!(excess.status, StatusCode::FORBIDDEN);
+    let line = wait_for_access_line(&log, "closed-excess").await?;
+    assert_eq!(line["reason"], "fail_closed_path");
+    assert_eq!(line["decision_error"], "client_busy");
     proxy.stop().await
 }

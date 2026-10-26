@@ -18,7 +18,8 @@ pub(crate) enum Action {
     Block,
     /// Respond with 302 and this `Location` value.
     Redirect(HeaderValue),
-    /// Respond with this status, because a limit refused the request. Only seen as a would-have action.
+    /// Respond with this status, because a limit refused the request, such as a client
+    /// over its share of decision calls (429). Shadow mode records it as a would-have action.
     Reject(StatusCode),
 }
 
@@ -55,6 +56,10 @@ pub(crate) enum Reason {
     RateLimitedAllowed,
     /// The backend rate-limited the request and the site blocks it.
     RateLimitedBlocked,
+    /// The client held its share of decision calls and the site allows the excess.
+    ClientBusyAllowed,
+    /// The client held its share of decision calls and the site refuses the excess with 429.
+    ClientBusyBlocked,
     /// The decision failed for another reason and the site allows it.
     DecisionErrorAllowed,
     /// The decision failed for another reason and the site blocks it.
@@ -74,6 +79,8 @@ impl Reason {
             Self::FailClosedPath => "fail_closed_path",
             Self::RateLimitedAllowed => "rate_limited_allowed",
             Self::RateLimitedBlocked => "rate_limited_blocked",
+            Self::ClientBusyAllowed => "client_busy_allowed",
+            Self::ClientBusyBlocked => "client_busy_blocked",
             Self::DecisionErrorAllowed => "decision_error_allowed",
             Self::DecisionErrorBlocked => "decision_error_blocked",
         }
@@ -93,6 +100,9 @@ pub(crate) enum Assessment {
     AccessDenied,
     /// The backend returned a verdict.
     Model(Verdict),
+    /// The client already holds its `max_concurrency_per_client` share of decision calls.
+    /// The backend was not called. Logged as `client_busy`, and governed by `on_client_busy`.
+    ClientBusy,
     /// The backend rate-limited the request, or no local slot was free in time.
     RateLimited {
         /// Specific cause for the log, such as `rate_limited` or `backend_busy`.
@@ -131,9 +141,9 @@ pub(crate) fn decide(site: &SiteConfig, views: &[String], assessment: &Assessmen
             (site_action(site), Reason::Model)
         }
         Assessment::Model(_) => (Action::Allow, Reason::BelowThreshold),
-        Assessment::RateLimited { .. } | Assessment::DecisionFailed { .. } => {
-            failure_outcome(site, views, assessment)
-        }
+        Assessment::RateLimited { .. }
+        | Assessment::ClientBusy
+        | Assessment::DecisionFailed { .. } => failure_outcome(site, views, assessment),
     };
     match site.mode {
         Mode::Enforce => Decision {
@@ -154,19 +164,29 @@ pub(crate) fn decide(site: &SiteConfig, views: &[String], assessment: &Assessmen
 
 /// Decides a request whose backend failed: `fail_closed_paths` always blocks, and
 /// otherwise the setting for the failure group decides.
+///
+/// A client over its share is refused with 429 rather than the site action, whatever
+/// `on_rate_limit` says, so that the two settings can differ.
 fn failure_outcome(
     site: &SiteConfig,
     views: &[String],
     assessment: &Assessment,
 ) -> (Action, Reason) {
-    let rate_limited = matches!(assessment, Assessment::RateLimited { .. });
     if fails_closed(site, views) {
         return (site_action(site), Reason::FailClosedPath);
     }
-    let setting = if rate_limited {
-        site.on_rate_limit
-    } else {
-        site.on_decision_error
+    let (rate_limited, setting) = match assessment {
+        Assessment::ClientBusy => {
+            return match site.on_client_busy {
+                FailureAction::Allow => (Action::Allow, Reason::ClientBusyAllowed),
+                FailureAction::Block => (
+                    Action::Reject(StatusCode::TOO_MANY_REQUESTS),
+                    Reason::ClientBusyBlocked,
+                ),
+            };
+        }
+        Assessment::RateLimited { .. } => (true, site.on_rate_limit),
+        _ => (false, site.on_decision_error),
     };
     match (rate_limited, setting) {
         (true, FailureAction::Allow) => (Action::Allow, Reason::RateLimitedAllowed),
@@ -440,6 +460,105 @@ mod tests {
             decision.would_have.as_ref().map(Action::name),
             expected_would_have
         );
+        Ok(())
+    }
+
+    /// A client over its share: `on_client_busy` decides, and `on_rate_limit` does not.
+    #[rstest]
+    // on_client_busy, on_rate_limit, fail_closed path matched, mode, expected action, reason, would_have
+    #[case::busy_block_enforce(
+        "block",
+        "allow",
+        false,
+        "enforce",
+        "reject",
+        Reason::ClientBusyBlocked,
+        None
+    )]
+    #[case::busy_allow_enforce(
+        "allow",
+        "block",
+        false,
+        "enforce",
+        "allow",
+        Reason::ClientBusyAllowed,
+        None
+    )]
+    #[case::busy_block_closed_enforce(
+        "block",
+        "allow",
+        true,
+        "enforce",
+        "block",
+        Reason::FailClosedPath,
+        None
+    )]
+    #[case::busy_block_shadow(
+        "block",
+        "allow",
+        false,
+        "shadow",
+        "allow",
+        Reason::ClientBusyBlocked,
+        Some("reject")
+    )]
+    #[case::busy_allow_shadow(
+        "allow",
+        "block",
+        false,
+        "shadow",
+        "allow",
+        Reason::ClientBusyAllowed,
+        None
+    )]
+    #[case::busy_block_closed_shadow(
+        "block",
+        "allow",
+        true,
+        "shadow",
+        "allow",
+        Reason::FailClosedPath,
+        Some("block")
+    )]
+    fn client_busy_table(
+        #[case] on_client_busy: &str,
+        #[case] on_rate_limit: &str,
+        #[case] fail_closed: bool,
+        #[case] mode: &str,
+        #[case] expected_action: &str,
+        #[case] expected_reason: Reason,
+        #[case] expected_would_have: Option<&str>,
+    ) -> Result<(), ConfigError> {
+        let config = site(&fields(&[
+            FAIL_CLOSED,
+            &format!("on_client_busy {on_client_busy};"),
+            &format!("on_rate_limit {on_rate_limit};"),
+            &format!("mode {mode};"),
+        ]))?;
+        let path = if fail_closed {
+            "/wp-login.php"
+        } else {
+            "/index.php"
+        };
+        let decision = decide(&config, &views_of(path), &Assessment::ClientBusy);
+        assert_eq!(decision.action.name(), expected_action);
+        assert_eq!(decision.reason, expected_reason);
+        assert_eq!(
+            decision.would_have.as_ref().map(Action::name),
+            expected_would_have
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn client_busy_block_answers_429_by_default() -> Result<(), ConfigError> {
+        let config = site(&fields(&[]))?;
+        let decision = decide(&config, &views_of("/index.php"), &Assessment::ClientBusy);
+        assert_eq!(
+            decision.action,
+            Action::Reject(StatusCode::TOO_MANY_REQUESTS)
+        );
+        assert_eq!(decision.reason, Reason::ClientBusyBlocked);
         Ok(())
     }
 

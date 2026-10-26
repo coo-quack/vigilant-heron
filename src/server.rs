@@ -1107,10 +1107,7 @@ async fn assess<B: DecisionBackend>(
             // A client that holds its share of decision calls is refused without waiting,
             // so its excess is a rate limit for that client alone (`client_busy`).
             let Some(_client_slot) = state.client_slots.take(client) else {
-                return Assessment::RateLimited {
-                    cause: "client_busy",
-                    retry_after: None,
-                };
+                return Assessment::ClientBusy;
             };
             // The event carries the name of the matched site, never the client's Host. The
             // Host the client sent stays in the untrusted headers.
@@ -1223,6 +1220,7 @@ fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
             fields.decision_error = Some(cause);
             fields.retry_after = retry_after.as_deref();
         }
+        Assessment::ClientBusy => fields.decision_error = Some("client_busy"),
         Assessment::DecisionFailed { cause } => fields.decision_error = Some(cause),
         Assessment::Rule | Assessment::Skip | Assessment::SkipRule | Assessment::AccessDenied => {}
     }

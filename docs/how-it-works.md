@@ -81,18 +81,24 @@ for the decision and streams the rest as the upstream reads it.
 
 ## Failure behavior
 
-A decision can fail in two ways, and each has its own site setting. Both default
-to `block` (fail closed).
+A decision can fail in three ways, and each has its own site setting.
 
 - **`on_rate_limit`** covers the backend's HTTP 429 and a request that finds no
-  free concurrency slot within `queue_timeout` (`backend_busy`).
+  free concurrency slot within `queue_timeout` (`backend_busy`). It defaults to
+  `allow`.
+- **`on_client_busy`** covers a client that already holds its
+  `max_concurrency_per_client` share of backend calls (`client_busy`). It defaults
+  to `block`, which answers 429 with an empty body and does not call the backend.
 - **`on_decision_error`** covers timeouts, connection errors, other non-2xx
-  statuses, and answers that cannot be parsed or are out of range.
+  statuses, and answers that cannot be parsed or are out of range. It defaults to
+  `allow`.
 
 Set each to `allow` or `block`. A saturated backend is always in the rate-limit
 group, so `on_decision_error` never applies to it.
 
-Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, and only that client follows `on_client_busy`, so other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, keep `on_client_busy block` and set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
+
+A client over its share can also be a legitimate user. Behind a shared address, such as an office or school NAT, or behind a proxy whose client address is not set up with `real_ip_from`, many users look like one client, and they can get the 429. Raise `max_concurrency_per_client`, or set `on_client_busy allow`, so that the excess skips the model while rules still apply.
 
 Two more rules apply to failures:
 
@@ -101,9 +107,10 @@ Two more rules apply to failures:
 - A rule decision is not affected by any of these settings.
 
 The decision log records the outcome in `reason`, one of `rate_limited_allowed`,
-`rate_limited_blocked`, `decision_error_allowed`, `decision_error_blocked` or
-`fail_closed_path`. The cause is in `decision_error`: `rate_limited`,
-`backend_busy`, `timeout`, `http_status` or `parse`.
+`rate_limited_blocked`, `client_busy_allowed`, `client_busy_blocked`,
+`decision_error_allowed`, `decision_error_blocked` or `fail_closed_path`. The cause
+is in `decision_error`: `rate_limited`, `backend_busy`, `client_busy`, `timeout`,
+`http_status` or `parse`.
 
 ```nginx
 site example.com {
@@ -143,8 +150,12 @@ Only a sanitized copy of the request goes to the decision backend. Before it is
 sent:
 
 - Credential headers are removed. `cookie`, `authorization`,
-  `proxy-authorization`, `x-api-key` and `x-auth-token` are always dropped, and
-  each name in `redact_header` is dropped too.
+  `proxy-authorization`, `x-api-key` and `x-auth-token` are always dropped. So is
+  any other header whose name is sensitive by the same rule as body fields, such
+  as `x-csrf-token`, `x-xsrf-token`, `x-amz-security-token`, `x-access-token` and
+  `x-session-id`, and each name in `redact_header` is dropped too. Headers the
+  model uses to judge a request, such as `host`, `user-agent`, `content-type`,
+  `accept`, `referer`, `origin` and `x-forwarded-for`, are sent.
 - Form and JSON bodies are scanned for sensitive fields. A field is sensitive
   when its name contains one of `password`, `passwd`, `pwd`, `secret`, `token`,
   `apikey`, `card`, `cvv`, `ssn`, `passphrase`, `passcode`, `credential`,
@@ -156,6 +167,10 @@ sent:
   replaced, when its name equals that name, case-insensitively. Text that is
   neither form data nor valid JSON is scanned for `key=value` pairs and
   `"key": value` pairs with the same rules.
+- The query string is scanned by the same name rule. A parameter whose decoded
+  name is sensitive, or is named in `redact_field`, has its value replaced by
+  `[REDACTED]`. The other parameters are sent exactly as the client sent them, in
+  the same order.
 - Only the first `inspect_body` bytes of the body are sent, cut on a UTF-8 boundary.
   `body_truncated` is set when the body was longer.
 

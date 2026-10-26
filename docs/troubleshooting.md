@@ -58,7 +58,7 @@ To test a change without blocking anyone, set `mode shadow;` on the site, reload
 
 ## The decision model is slow or rate-limited
 
-**Cause:** the model answers slowly, rate-limits the router, or is busy with other calls. The `decision_error` field of the log shows which one: `timeout`, `rate_limited`, `backend_busy`, `http_status` or `parse`.
+**Cause:** the model answers slowly, rate-limits the router, or is busy with other calls. The `decision_error` field of the log shows which one: `timeout`, `rate_limited`, `backend_busy`, `client_busy`, `http_status` or `parse`.
 
 **Fix:** these settings are in the `decision` block unless noted.
 
@@ -66,6 +66,7 @@ To test a change without blocking anyone, set `mode shadow;` on the site, reload
 - `queue_timeout` (default 0, no queueing) is how long a call may wait for a free slot. It must not be longer than `timeout`. A request that waits longer gets `backend_busy`.
 - `max_concurrency` (default 64) is the number of model calls in flight at once. Lower it if the model's rate limit is smaller.
 - `on_rate_limit` and `on_decision_error` are per site. Both default to `allow`, so a request that the model cannot judge is forwarded. Set one to `block` if you prefer to refuse such requests. Rules still apply in either case.
+- `on_client_busy` is per site and defaults to `block`. A client that holds more than `max_concurrency_per_client` calls (default 8) gets 429 (`decision_error=client_busy`) without the model. Behind a shared address, such as an office or school NAT, many people look like one client, so raise `max_concurrency_per_client`, or set `on_client_busy allow` to forward the excess without the model. Rules still apply.
 
 ## Client addresses are all the proxy's address
 

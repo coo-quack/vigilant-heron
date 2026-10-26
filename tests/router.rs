@@ -405,6 +405,47 @@ async fn backend_never_receives_credentials_and_sees_the_form_password_redacted(
 }
 
 #[tokio::test]
+async fn backend_receives_the_query_with_sensitive_parameters_redacted() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/search?token=abc123&q=shoes&password=hunter2&lang=ja",
+        "example.com",
+        &[("x-csrf-token", "csrf-secret")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    // The upstream still receives the query as sent.
+    assert_eq!(
+        reply.json()["uri"],
+        "/search?token=abc123&q=shoes&password=hunter2&lang=ja"
+    );
+    let event = stub.last_event().unwrap_or_default();
+    let untrusted = &event["event"]["untrusted"];
+    assert_eq!(
+        untrusted["query"],
+        "token=[REDACTED]&q=shoes&password=[REDACTED]&lang=ja"
+    );
+    let header_names: Vec<&str> = untrusted["headers"]
+        .as_array()
+        .map(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect())
+        .unwrap_or_default();
+    assert!(!header_names.contains(&"x-csrf-token"));
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn backend_meta_host_is_the_configured_site_name_not_the_client_host() -> TestResult {
     let upstream = Upstream::start().await?;
     let stub = StubDecider::start().await?;

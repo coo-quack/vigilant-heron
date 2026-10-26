@@ -85,7 +85,10 @@ hyper's own buffer limit. hyper's limit of 100 header fields is unchanged.
 | `decision` `queue_timeout` | how long a call may wait for one of those slots; no slot in that time is `backend_busy` | 0 (no queueing) |
 
 A call that gets a slot then has the rest of `timeout`. A saturated backend is a
-rate limit, and it follows `on_rate_limit`, not `on_decision_error`.
+rate limit, and it follows `on_rate_limit`, not `on_decision_error`. A client that
+already holds its `decision` `max_concurrency_per_client` share (default 8) is
+refused at once as `client_busy`, which follows `on_client_busy` (default 429),
+not `on_rate_limit`.
 
 The [load measurement](/evaluation) shows the router with the default
 `max_concurrency` and `max_connections`.
