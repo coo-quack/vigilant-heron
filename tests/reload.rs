@@ -454,3 +454,125 @@ async fn a_reload_keeps_the_decision_slots_of_a_call_in_flight() -> TestResult {
     assert_eq!(in_flight.await??.status, StatusCode::OK);
     running.stop().await
 }
+
+/// A configuration with the given decision concurrency limits, and clients told apart by `X-Real-IP`.
+fn concurrency_config(
+    decide_url: &str,
+    upstream: &str,
+    status: u16,
+    total: usize,
+    per_client: usize,
+) -> String {
+    config(decide_url, upstream, status, "on_rate_limit block;")
+        .replace(
+            "inspect_body 512;",
+            &format!(
+                "inspect_body 512;\n    max_concurrency {total};\n    max_concurrency_per_client {per_client};"
+            ),
+        )
+        .replace(
+            "default_status",
+            "real_ip_from 127.0.0.0/8;\nreal_ip_header x-real-ip;\n\ndefault_status",
+        )
+}
+
+#[tokio::test]
+async fn a_reload_that_raises_max_concurrency_lets_another_client_call_the_backend() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decider = GatedDecider::start().await?;
+    let file = temp_file("raise-concurrency.conf")?;
+    write(
+        &file,
+        &concurrency_config(&decider.decide_url(), &upstream.url(), 421, 1, 1),
+    )?;
+    let running = Running::start(&file).await?;
+    let base = running.base.clone();
+    let first = tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/",
+            "example.com",
+            &[("x-real-ip", "203.0.113.1")],
+            Bytes::new(),
+        )
+        .await
+    });
+    wait_for_calls(&decider, 1).await?;
+
+    write(
+        &file,
+        &concurrency_config(&decider.decide_url(), &upstream.url(), 404, 2, 1),
+    )?;
+    running.request_reload().await?;
+    wait_for_status(&running.base, StatusCode::NOT_FOUND).await?;
+    let base = running.base.clone();
+    let second = tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/",
+            "example.com",
+            &[("x-real-ip", "203.0.113.2")],
+            Bytes::new(),
+        )
+        .await
+    });
+    wait_for_calls(&decider, 2).await?;
+
+    decider.release(2);
+    assert_eq!(first.await??.status, StatusCode::OK);
+    assert_eq!(second.await??.status, StatusCode::OK);
+    running.stop().await
+}
+
+#[tokio::test]
+async fn a_reload_that_raises_max_concurrency_per_client_lets_the_same_client_call_again()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let decider = GatedDecider::start().await?;
+    let file = temp_file("raise-per-client.conf")?;
+    write(
+        &file,
+        &concurrency_config(&decider.decide_url(), &upstream.url(), 421, 4, 1),
+    )?;
+    let running = Running::start(&file).await?;
+    let base = running.base.clone();
+    let first = tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/",
+            "example.com",
+            &[("x-real-ip", "203.0.113.1")],
+            Bytes::new(),
+        )
+        .await
+    });
+    wait_for_calls(&decider, 1).await?;
+
+    write(
+        &file,
+        &concurrency_config(&decider.decide_url(), &upstream.url(), 404, 4, 2),
+    )?;
+    running.request_reload().await?;
+    wait_for_status(&running.base, StatusCode::NOT_FOUND).await?;
+    let base = running.base.clone();
+    let second = tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/",
+            "example.com",
+            &[("x-real-ip", "203.0.113.1")],
+            Bytes::new(),
+        )
+        .await
+    });
+    wait_for_calls(&decider, 2).await?;
+
+    decider.release(2);
+    assert_eq!(first.await??.status, StatusCode::OK);
+    assert_eq!(second.await??.status, StatusCode::OK);
+    running.stop().await
+}

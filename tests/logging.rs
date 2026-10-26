@@ -409,3 +409,201 @@ async fn access_log_off_writes_nothing_for_the_site() -> TestResult {
     assert!(!text.contains("log-off-1"));
     proxy.stop().await
 }
+
+#[tokio::test]
+async fn an_unknown_host_is_logged_with_the_normalized_host_as_its_site() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("unknown-site");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "Unknown.Example.",
+        &[("x-request-id", "unknown-site-1")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST);
+    let line = wait_for_line(&path, "unknown-site-1").await?;
+    assert_eq!(line["site"], "unknown.example");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_slow_upstream_answer_is_logged_with_its_latency() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream = format!("http://{}", listener.local_addr()?);
+    let _task = common::spawn_server(
+        listener,
+        |_request: http::Request<hyper::body::Incoming>| async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            common::json_response(StatusCode::OK, &serde_json::json!({"late": true}))
+        },
+    );
+    let path = log_path("latency");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream,
+        &path,
+        "",
+    )?)
+    .await?;
+    let reply = get_with_id(&proxy.base(), "/slow", "latency-1").await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "latency-1").await?;
+    let latency = line["latency_ms"]
+        .as_str()
+        .and_then(|text| text.parse::<u64>().ok())
+        .unwrap_or_default();
+    assert!(latency >= 250, "latency_ms was {latency}");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_block_at_status_444_is_logged_with_status_444() -> TestResult {
+    let decider = StubDecider::start().await?;
+    decider.set_behavior(common::StubBehavior {
+        attack: 0.95,
+        ..common::StubBehavior::default()
+    });
+    let upstream = Upstream::start().await?;
+    let path = log_path("status-444");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "block_status 444;",
+    )?)
+    .await?;
+    let result = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "example.com",
+        &[("x-request-id", "status-444-1")],
+        Bytes::new(),
+    )
+    .await;
+    assert!(result.is_err(), "expected no response");
+    let line = wait_for_line(&path, "status-444-1").await?;
+    assert_eq!(line["status"], "444");
+    assert_eq!(line["action"], "block");
+    proxy.stop().await
+}
+
+/// A configuration whose access log writes the fields that a rejection records, in a fixed order.
+fn field_config(decide_url: &str, upstream: &str, path: &Path, top: &str) -> String {
+    format!(
+        r#"
+listen 127.0.0.1:0;
+log_format fields "$status|$client_ip|$remote_addr|$host|$method|$path|$query_shape|$limit_conn_status";
+access_log "{path}" fields;
+{top}
+decision {{
+    backend http;
+    url "{decide_url}";
+    timeout 2000ms;
+    inspect_body 512;
+}}
+default_status 421;
+
+site example.com {{
+    upstream "{upstream}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        path = path.display()
+    )
+}
+
+/// The first access-log line that starts with `prefix`, once it has been written.
+async fn wait_for_field_line(path: &Path, prefix: &str) -> Result<String, BoxError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if let Some(line) = text.lines().find(|line| line.starts_with(prefix)) {
+            return Ok(line.to_owned());
+        }
+        if Instant::now() > deadline {
+            return Err(format!("no access log line starting with {prefix}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rejection_is_logged_with_its_client_host_method_path_query_shape_and_limit_status()
+-> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("reject-fields");
+    let _ = std::fs::remove_file(&path);
+    let top = "limit_conn_zone $client_ip zone=c:1m;\nlimit_conn c 10;";
+    let text = field_config(&decider.decide_url(), &upstream.url(), &path, top);
+    let proxy = common::start_proxy(&text).await?;
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/p?q=1",
+        "unknown.example",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::MISDIRECTED_REQUEST);
+    let line = wait_for_field_line(&path, "421|").await?;
+    let fields: Vec<&str> = line.split('|').collect();
+    assert_eq!(fields.get(1), Some(&"127.0.0.1"), "{line}");
+    assert_eq!(fields.get(2), Some(&"127.0.0.1"), "{line}");
+    assert_eq!(fields.get(3), Some(&"unknown.example"), "{line}");
+    assert_eq!(fields.get(4), Some(&"GET"), "{line}");
+    assert_eq!(fields.get(5), Some(&"/p"), "{line}");
+    assert_eq!(fields.get(6), Some(&"q=<num>"), "{line}");
+    assert_eq!(fields.get(7), Some(&"PASSED"), "{line}");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_transport_refusal_is_logged_with_the_client_address() -> TestResult {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("transport-fields");
+    let _ = std::fs::remove_file(&path);
+    let text = field_config(&decider.decide_url(), &upstream.url(), &path, "");
+    let proxy = common::start_proxy(&text).await?;
+    let mut stream = tokio::net::TcpStream::connect(proxy.addr).await?;
+    let long_path = format!("/{}", "a".repeat(9000));
+    stream
+        .write_all(format!("GET {long_path} HTTP/1.1\r\nHost: example.com\r\n\r\n").as_bytes())
+        .await?;
+    let mut answer = Vec::new();
+    let _ = stream.read_to_end(&mut answer).await;
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 414"));
+    // The connection is written to the log when it ends, so the client closes its end first.
+    drop(stream);
+    let line = wait_for_field_line(&path, "414|").await?;
+    let fields: Vec<&str> = line.split('|').collect();
+    assert_eq!(fields.get(1), Some(&"127.0.0.1"), "{line}");
+    assert_eq!(fields.get(2), Some(&"127.0.0.1"), "{line}");
+    proxy.stop().await
+}

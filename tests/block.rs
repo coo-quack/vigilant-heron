@@ -250,3 +250,39 @@ fn an_invalid_block_status_fails_to_load() {
         "{result:?}"
     );
 }
+
+#[tokio::test]
+async fn a_block_page_is_sent_with_its_length() -> TestResult {
+    let dir = std::env::temp_dir().join("vh-block-it-length");
+    std::fs::create_dir_all(&dir)?;
+    let page = dir.join("blocked.html");
+    let text = "<!doctype html><h1>Blocked</h1>";
+    std::fs::write(&page, text)?;
+    let upstream = Upstream::start().await?;
+    let stub = attacking_stub().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream.url(),
+        "",
+        &format!("block_status 403;\n    block_page {};", page.display()),
+    ))
+    .await?;
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        reply
+            .headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok()),
+        Some(text.len().to_string().as_str())
+    );
+    proxy.stop().await
+}
