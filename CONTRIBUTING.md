@@ -96,15 +96,19 @@ After merging into `main`, `release.yml` automatically:
 - Builds and pushes `ghcr.io/coo-quack/vigilant-heron:latest` and
   `:X.Y.Z` for `linux/amd64` and `linux/arm64` in the `publish` job, which runs
   only after `verify` passes
+- Builds the Linux binaries for x86_64 and aarch64 from the same build as the
+  image, checks that each needs glibc 2.39 or older and that the x86_64 binary
+  reports the version, and packages them with `SHA256SUMS`
 - Creates the git tag `vX.Y.Z` through the GitHub REST API
-- Creates a GitHub Release with the notes from `CHANGELOG.md`
+- Creates a GitHub Release with the notes from `CHANGELOG.md` and the binaries
+  attached
 
 The `publish` job does not run the project's tests or its advisory check, and its
 checkout keeps no credential, so the write token is not left in `.git/config`.
 
 To check the multi-arch build without publishing, run the `Release` workflow by
 hand from `develop` (`dry_run` is `true` by default). It runs `verify`, builds
-both platforms and pushes, tags and releases nothing.
+both platforms, checks the binaries, and pushes, tags and releases nothing.
 
 `backport.yml` opens the `main` → `develop` sync PR after every merge into
 `main`; see the hotfix steps above.

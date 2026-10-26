@@ -31,18 +31,24 @@ RUN set -eux; \
     mkdir -p /out; \
     cp "target/$triple/release/vigilant-heron" "target/$triple/release/stub-decider" /out/
 
-# The router. Distroless keeps the runtime image to glibc and the binary, with
-# no shell for an attacker who gets code execution to use.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS runtime
-COPY --from=build /out/vigilant-heron /usr/local/bin/vigilant-heron
-USER nonroot
-EXPOSE 8080
-ENTRYPOINT ["/usr/local/bin/vigilant-heron"]
-CMD ["--config", "/etc/vigilant-heron/vigilant-heron.conf"]
-
 # Test double for the decision backend, used only by the e2e stack.
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS stub-decider
 COPY --from=build /out/stub-decider /usr/local/bin/stub-decider
 USER nonroot
 EXPOSE 9000
 ENTRYPOINT ["/usr/local/bin/stub-decider"]
+
+# The release binaries. release.yml exports this stage with `--output type=local`
+# and attaches the binaries to the GitHub Release.
+FROM scratch AS binaries
+COPY --from=build /out/vigilant-heron /vigilant-heron
+
+# The router. Distroless keeps the runtime image to glibc and the binary, with
+# no shell for an attacker who gets code execution to use. This is the last
+# stage, so a build without --target builds the router.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:3ee00291cf386ec52a552e6a858d555debd74776eb4bfa53fa3df2cd6677515e AS runtime
+COPY --from=build /out/vigilant-heron /usr/local/bin/vigilant-heron
+USER nonroot
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/vigilant-heron"]
+CMD ["--config", "/etc/vigilant-heron/vigilant-heron.conf"]

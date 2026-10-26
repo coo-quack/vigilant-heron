@@ -17,7 +17,26 @@ client ──► nginx / Cloudflare ──► vigilant-heron ──► your site
 
 ## Install
 
-Build from source. You need the Rust toolchain that `rust-toolchain.toml` names. `rustup` installs it on the first build:
+Download a Linux binary (x86_64 or aarch64, glibc 2.39 or newer) from the [latest release](https://github.com/coo-quack/vigilant-heron/releases/latest):
+
+```bash
+ARCH=$(uname -m)   # x86_64 or aarch64
+curl -fsSLO "https://github.com/coo-quack/vigilant-heron/releases/latest/download/vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz"
+tar -xzf "vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz"
+sudo install -m 755 "vigilant-heron-$ARCH-unknown-linux-gnu/vigilant-heron" /usr/local/bin/
+```
+
+Check the download against `SHA256SUMS` before you install it, as [Installation](docs/install.md) shows.
+
+**Docker.** Run the published image:
+
+```bash
+docker run --rm ghcr.io/coo-quack/vigilant-heron:latest --version
+```
+
+The container runs as `nonroot`, so its configuration must set `listen 0.0.0.0:8080;` and a writable pid file, for example `pid /tmp/vigilant-heron.pid;`. See [Installation](docs/install.md) for the full Docker example, Docker Compose, nginx and Cloudflare in front, and systemd.
+
+**From source.** On macOS or another system, build from source. You need the Rust toolchain that `rust-toolchain.toml` names; `rustup` installs it on the first build:
 
 ```bash
 git clone https://github.com/coo-quack/vigilant-heron.git
@@ -27,15 +46,6 @@ cargo build --release --locked
 ```
 
 To put the binary on your `PATH`, run `cargo install --locked --path .` in the clone.
-
-**Docker.** No image is published yet, so build it from the Dockerfile:
-
-```bash
-docker build -t vigilant-heron .
-docker run --rm vigilant-heron --version
-```
-
-The container runs as `nonroot`, so its configuration must set `listen 0.0.0.0:8080;` and a writable pid file, for example `pid /tmp/vigilant-heron.pid;`. See [Installation](docs/install.md) for the full Docker example, Docker Compose, nginx and Cloudflare in front, and systemd.
 
 ## Quick start
 
