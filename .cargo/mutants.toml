@@ -5,3 +5,8 @@ exclude_globs = ["src/test_support.rs"]
 
 # The tests use real short timers, so a mutant that slows the code gets extra time before it counts as a timeout.
 timeout_multiplier = 3.0
+
+# The workspace denies lints such as unused imports, so a mutant that leaves an
+# import or a parameter unused would fail to build and count as unviable instead
+# of being tested. Lints are turned off for mutant builds only.
+cap_lints = true
