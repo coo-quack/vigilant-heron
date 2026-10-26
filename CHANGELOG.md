@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 (2026-10-26)
 
 - Added: `vigilant-heron test-request <file> [--client <address>]` reports what the
   router would do with one raw HTTP/1.1 request before deployment: the site, the access
