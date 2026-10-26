@@ -329,6 +329,30 @@ mod client_slot_tests {
         drop(first);
         assert!(table.take(client).is_some());
     }
+
+    #[test]
+    fn the_table_reports_the_limit_it_was_created_with() {
+        assert_eq!(ClientSlots::new(3).limit(), 3);
+    }
+
+    #[test]
+    fn dropping_one_of_two_calls_leaves_the_other_counted() {
+        let table = ClientSlots::new(2);
+        let client = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3));
+        let first = table.take(client);
+        let second = table.take(client);
+        drop(first);
+        let third = table.take(client);
+        assert!(
+            third.is_some(),
+            "the slot of the dropped call is free again"
+        );
+        assert!(
+            table.take(client).is_none(),
+            "the share is still two calls, and the remaining one is counted"
+        );
+        assert!(second.is_some());
+    }
 }
 
 #[cfg(test)]
@@ -428,5 +452,32 @@ mod tests {
     #[case::negative_infinity(f64::NEG_INFINITY)]
     fn probability_rejects_nan_and_values_outside_the_unit_interval(#[case] value: f64) {
         assert!(Probability::new(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_decision_response_of_two_kibibytes_is_read_in_full()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BODY_LEN: usize = 2 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url: Uri = format!("http://{}/decide", listener.local_addr()?).parse()?;
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _peer)) = listener.accept().await {
+                let service =
+                    hyper::service::service_fn(|_request: Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
+                            Bytes::from(vec![b'x'; BODY_LEN]),
+                        )))
+                    });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        let client = decision_client()?;
+        let slots = Arc::new(Semaphore::new(1));
+        let body = post_json(&client, &url, None, b"{}".to_vec(), &limits(1000, slots)).await?;
+        assert_eq!(body.len(), BODY_LEN);
+        server.abort();
+        Ok(())
     }
 }
