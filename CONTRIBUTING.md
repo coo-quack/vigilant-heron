@@ -18,14 +18,17 @@ cargo fmt --all                                            # Format
 cargo fmt --all -- --check                                 # fmt job
 cargo clippy --workspace --all-targets --locked -- -D warnings  # lint job
 RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked  # lint job
-cargo test --workspace --locked                            # test job
+cargo test --workspace --locked                            # Tests
+cargo llvm-cov --workspace --locked --fail-under-lines 90  # test job: tests and line coverage
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
+pnpm run dup                                               # duplication job
 cargo bench --bench hot_path                              # benchmarks (bench job runs them once with -- --test)
 ```
 
-`cargo install --locked cargo-deny cargo-machete` installs the two tools.
+`cargo install --locked cargo-deny cargo-machete cargo-llvm-cov` installs the three
+tools, and `rustup component add llvm-tools` adds what `cargo llvm-cov` needs.
 
 ## Rules the CI enforces
 
@@ -40,7 +43,11 @@ cargo bench --bench hot_path                              # benchmarks (bench jo
   dependencies are caught by `cargo machete`.
 - Every public item has a doc comment; fallible functions document their
   errors under `# Errors`.
+- Duplicated code in `src/` may not grow beyond the `threshold` in
+  `.jscpd.json`. List the clones with `pnpm run dup`.
 - Comments and documentation are written in English.
+- Line coverage of the tests stays at 90% or more. The `test` job runs the tests
+  under `cargo llvm-cov` and fails below that, so new code needs its tests.
 
 ## Tests
 
@@ -54,14 +61,38 @@ cargo bench --bench hot_path                              # benchmarks (bench jo
   the normal run; `scripts/e2e.sh` starts the stack and runs them.
 - Expected values are never changed to match what the code happens to do.
 
+## Mutation testing
+
+Mutation testing checks whether the tests notice a change in the code. The
+tool, cargo-mutants, changes the code one place at a time (for example, it
+replaces the body of a function that returns `bool` with `true` or with `false`)
+and runs the tests. A test should fail for each change. If every test still
+passes, that change is a **missed mutant**, which means a test is missing or
+too weak.
+
+`.github/workflows/mutants.yml` runs it every Sunday night (Monday 03:17 JST)
+in 32 shards. When the run finds missed mutants, timed-out mutants, or fails,
+it opens or updates the issue "Weekly mutation testing: findings". When a later
+run is clean, it closes that issue. The full output is in the `mutants-*`
+artifacts of the run. The settings are in `.cargo/mutants.toml`.
+
+To run it on one file locally:
+
+```bash
+cargo mutants --file src/skip_suggest.rs
+```
+
+A full run takes hours, so run it for the file you are changing. Its output is
+written to `mutants.out/`, and the lines in `missed.txt` tell you which change
+the tests did not catch.
+
 ## Benchmarks
 
 `benches/hot_path.rs` measures the request hot path through the public API:
-`check_request` for four kinds of request (a plain page, a page a skip rule
+`check_request_with` for four kinds of request (a plain page, a page a skip rule
 forwards, a long request that goes through every built-in rule, and a request a
-built-in rule blocks), `suggest_skip_rules` over 10,000 access log lines, and
-loading the sample configuration. `check_request` reads the configuration file on
-each call, so its times include the cost that `config_load` measures on its own.
+built-in rule blocks) against a configuration loaded once, `suggest_skip_rules`
+over 10,000 access log lines, and loading the sample configuration.
 
 Timings on a laptop or a shared runner are noisy, so compare runs on the same
 machine. Save a baseline before a change, then compare after it:
@@ -74,8 +105,8 @@ cargo bench --bench hot_path -- --baseline before
 
 The `bench` CI job only runs the benchmarks once to check that they build and
 run. The `Bench` workflow (`.github/workflows/bench.yml`) runs them every Sunday
-at 18:43 UTC and uploads `target/criterion` as the `criterion-<run_id>` artifact, kept for 90
-days, so results can be compared week to week.
+at 18:43 UTC and uploads `target/criterion` as the `criterion-<run_id>`
+artifact, kept for 90 days, so results can be compared week to week.
 
 ## Branching Strategy
 

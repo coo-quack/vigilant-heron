@@ -20,9 +20,11 @@ Shadow mode records what it would have done without blocking.
 - `cargo fmt --all` — format
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — lint
 - `cargo test --workspace --locked` — unit and integration tests
+- `cargo llvm-cov --workspace --locked --fail-under-lines 90` — the tests with line coverage; CI fails below 90%
 - `bash scripts/e2e.sh` — e2e suite against the Compose stack in `e2e/`
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
+- `pnpm run dup` — duplicated code in src/ (jscpd)
 - `cargo bench --locked --bench hot_path` — benchmarks (the `bench` job runs them once with `-- --test`)
 
 ## Project Structure
@@ -109,11 +111,13 @@ Top-level and documentation files:
 
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, bench.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
 deny.toml        # cargo-deny policy: advisories, licenses, sources
+.jscpd.json      # jscpd settings for the duplication check (pnpm run dup)
+.cargo/mutants.toml # cargo-mutants settings (exclusions, timeout multiplier)
 clippy.toml      # Clippy settings (allow the lints in tests)
 rust-toolchain.toml # Toolchain pin
 README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents

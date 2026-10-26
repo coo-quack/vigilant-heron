@@ -15,6 +15,7 @@ env:
   # on the first cargo call, so no third-party toolchain action is needed.
   CARGO_DENY_VERSION: 0.20.2
   CARGO_MACHETE_VERSION: 0.9.2
+  CARGO_LLVM_COV_VERSION: 0.9.1
 
 jobs:
   # Advisories, licenses, banned crates and registry sources (deny.toml).
@@ -79,7 +80,15 @@ jobs:
             ~/.cargo/git
             target
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo test --workspace --locked
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-${{ env.CARGO_LLVM_COV_VERSION }}
+      - run: command -v cargo-llvm-cov || cargo install --locked cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION"
+      # The tests run once, instrumented. The job fails when they fail or when
+      # fewer than 90% of the lines run, so new code comes with its tests.
+      - run: rustup component add llvm-tools
+      - run: cargo llvm-cov --workspace --locked --fail-under-lines 90
 
   # Timings on shared runners are too noisy to gate on, so this job only proves
   # that the benchmarks build and run once. bench.yml records the timings weekly.
@@ -130,3 +139,20 @@ jobs:
           key: cargo-machete-${{ runner.os }}-${{ env.CARGO_MACHETE_VERSION }}
       - run: command -v cargo-machete || cargo install --locked cargo-machete --version "$CARGO_MACHETE_VERSION"
       - run: cargo machete
+
+  # Copy/paste duplication in src/ (jscpd, configured by .jscpd.json). The
+  # threshold there keeps duplicated Rust code from growing; `pnpm run dup`
+  # lists the clones. pnpm comes from corepack, as in the audit job.
+  duplication:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: corepack enable pnpm
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.1'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run dup
