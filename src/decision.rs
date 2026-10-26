@@ -1,7 +1,6 @@
 //! The decision backends: the transport shared by all of them, the JSON HTTP
 //! protocol, the System One protocol in [`crate::system_one`], and the backend enum.
 
-use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,15 +67,6 @@ struct RawVerdict {
     ai_instruction: f64,
     #[serde(default)]
     category: Option<String>,
-}
-
-/// Something that can score a sanitized event.
-pub(crate) trait DecisionBackend: Send + Sync + 'static {
-    /// Asks the backend for a verdict on `event`.
-    fn decide(
-        &self,
-        event: &DecisionEvent,
-    ) -> impl Future<Output = Result<Verdict, DecisionError>> + Send;
 }
 
 /// Builds the HTTP client. TLS uses the operating system's root certificates.
@@ -187,21 +177,22 @@ impl Drop for ClientSlot {
 
 /// Posts a JSON payload and returns the response body, bounded in size and time.
 ///
-/// `bearer` is sent as an `Authorization: Bearer` header when given. The wait for
-/// a slot is bounded by `queue_timeout` only: if no slot is obtained in that
-/// window the result is always [`DecisionError::Busy`]. The exchange then gets
-/// the rest of `timeout`, and running out there is [`DecisionError::Timeout`].
+/// `authorization` is sent as the `Authorization` header value, as given, when
+/// present. The wait for a slot is bounded by `queue_timeout` only: if no slot is
+/// obtained in that window the result is always [`DecisionError::Busy`]. The
+/// exchange then gets the rest of `timeout`, and running out there is
+/// [`DecisionError::Timeout`].
 pub(crate) async fn post_json(
     client: &DecisionClient,
     url: &Uri,
-    bearer: Option<&str>,
+    authorization: Option<&str>,
     payload: Vec<u8>,
     limits: &Limits,
 ) -> Result<Bytes, DecisionError> {
     let started = tokio::time::Instant::now();
     let _slot = acquire_slot(limits).await?;
     let remaining = limits.timeout.saturating_sub(started.elapsed());
-    match tokio::time::timeout(remaining, exchange(client, url, bearer, payload)).await {
+    match tokio::time::timeout(remaining, exchange(client, url, authorization, payload)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(DecisionError::Timeout),
     }
@@ -220,15 +211,15 @@ async fn acquire_slot(limits: &Limits) -> Result<SemaphorePermit<'_>, DecisionEr
 async fn exchange(
     client: &DecisionClient,
     url: &Uri,
-    bearer: Option<&str>,
+    authorization: Option<&str>,
     payload: Vec<u8>,
 ) -> Result<Bytes, DecisionError> {
     let mut builder = Request::builder()
         .method(Method::POST)
         .uri(url.clone())
         .header(CONTENT_TYPE, "application/json");
-    if let Some(token) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(value) = authorization {
+        builder = builder.header(AUTHORIZATION, value);
     }
     let request = builder.body(Full::new(Bytes::from(payload)))?;
     let response = client
@@ -273,8 +264,9 @@ impl HttpDecisionBackend {
     }
 }
 
-impl DecisionBackend for HttpDecisionBackend {
-    async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
+impl HttpDecisionBackend {
+    /// Asks the backend for a verdict on `event`.
+    pub(crate) async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         let payload = serde_json::to_vec(event)?;
         let body = post_json(&self.client, &self.url, None, payload, &self.limits).await?;
         let raw: RawVerdict = serde_json::from_slice(&body)?;
@@ -295,8 +287,9 @@ pub(crate) enum Backend {
     SystemOne(SystemOneBackend),
 }
 
-impl DecisionBackend for Backend {
-    async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
+impl Backend {
+    /// Asks the configured backend for a verdict on `event`.
+    pub(crate) async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         match self {
             Self::Http(backend) => backend.decide(event).await,
             Self::SystemOne(backend) => backend.decide(event).await,

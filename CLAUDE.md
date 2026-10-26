@@ -50,7 +50,7 @@ src/
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   sanitize.rs    # Backend event: header drop, body redaction, truncation
-  decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
+  decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
   proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers, proxy_set_header

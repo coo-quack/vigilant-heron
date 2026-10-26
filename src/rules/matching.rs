@@ -4,14 +4,15 @@
 //! never backtracks, so a pattern cannot make a request take longer in
 //! proportion to a pathological input.
 
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::net::IpAddr;
 
 use http::{HeaderMap, HeaderName, Method};
-use percent_encoding::percent_decode_str;
 use regex::RegexBuilder;
 
 use super::Rule;
+use crate::prefilter::percent_decode_lossy;
 use crate::realip::IpNet;
 
 /// Longest regex source, in bytes.
@@ -91,8 +92,8 @@ impl PathMatch {
 
 /// Decodes percent escapes at most twice, so double encoding is undone too, and drops NUL bytes.
 fn decode_twice(raw: &str) -> String {
-    let once = percent_decode_str(raw).decode_utf8_lossy();
-    let twice = percent_decode_str(&once).decode_utf8_lossy();
+    let once = percent_decode_lossy(raw);
+    let twice = percent_decode_lossy(&once);
     twice.replace('\0', "")
 }
 
@@ -132,7 +133,8 @@ pub(crate) struct RuleInput<'a> {
     /// The path as received, which the static skip inspects.
     pub(crate) raw_path: &'a str,
     /// The path in each reading of [`crate::prefilter::path_views`]. Case is kept.
-    pub(crate) paths: Vec<String>,
+    /// Borrowed when the caller has already computed the views of this request.
+    pub(crate) paths: Cow<'a, [String]>,
     /// The raw query string, if the request has one.
     query: Option<&'a str>,
     /// The request headers.
@@ -151,6 +153,8 @@ pub(crate) struct RuleInput<'a> {
 
 impl<'a> RuleInput<'a> {
     /// Collects the inputs of one request. `raw_path` is the path as received.
+    /// The server and `test-request` use [`Self::with_views`]; this computes the views itself.
+    #[cfg(test)]
     pub(crate) fn new(
         method: &'a Method,
         raw_path: &'a str,
@@ -159,10 +163,45 @@ impl<'a> RuleInput<'a> {
         body: &'a [u8],
         client: IpAddr,
     ) -> Self {
+        let paths = Cow::Owned(crate::prefilter::path_views(raw_path));
+        Self::build(method, raw_path, paths, query, headers, body, client)
+    }
+
+    /// Collects the inputs of one request whose path views `views` were computed once
+    /// from `raw_path` with [`crate::prefilter::path_views`].
+    pub(crate) fn with_views(
+        method: &'a Method,
+        raw_path: &'a str,
+        views: &'a [String],
+        query: Option<&'a str>,
+        headers: &'a HeaderMap,
+        body: &'a [u8],
+        client: IpAddr,
+    ) -> Self {
+        Self::build(
+            method,
+            raw_path,
+            Cow::Borrowed(views),
+            query,
+            headers,
+            body,
+            client,
+        )
+    }
+
+    fn build(
+        method: &'a Method,
+        raw_path: &'a str,
+        paths: Cow<'a, [String]>,
+        query: Option<&'a str>,
+        headers: &'a HeaderMap,
+        body: &'a [u8],
+        client: IpAddr,
+    ) -> Self {
         Self {
             method,
             raw_path,
-            paths: crate::prefilter::path_views(raw_path),
+            paths,
             query,
             headers,
             body,

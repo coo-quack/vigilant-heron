@@ -417,6 +417,8 @@ pub struct SiteConfig {
     pub instruction_threshold: f64,
     /// Path prefixes that are always blocked without calling the backend.
     pub deny_paths: Vec<String>,
+    /// `deny_paths` in lowercase, in the same order, for matching against lowercase views.
+    pub(crate) deny_paths_lowered: Vec<String>,
     /// Path prefixes that are always blocked when the decision fails.
     pub fail_closed_paths: Vec<String>,
     /// What happens when the backend rate-limits the request or no slot is free in time.
@@ -642,20 +644,9 @@ pub(crate) fn block(directive: &Directive) -> Result<&[Directive], ConfigError> 
     })
 }
 
-fn parse_uint(directive: &Directive, text: &str) -> Result<u64, ConfigError> {
-    text.parse::<u64>().map_err(|_| {
-        invalid(
-            directive,
-            format!(
-                "\"{}\" must be a whole number, got \"{text}\"",
-                directive.name
-            ),
-        )
-    })
-}
-
-fn parse_usize(directive: &Directive, text: &str) -> Result<usize, ConfigError> {
-    text.parse::<usize>().map_err(|_| {
+/// Parses a whole number of type `T`. The message is the same for every type.
+fn parse_number<T: FromStr>(directive: &Directive, text: &str) -> Result<T, ConfigError> {
+    text.parse::<T>().map_err(|_| {
         invalid(
             directive,
             format!(
@@ -814,7 +805,7 @@ fn parse_header_buffers(directive: &Directive) -> Result<HeaderBuffers, ConfigEr
             "\"large_client_header_buffers\" takes two arguments: a number and a size",
         ));
     };
-    let count = parse_usize(directive, count)?;
+    let count = parse_number::<usize>(directive, count)?;
     let size = parse_size(directive, size)?;
     if count == 0 || size == 0 {
         return Err(invalid(
@@ -994,7 +985,7 @@ where
             }
             "worker_threads" => {
                 once(&mut seen, directive)?;
-                let count = parse_usize(directive, one_arg(directive)?)?;
+                let count = parse_number::<usize>(directive, one_arg(directive)?)?;
                 if count == 0 {
                     return Err(invalid(directive, "\"worker_threads\" must be at least 1"));
                 }
@@ -1002,7 +993,7 @@ where
             }
             "max_connections" => {
                 once(&mut seen, directive)?;
-                let count = parse_usize(directive, one_arg(directive)?)?;
+                let count = parse_number::<usize>(directive, one_arg(directive)?)?;
                 if count == 0 {
                     return Err(invalid(directive, "\"max_connections\" must be at least 1"));
                 }
@@ -1015,7 +1006,7 @@ where
             }
             "default_status" => {
                 once(&mut seen, directive)?;
-                let status = parse_uint(directive, one_arg(directive)?)?;
+                let status = parse_number::<u64>(directive, one_arg(directive)?)?;
                 let valid = u16::try_from(status)
                     .ok()
                     .and_then(|code| StatusCode::from_u16(code).ok())
@@ -1084,7 +1075,7 @@ where
             }
             "keepalive_requests" => {
                 once(&mut seen, directive)?;
-                let count = parse_usize(directive, one_arg(directive)?)?;
+                let count = parse_number::<usize>(directive, one_arg(directive)?)?;
                 if count == 0 {
                     return Err(invalid(
                         directive,
@@ -1560,11 +1551,11 @@ where
             }
             "max_concurrency" => {
                 once(&mut seen, child)?;
-                max_concurrency = parse_usize(child, one_arg(child)?)?;
+                max_concurrency = parse_number::<usize>(child, one_arg(child)?)?;
             }
             "max_concurrency_per_client" => {
                 once(&mut seen, child)?;
-                max_concurrency_per_client = Some(parse_usize(child, one_arg(child)?)?);
+                max_concurrency_per_client = Some(parse_number::<usize>(child, one_arg(child)?)?);
             }
             "inspect_body" => {
                 once(&mut seen, child)?;
@@ -2101,6 +2092,7 @@ fn parse_site(
         action,
         block_threshold,
         instruction_threshold,
+        deny_paths_lowered: deny_paths.iter().map(|path| path.to_lowercase()).collect(),
         deny_paths,
         fail_closed_paths,
         on_rate_limit,

@@ -6,6 +6,7 @@
 //! Security checks read the request path in several ways, see [`path_views`]. The
 //! request is forwarded with its raw path, so only the matching is affected.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use http::Method;
@@ -86,7 +87,7 @@ pub(crate) fn decoded_path(raw: &str) -> String {
 /// Views 1 to 4: decode once, read `\` as `/` when `backslash`, resolve dot segments, cut
 /// segments at `;` when `strip`.
 fn decoded_view(raw: &str, strip: bool, backslash: bool) -> String {
-    let decoded = percent_decode_str(raw).decode_utf8_lossy();
+    let decoded = percent_decode_lossy(raw);
     let text = if backslash {
         decoded.replace('\\', "/")
     } else {
@@ -115,7 +116,12 @@ fn raw_view(raw: &str, strip: bool, backslash: bool) -> String {
         }
     }
     let joined = format!("/{}", segments.join("/"));
-    percent_decode_str(&joined).decode_utf8_lossy().into_owned()
+    percent_decode_lossy(&joined).into_owned()
+}
+
+/// Decodes the percent escapes of `raw` once; bytes that are not valid UTF-8 become U+FFFD.
+pub(crate) fn percent_decode_lossy(raw: &str) -> Cow<'_, str> {
+    percent_decode_str(raw).decode_utf8_lossy()
 }
 
 /// Applies RFC 3986 `remove_dot_segments` with empty segments collapsed.
@@ -180,11 +186,9 @@ pub(crate) fn denied(site: &SiteConfig, views: &[String]) -> bool {
 pub(crate) fn denied_by<'a>(site: &'a SiteConfig, views: &[String]) -> Option<&'a str> {
     site.deny_paths
         .iter()
-        .find(|denied| {
-            let prefix = denied.to_lowercase();
-            views.iter().any(|view| view.starts_with(prefix.as_str()))
-        })
-        .map(String::as_str)
+        .zip(&site.deny_paths_lowered)
+        .find(|(_, prefix)| views.iter().any(|view| view.starts_with(prefix.as_str())))
+        .map(|(denied, _)| denied.as_str())
 }
 
 /// Returns true when a `fail_closed_path` entry is a prefix of any view. Views must be lowercase.
