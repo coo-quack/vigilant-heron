@@ -57,6 +57,31 @@ tools, and `rustup component add llvm-tools` adds what `cargo llvm-cov` needs.
   the normal run; `scripts/e2e.sh` starts the stack and runs them.
 - Expected values are never changed to match what the code happens to do.
 
+## Mutation testing
+
+Mutation testing checks whether the tests notice a change in the code. The
+tool, cargo-mutants, changes the code one place at a time (for example, it
+replaces the body of a function that returns `bool` with `true` or with `false`)
+and runs the tests. A test should fail for each change. If every test still
+passes, that change is a **missed mutant**, which means a test is missing or
+too weak.
+
+`.github/workflows/mutants.yml` runs it every Sunday night (Monday 03:17 JST)
+in 32 shards. When the run finds missed mutants, timed-out mutants, or fails,
+it opens or updates the issue "Weekly mutation testing: findings". When a later
+run is clean, it closes that issue. The full output is in the `mutants-*`
+artifacts of the run. The settings are in `.cargo/mutants.toml`.
+
+To run it on one file locally:
+
+```bash
+cargo mutants --file src/skip_suggest.rs
+```
+
+A full run takes hours, so run it for the file you are changing. Its output is
+written to `mutants.out/`, and the lines in `missed.txt` tell you which change
+the tests did not catch.
+
 ## Branching Strategy
 
 ```

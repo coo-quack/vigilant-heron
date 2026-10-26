@@ -107,11 +107,12 @@ Top-level and documentation files:
 
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
 deny.toml        # cargo-deny policy: advisories, licenses, sources
+.cargo/mutants.toml # cargo-mutants settings (exclusions, timeout multiplier)
 clippy.toml      # Clippy settings (allow the lints in tests)
 rust-toolchain.toml # Toolchain pin
 README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents
