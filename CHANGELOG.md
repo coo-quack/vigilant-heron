@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Security: more credentials are kept out of the decision backend. Headers named
+  with `signature` (for example `x-hub-signature-256`, `svix-signature` and
+  `x-slack-signature`), with `ticket` or `authentication` as a word, or ending in
+  `key`, `authkey` or `sessionkey` (for example `x-functions-key`, `x-master-key`
+  and `x-admin-key`) are now dropped. Body fields with `signature` in their name are
+  redacted. The rules for `ticket`, `authentication`
+  and the `key` suffix apply to header names only, so an ordinary `key` or `ticket`
+  body or query field is still sent. Multipart parts whose `name` is sensitive have
+  their values replaced, and XML elements such as `<password>` and `<wsse:Password>`
+  have their text replaced. Form bodies split on `;` as well as `&`, so
+  `a=1;password=x` hides the password. A file part is redacted by its field name
+  only. Its content is not scanned.
 - Fixed: a `proxy_websocket` tunnel was read as if it were HTTP requests. After the
   `101 Switching Protocols`, a tunnelled chunk of more than 8 KiB without a line
   break (a binary WebSocket frame, for example) was answered with 414 and the

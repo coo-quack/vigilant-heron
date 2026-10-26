@@ -25,7 +25,7 @@ const DROPPED_HEADERS: [&str; 5] = [
 ///
 /// The name is compared without its non-alphanumeric characters and in lowercase,
 /// so `api_key`, `API-KEY` and `apikey` all match `apikey`.
-const SENSITIVE_KEY_PARTS: [&str; 12] = [
+const SENSITIVE_KEY_PARTS: [&str; 13] = [
     "password",
     "passwd",
     "secret",
@@ -38,7 +38,16 @@ const SENSITIVE_KEY_PARTS: [&str; 12] = [
     "accesskey",
     "creditcard",
     "cardnumber",
+    // Covers request signatures such as `x-hub-signature-256`, `svix-signature`
+    // and `x-slack-signature`, which carry an HMAC of the request.
+    "signature",
 ];
+
+/// Last words that mark a header as sensitive, as in `x-functions-key`, `x-master-key`,
+/// `x-authkey` and `x-sessionkey`. Only header names are checked against these: a body
+/// or query field named `key` is common and ordinary, so [`is_sensitive_key`] does not
+/// use them.
+const SENSITIVE_HEADER_KEY_WORDS: [&str; 3] = ["key", "authkey", "sessionkey"];
 
 /// Short words that mark a field as sensitive only when a whole word of its name
 /// is one of them. A substring match would redact `shipping` (`pin`), `author`
@@ -47,9 +56,20 @@ const SENSITIVE_KEY_PARTS: [&str; 12] = [
 ///
 /// Words are split as described in [`key_words`]: `card_id`, `userSSN` and `new_pwd`
 /// are sensitive, `postcard` is not.
+///
 const SENSITIVE_WORDS: [&str; 12] = [
     "pass", "pin", "otp", "auth", "session", "cookie", "jwt", "pwd", "card", "cvv", "cvc", "ssn",
 ];
+
+/// Whole words that mark a header name as sensitive, as in `x-cas-ticket` and
+/// `x-authentication`. They are checked only for header names: `ticket` is a common
+/// body field (support tickets, `ticket_ref`), so body and query fields keep it visible.
+/// Whole-word matching keeps `authenticated` and `authenticator-id` visible.
+const SENSITIVE_HEADER_WORDS: [&str; 2] = ["ticket", "authentication"];
+
+/// Header names that end in `key` but are not credentials. `Sec-WebSocket-Key` is the
+/// random nonce of the WebSocket handshake, and its value is not secret.
+const KEY_HEADER_EXEMPTIONS: [&str; 1] = ["sec-websocket-key"];
 
 /// The JSON body posted to the decision backend.
 #[derive(Debug, Serialize)]
@@ -186,7 +206,7 @@ pub(crate) fn sanitize_headers(headers: &HeaderMap, extra: &[String]) -> Vec<(St
         .filter(|(name, _)| {
             let name = name.as_str();
             !DROPPED_HEADERS.contains(&name)
-                && !is_sensitive_key(name)
+                && !is_sensitive_header(name)
                 && !extra
                     .iter()
                     .any(|dropped| dropped.eq_ignore_ascii_case(name))
@@ -218,6 +238,27 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
         || key_words(key)
             .iter()
             .any(|word| SENSITIVE_WORDS.contains(&word.as_str()))
+}
+
+/// Returns true when a header name is sensitive: by [`is_sensitive_key`], by one of
+/// [`SENSITIVE_HEADER_WORDS`] as a word, or by a last word in [`SENSITIVE_HEADER_KEY_WORDS`]
+/// (except the [`KEY_HEADER_EXEMPTIONS`]). A header such as `x-limit-key` is dropped by the
+/// last rule. Body and query fields are not checked against these two header rules.
+pub(crate) fn is_sensitive_header(name: &str) -> bool {
+    if is_sensitive_key(name) {
+        return true;
+    }
+    let words = key_words(name);
+    if words
+        .iter()
+        .any(|word| SENSITIVE_HEADER_WORDS.contains(&word.as_str()))
+    {
+        return true;
+    }
+    !KEY_HEADER_EXEMPTIONS.contains(&name.to_ascii_lowercase().as_str())
+        && words
+            .last()
+            .is_some_and(|word| SENSITIVE_HEADER_KEY_WORDS.contains(&word.as_str()))
 }
 
 /// Splits a field name into lowercase words, at non-alphanumeric characters and at a
@@ -254,20 +295,112 @@ fn is_redacted_key(key: &str, redact_fields: &[String]) -> bool {
 
 /// Redacts sensitive fields of a body.
 ///
-/// Form bodies are parsed as form data. Other bodies are parsed as JSON when
-/// possible. Anything else, including malformed JSON, gets lexical redaction.
+/// Form bodies are split into fields on `&` and `;`, as query strings are. Multipart
+/// bodies are split into parts, and a part is redacted by its `Content-Disposition`
+/// name. Other bodies are parsed as JSON when possible. Anything else, including
+/// malformed JSON and XML, gets lexical redaction. A multipart body that does not have
+/// the expected framing also gets lexical redaction.
 pub(crate) fn redact_body(
     content_type: Option<&str>,
     body: &[u8],
     redact_fields: &[String],
 ) -> String {
+    let text = String::from_utf8_lossy(body);
     if is_form_content_type(content_type) {
-        return redact_form(body, redact_fields);
+        return redact_query(&text, redact_fields);
+    }
+    if let Some(multipart) = multipart_boundary(content_type)
+        .and_then(|boundary| redact_multipart(&text, &boundary, redact_fields))
+    {
+        return multipart;
     }
     if let Some(json) = redact_json(body, redact_fields) {
         return json;
     }
-    redact_lexical(&String::from_utf8_lossy(body), redact_fields)
+    redact_lexical(&text, redact_fields)
+}
+
+/// Returns the boundary of a `multipart/form-data` content type, without its quotes.
+fn multipart_boundary(content_type: Option<&str>) -> Option<String> {
+    let mut params = content_type?.split(';');
+    if !params
+        .next()?
+        .trim()
+        .eq_ignore_ascii_case("multipart/form-data")
+    {
+        return None;
+    }
+    params.find_map(|param| {
+        let (key, value) = param.split_once('=')?;
+        (key.trim().eq_ignore_ascii_case("boundary"))
+            .then(|| value.trim().trim_matches('"').to_owned())
+            .filter(|boundary| !boundary.is_empty())
+    })
+}
+
+/// Redacts the value of each `multipart/form-data` part whose `Content-Disposition` name is
+/// sensitive. Boundaries and part headers are copied as they were sent.
+///
+/// Returns `None` when the framing is not as expected (no opening delimiter, a part without a
+/// blank line after its headers, or no closing delimiter). The caller then uses lexical
+/// redaction. Each part is searched only inside its own bytes, so the work is linear.
+fn redact_multipart(text: &str, boundary: &str, redact_fields: &[String]) -> Option<String> {
+    let open = format!("--{boundary}");
+    let sep = format!("\n{open}");
+    let mut out = String::with_capacity(text.len());
+    let mut pos = text.find(&open)?;
+    out.push_str(text.get(..pos)?);
+    loop {
+        let after_open = text.get(pos + open.len()..)?;
+        if after_open.starts_with("--") {
+            out.push_str(text.get(pos..)?);
+            return Some(out);
+        }
+        // The newline that ends the opening delimiter line.
+        let delim_nl = pos + open.len() + after_open.find('\n')?;
+        let rest = text.get(delim_nl..)?;
+        // The next delimiter starts with the newline that ends this part's content.
+        let part_len = rest.find(&sep)?;
+        let part = rest.get(..part_len)?;
+        let blank = match (part.find("\n\r\n"), part.find("\n\n")) {
+            (Some(crlf), Some(lf)) if lf < crlf => (lf, 2),
+            (Some(crlf), _) => (crlf, 3),
+            (None, Some(lf)) => (lf, 2),
+            (None, None) => return None,
+        };
+        let body_start = delim_nl + blank.0 + blank.1;
+        let body_end = delim_nl + part_len;
+        let headers = text.get(delim_nl..body_start)?;
+        let content = text.get(body_start..body_end)?;
+        let value = content.strip_suffix('\r').unwrap_or(content);
+        out.push_str(text.get(pos..body_start)?);
+        if part_is_redacted(headers, redact_fields) {
+            // Keep the line ending before the next delimiter, so the framing stays intact.
+            out.push_str(REDACTED);
+            out.push_str(text.get(body_start + value.len()..=body_end)?);
+        } else {
+            out.push_str(text.get(body_start..=body_end)?);
+        }
+        pos = body_end + 1;
+    }
+}
+
+/// Returns true when a part's `Content-Disposition` names a redacted field. Only the `name`
+/// parameter counts, so `filename` never names a field.
+fn part_is_redacted(headers: &str, redact_fields: &[String]) -> bool {
+    headers.lines().any(|line| {
+        let Some((field, value)) = line.split_once(':') else {
+            return false;
+        };
+        field.trim().eq_ignore_ascii_case("content-disposition")
+            && value
+                .split(';')
+                .filter_map(|param| param.trim().split_once('='))
+                .any(|(key, name)| {
+                    key.trim().eq_ignore_ascii_case("name")
+                        && is_redacted_key(name.trim().trim_matches('"'), redact_fields)
+                })
+    })
 }
 
 fn is_form_content_type(content_type: Option<&str>) -> bool {
@@ -286,7 +419,71 @@ fn is_form_content_type(content_type: Option<&str>) -> bool {
 /// whitespace. The second redacts `"key": value` pairs, where the value is a JSON
 /// string, a bracketed value or a bare token.
 pub(crate) fn redact_lexical(text: &str, redact_fields: &[String]) -> String {
-    redact_json_like(&redact_key_value_tokens(text, redact_fields), redact_fields)
+    let elements = redact_xml_elements(text, redact_fields);
+    redact_json_like(
+        &redact_key_value_tokens(&elements, redact_fields),
+        redact_fields,
+    )
+}
+
+/// Redacts the text of XML elements whose local name is sensitive, as in
+/// `<password>x</password>` and `<wsse:Password Type="...">x</wsse:Password>`. Attributes
+/// and element names are kept.
+///
+/// Each tag is read once, and the text up to the next `<` is read at most twice, so the
+/// work is linear in the length of the text.
+fn redact_xml_elements(text: &str, redact_fields: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(lt) = text
+        .get(search..)
+        .and_then(|rest| rest.find('<'))
+        .map(|k| search + k)
+    {
+        let Some(gt) = text
+            .get(lt..)
+            .and_then(|rest| rest.find('>'))
+            .map(|k| lt + k)
+        else {
+            break;
+        };
+        search = gt + 1;
+        let Some(tag) = text.get(lt + 1..gt) else {
+            break;
+        };
+        if tag.starts_with(['/', '!', '?']) || tag.ends_with('/') {
+            continue;
+        }
+        let name = tag
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("");
+        let local = name.rsplit(':').next().unwrap_or("");
+        if !is_redacted_key(local, redact_fields) {
+            continue;
+        }
+        let Some(close) = text
+            .get(gt + 1..)
+            .and_then(|rest| rest.find('<'))
+            .map(|k| gt + 1 + k)
+        else {
+            break;
+        };
+        // Only text that is followed by a closing tag is an element value.
+        if close == gt + 1 || !text.get(close..).is_some_and(|rest| rest.starts_with("</")) {
+            continue;
+        }
+        let Some(kept) = text.get(copied..=gt) else {
+            break;
+        };
+        out.push_str(kept);
+        out.push_str(REDACTED);
+        copied = close;
+        search = close;
+    }
+    out.push_str(text.get(copied..).unwrap_or(""));
+    out
 }
 
 fn redact_key_value_tokens(text: &str, redact_fields: &[String]) -> String {
@@ -440,19 +637,6 @@ fn copy_range(chars: &[char], from: usize, to: usize, out: &mut String) {
 
 fn collect_range(chars: &[char], from: usize, to: usize) -> String {
     (from..to).filter_map(|j| chars.get(j).copied()).collect()
-}
-
-fn redact_form(body: &[u8], redact_fields: &[String]) -> String {
-    let mut serializer = form_urlencoded::Serializer::new(String::new());
-    for (key, value) in form_urlencoded::parse(body) {
-        let value: &str = if is_redacted_key(&key, redact_fields) {
-            REDACTED
-        } else {
-            &value
-        };
-        serializer.append_pair(&key, value);
-    }
-    serializer.finish()
 }
 
 fn redact_json(body: &[u8], redact_fields: &[String]) -> Option<String> {
@@ -1045,6 +1229,217 @@ mod tests {
             prop_assert!(!quoted.contains(&value));
             prop_assert!(!bare.contains(&value));
         }
+    }
+
+    #[rstest]
+    #[case::signature_hub_sha256("x-hub-signature-256")]
+    #[case::signature_hub("x-hub-signature")]
+    #[case::signature_svix("svix-signature")]
+    #[case::signature_slack("x-slack-signature")]
+    #[case::signature_bare("signature")]
+    #[case::functions_key("x-functions-key")]
+    #[case::azure_functions_key("x-azure-functions-key")]
+    #[case::master_key("x-master-key")]
+    #[case::admin_key("x-admin-key")]
+    #[case::app_key("x-app-key")]
+    #[case::limit_key("x-limit-key")]
+    #[case::bare_key("x-key")]
+    #[case::authkey("x-authkey")]
+    #[case::sessionkey("x-sessionkey")]
+    #[case::ticket("x-cas-ticket")]
+    #[case::authentication("authentication")]
+    #[case::x_authentication("x-authentication")]
+    fn credential_header_names_added_for_the_signature_key_and_ticket_families_are_dropped(
+        #[case] name: &str,
+    ) -> Result<(), BoxError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_static("secret"),
+        );
+        headers.insert(http::header::ACCEPT, HeaderValue::from_static("*/*"));
+        let kept = sanitize_headers(&headers, &[]);
+        assert!(kept.iter().all(|(kept_name, _)| kept_name != name));
+        assert!(kept.iter().any(|(kept_name, _)| kept_name == "accept"));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::keyboard("keyboard")]
+    #[case::cache_control("cache-control")]
+    #[case::request_id("x-request-id")]
+    #[case::key_in_the_middle("x-key-version")]
+    #[case::websocket_key("sec-websocket-key")]
+    #[case::authenticated("x-authenticated")]
+    #[case::authenticator_id("x-authenticator-id")]
+    fn ordinary_header_names_are_kept_by_the_key_and_ticket_rules(
+        #[case] name: &str,
+    ) -> Result<(), BoxError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_static("visible"),
+        );
+        let kept = sanitize_headers(&headers, &[]);
+        assert!(kept.iter().any(|(kept_name, _)| kept_name == name));
+        Ok(())
+    }
+
+    #[test]
+    fn body_fields_named_key_or_ticket_are_not_redacted_by_the_header_rules() {
+        assert!(!is_sensitive_key("key"));
+        assert!(!is_sensitive_key("ticket"));
+        assert_eq!(
+            redact(
+                Some("application/x-www-form-urlencoded"),
+                b"key=k1&ticket=T9&authentication_method=sms"
+            ),
+            "key=k1&ticket=T9&authentication_method=sms"
+        );
+    }
+
+    #[rstest]
+    #[case::password_part(
+        "multipart/form-data; boundary=BB",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB--\r\n",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+    )]
+    #[case::quoted_boundary(
+        "multipart/form-data; boundary=\"BB\"",
+        "--BB\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\nabc\r\n--BB--",
+        "--BB\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n[REDACTED]\r\n--BB--"
+    )]
+    #[case::lf_line_endings(
+        "multipart/form-data; boundary=BB",
+        "--BB\nContent-Disposition: form-data; name=\"secret\"\n\nabc\n--BB--\n",
+        "--BB\nContent-Disposition: form-data; name=\"secret\"\n\n[REDACTED]\n--BB--\n"
+    )]
+    fn sensitive_multipart_part_values_are_redacted(
+        #[case] content_type: &str,
+        #[case] body: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(redact(Some(content_type), body.as_bytes()), expected);
+    }
+
+    #[test]
+    fn multipart_ordinary_part_is_kept_and_sensitive_part_redacted() {
+        let body = "--BB\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n\
+                    --BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n\
+                    --BB\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"pw.png\"\r\n\
+                    Content-Type: image/png\r\n\r\nbinary\r\n--BB--\r\n";
+        let redacted = redact(Some("multipart/form-data; boundary=BB"), body.as_bytes());
+        assert_eq!(
+            redacted,
+            "--BB\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n\
+             --BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n\
+             --BB\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"pw.png\"\r\n\
+             Content-Type: image/png\r\n\r\nbinary\r\n--BB--\r\n"
+        );
+    }
+
+    #[test]
+    fn multipart_redact_field_names_are_redacted() {
+        let fields = vec!["ticket_ref".to_owned()];
+        let body =
+            "--BB\r\nContent-Disposition: form-data; name=\"ticket_ref\"\r\n\r\nT1\r\n--BB--\r\n";
+        assert_eq!(
+            redact_body(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                &fields
+            ),
+            "--BB\r\nContent-Disposition: form-data; name=\"ticket_ref\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+        );
+    }
+
+    #[rstest]
+    #[case::missing_closing_delimiter(
+        "multipart/form-data; boundary=BB",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2"
+    )]
+    #[case::missing_blank_line(
+        "multipart/form-data; boundary=BB",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\nhunter2\r\n--BB--"
+    )]
+    #[case::wrong_boundary(
+        "multipart/form-data; boundary=XX",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB--"
+    )]
+    #[case::no_boundary_parameter(
+        "multipart/form-data",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB--"
+    )]
+    fn broken_multipart_falls_back_to_lexical_redaction(
+        #[case] content_type: &str,
+        #[case] body: &str,
+    ) {
+        assert_eq!(
+            redact(Some(content_type), body.as_bytes()),
+            redact_lexical(body, &[])
+        );
+    }
+
+    #[test]
+    fn multipart_content_with_no_sensitive_names_is_unchanged() {
+        let body =
+            "--BB\r\nContent-Disposition: form-data; name=\"comment\"\r\n\r\nhello\r\n--BB--\r\n";
+        assert_eq!(
+            redact(Some("multipart/form-data; boundary=BB"), body.as_bytes()),
+            body
+        );
+    }
+
+    #[rstest]
+    #[case::password_element(
+        "application/xml",
+        "<auth><username>bob</username><password>hunter2</password></auth>",
+        "<auth><username>bob</username><password>[REDACTED]</password></auth>"
+    )]
+    #[case::soap_namespaced_password_with_attribute(
+        "application/soap+xml",
+        "<wsse:Security><wsse:Password Type=\"PasswordText\">hunter2</wsse:Password></wsse:Security>",
+        "<wsse:Security><wsse:Password Type=\"PasswordText\">[REDACTED]</wsse:Password></wsse:Security>"
+    )]
+    #[case::text_xml_token_element(
+        "text/xml",
+        "<req><api:token>abc</api:token></req>",
+        "<req><api:token>[REDACTED]</api:token></req>"
+    )]
+    #[case::mislabelled_as_json(
+        "application/json",
+        "<auth><password>hunter2</password></auth>",
+        "<auth><password>[REDACTED]</password></auth>"
+    )]
+    fn sensitive_xml_elements_are_redacted(
+        #[case] content_type: &str,
+        #[case] body: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(redact(Some(content_type), body.as_bytes()), expected);
+    }
+
+    #[test]
+    fn xml_ordinary_elements_are_kept() {
+        let body = "<auth><username>bob</username><name>Bob</name></auth>";
+        assert_eq!(redact(Some("application/xml"), body.as_bytes()), body);
+    }
+
+    #[test]
+    fn xml_self_closing_and_empty_sensitive_elements_are_kept() {
+        let body = "<req><password/><token></token></req>";
+        assert_eq!(redact(Some("application/xml"), body.as_bytes()), body);
+    }
+
+    #[rstest]
+    #[case::semicolon_hides_password("a=1;password=hunter2", "a=1;password=[REDACTED]")]
+    #[case::semicolon_before_ordinary("a=1;b=2", "a=1;b=2")]
+    #[case::ampersand_still_works("a=1&password=x", "a=1&password=[REDACTED]")]
+    fn form_body_semicolons_separate_fields(#[case] body: &str, #[case] expected: &str) {
+        assert_eq!(
+            redact(Some("application/x-www-form-urlencoded"), body.as_bytes()),
+            expected
+        );
     }
 
     #[test]

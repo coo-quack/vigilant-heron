@@ -156,23 +156,37 @@ sent:
   `x-session-id`, and each name in `redact_header` is dropped too. Headers the
   model uses to judge a request, such as `host`, `user-agent`, `content-type`,
   `accept`, `referer`, `origin` and `x-forwarded-for`, are sent.
-- Form and JSON bodies are scanned for sensitive fields. A field is sensitive
-  when its name contains one of these parts, matched anywhere in the name, with
-  case and `_`, `-`, `.` ignored: `password`, `passwd`, `secret`, `token`,
+  Header names get two more rules that body fields do not. A header is dropped when
+  one of its words is `ticket` or `authentication`, as in `x-cas-ticket` and
+  `x-authentication`, or when its last word is `key`, `authkey` or `sessionkey`, as
+  in `x-functions-key`, `x-master-key` and `x-authkey`. `x-limit-key` is dropped by
+  the same rule. `sec-websocket-key` is kept, because it is the handshake nonce and
+  not a credential.
+- Form, JSON, multipart and XML bodies are scanned for sensitive fields. A field is
+  sensitive when its name contains one of these parts, matched anywhere in the name,
+  with case and `_`, `-`, `.` ignored: `password`, `passwd`, `secret`, `token`,
   `apikey`, `passphrase`, `passcode`, `credential`, `private_key`, `access_key`,
-  `credit_card` and `card_number`. It is also sensitive when one of its words is
-  `pass`, `pin`, `otp`, `auth`, `session`, `cookie`, `jwt`, `pwd`, `card`, `cvv`,
-  `cvc` or `ssn`. Those short words match only as whole words. A word is a run of
-  letters and digits, split at other characters and at a lowercase to uppercase
-  change, so `card_id`, `userSSN` and `new_pwd` are sensitive, while `author`,
-  `shipping`, `passenger`, `class_name`, `business_name` and `postcard` are not. The
-  value is replaced by `[REDACTED]`. A field named in `redact_field` is also
-  replaced, when its name equals that name, case-insensitively. Text that is
-  neither form data nor valid JSON is scanned for `key=value` pairs and
-  `"key": value` pairs with the same rules.
-- The query string is scanned by the same name rule. Both `&` and `;` separate
-  parameters. A parameter whose decoded name is sensitive, or is named in
-  `redact_field`, has its value replaced by `[REDACTED]`. The other parameters and
+  `credit_card`, `card_number` and `signature`. It is also sensitive when one of its
+  words is `pass`, `pin`, `otp`, `auth`, `session`, `cookie`, `jwt`, `pwd`, `card`,
+  `cvv`, `cvc` or `ssn`. Those short words match only as whole words. A word is a
+  run of letters and digits, split at other characters and at a lowercase to
+  uppercase change, so `card_id`, `userSSN` and `new_pwd` are sensitive, while
+  `author`, `shipping`, `passenger`, `class_name`, `business_name` and `postcard` are
+  not. The value is replaced by `[REDACTED]`. A field named in `redact_field` is also
+  replaced, when its name equals that name, case-insensitively.
+- Multipart bodies (`multipart/form-data`) are split into parts. A part is redacted
+  when its `Content-Disposition` `name` is sensitive. Its value is replaced, and its
+  boundary and part headers are sent as they were. A file part is redacted by its
+  field name only, and its content is not scanned. A multipart body without the
+  expected framing is scanned as text, as below.
+- XML and SOAP elements whose local name is sensitive have their text replaced, so
+  `<password>` and `<wsse:Password Type="...">` are redacted and `<username>` is
+  kept. Attributes are not scanned.
+- Text that is none of these, including XML sent with a JSON content type, is
+  scanned for `key=value` pairs and `"key": value` pairs with the same rules.
+- The query string and form bodies are scanned by the same name rule. Both `&` and
+  `;` separate parameters. A parameter whose decoded name is sensitive, or is named
+  in `redact_field`, has its value replaced by `[REDACTED]`. The other parameters and
   the separators are sent exactly as the client sent them, in the same order.
 - Only the first `inspect_body` bytes of the body are sent, cut on a UTF-8 boundary.
   `body_truncated` is set when the body was longer.
