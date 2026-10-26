@@ -195,7 +195,8 @@ pub(crate) const DEFAULT_CONFIG_PATH: &str = "/etc/vigilant-heron/vigilant-heron
 /// # Errors
 ///
 /// Returns an error when the configuration cannot be read, the pid file is missing
-/// or does not hold a process id, or no process has that id (a stale pid file).
+/// or does not hold a process id, no router holds the pid file's lock (a stale pid file,
+/// in which case nothing is signalled), or no process has that id.
 pub(crate) fn send_signal(
     config_path: &std::path::Path,
     command: SignalCommand,
@@ -215,6 +216,16 @@ pub(crate) fn send_signal(
             anyhow!("the pid file {}: {error}", pid_path.display())
         }
     })?;
+    // A router holds the lock of the pid file for its whole life. Without the lock the pid
+    // may belong to an unrelated process that reused it, so nothing is signalled.
+    let locked = pidfile::lock_held(&pid_path)
+        .map_err(|error| anyhow!("the lock of the pid file {}: {error}", pid_path.display()))?;
+    if !locked {
+        bail!(
+            "the pid file {} is stale: no router holds its lock, so no signal was sent (process {raw} may be unrelated); delete the file if no router runs",
+            pid_path.display()
+        );
+    }
     let pid = Pid::from_raw(raw).ok_or_else(|| anyhow!("invalid process id {raw}"))?;
     match kill_process(pid, command.signal()) {
         Ok(()) => Ok(()),

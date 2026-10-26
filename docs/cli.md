@@ -43,15 +43,18 @@ container runtime or systemd watch the process.
   in its own process group, with its standard input and output not kept. It waits
   up to 10 seconds for the router to write its pid file, then prints
   `started (pid N)` and exits 0. If the router exits while it starts, `start` exits
-  1 and prints the router's startup message. A stale pid file, one that names no
-  process, does not stop `start`.
+  1 and prints the router's startup message. A stale pid file does not stop
+  `start`: a pid file counts as running only while a router holds its lock (see
+  [One router per pid file](#one-router-per-pid-file)), so a file that names a
+  process but has no lock is stale.
 - **`stop`** sends the graceful shutdown that `-s quit` sends, then waits until the
   router has exited. It prints `stopped (pid N)`. The wait is the
   [worker_shutdown_timeout](/configuration#worker_shutdown_timeout) plus 5 seconds,
   or 35 seconds (30 seconds plus 5) when that directive is not set. If the router is still running after
   the wait, `stop` exits 1 and says so. It does not kill the process. With no pid
   file, or with a stale one, `stop` prints `not running` and exits 0, as
-  `systemctl stop` does.
+  `systemctl stop` does. A pid file is stale when no router holds its lock, even
+  if the process it names is alive, and `stop` does not signal that process.
 - **`restart`** checks the configuration first. An invalid file exits 1, and the
   running router keeps its pid and keeps serving. Otherwise it stops the running
   router, if there is one, and starts a new one.
@@ -66,6 +69,25 @@ stopped (pid 48211)
 
 A router started with `start` is not restarted if it crashes. Nothing watches it.
 Use systemd for that, as [Installation](/install#run-as-a-service-with-systemd) shows.
+
+### One router per pid file
+
+A running router holds an exclusive lock on a file next to its pid file, named
+`<pid file>.lock`, until it exits. It takes the lock before it binds its
+listen address, so a second router with the same `pid` path does not start. It
+exits 1 with this message and does not change the pid file or bind:
+
+```console
+$ vigilant-heron -c second.conf
+vigilant-heron: another router is using the pid file /run/vigilant-heron.pid
+```
+
+The lock file is an empty file. The router never deletes it, so it stays after
+the router exits. The lock is what makes a pid file trusted as a running router.
+If the lock file cannot be created, or another user owns it inside a shared
+directory, the router logs a warning and runs without the lock. Then `-s`, `start`,
+`stop` and `restart` treat it as not running, and `start` may start a second
+router with the same pid file.
 
 ### Standard streams and logs
 
@@ -155,6 +177,11 @@ which defaults to `/run/vigilant-heron.pid`. The router writes that file once it
 is listening, and removes it on exit. `-s` reads `pid` from the configuration it
 is given, so pass the same `-c` as the running router.
 
+`-s` sends a signal only while a router holds the lock of the pid file (see
+[One router per pid file](#one-router-per-pid-file)). A pid file without the lock is
+stale: `-s` fails and sends nothing, even when the process it names is alive,
+because a crashed router's pid can belong to an unrelated process now.
+
 ```console
 $ vigilant-heron -s reload -c vigilant-heron.conf
 $ vigilant-heron -s reopen -c vigilant-heron.conf
@@ -171,6 +198,7 @@ router to finish the work the signal asks for.
 | `cannot read the pid file <path>` | The router is not running with this configuration, or it has exited without removing the file. |
 | `does not hold a process id` | The file was edited by hand or is damaged. A positive decimal process id is required. |
 | `is not trusted` | The file sits in a shared directory such as `/tmp` and another user owns it, so its contents are ignored. Put the pid file in a directory that only the router's user can write. |
+| `the pid file <path> is stale: no router holds its lock` | The router has stopped, or it crashed and left the file. Nothing was signalled. Delete the file if no router runs. |
 | `no process <n> is running: the pid file <path> is stale` | The router has stopped, or the file was left by a crash. Delete the file. |
 
 Each of these exits 1.
@@ -194,6 +222,9 @@ docker exec <container> /usr/local/bin/vigilant-heron -s reload -c /etc/vigilant
 
 If the pid file cannot be written at startup, the router logs a warning and runs
 anyway, so `-s` reports the missing file instead of the router refusing to start.
+The same holds for the lock file: if it cannot be created or is not trusted, the
+router logs a warning and runs without the lock, as described in
+[One router per pid file](#one-router-per-pid-file).
 
 
 ## Run from source

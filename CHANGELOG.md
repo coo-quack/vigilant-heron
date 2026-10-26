@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fixed: a stale pid file could make `-s`, `stop`, `restart` and `start` act on an
+  unrelated process. When a router died without removing its pid file and the OS
+  gave its pid to another process, `-s stop` or `stop` signalled that process, and
+  `start` refused with "already running". A running router now holds an exclusive
+  lock on `<pid file>.lock`, and those commands treat a pid file as running only
+  while the lock is held. A stale file is never signalled. Also, two routers with
+  the same `pid` path no longer overwrite each other's pid file: the second exits
+  with `another router is using the pid file <path>`.
 - Changed: releases now run the tests and the advisory check (`cargo deny` and
   `pnpm audit`) in a job without write access, and the publishing job keeps no
   credential in its checkout. The version tag is created through the REST API.
