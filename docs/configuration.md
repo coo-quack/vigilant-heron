@@ -266,7 +266,7 @@ The parser rejects `max_body` and names its replacement, `client_max_body_size`,
 - **Default:** none. Every client is allowed.
 - **Context:** top level, site.
 
-Access list by client address. The entries are checked in order, and the first entry that covers the client decides. A denied client gets 403 before the body is read. A site that has any `allow` or `deny` line replaces the top-level list. See [Rules](/rules#access-list).
+Access list by client address. The entries are checked in order, and the first entry that covers the client decides. A denied client gets 403 before the body is read. On a site in [shadow mode](/how-it-works#shadow-mode), a denied client is forwarded and the denial is recorded as `would_have=block`, as for every other check. A site that has any `allow` or `deny` line replaces the top-level list. See [Rules](/rules#access-list).
 
 ### `proxy_set_header`
 
