@@ -131,6 +131,45 @@ async fn access_line_has_the_request_fields_and_the_decision() -> TestResult {
 }
 
 #[tokio::test]
+async fn query_shape_logs_names_and_value_classes_never_values() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("query-shape");
+    let _ = std::fs::remove_file(&path);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?p=42&s=secret+words", "shape-1").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "shape-1").await?;
+    assert_eq!(line["query_shape"], "p=<num>&s=<text>");
+    let text = std::fs::read_to_string(&path)?;
+    assert!(
+        !text.contains("secret"),
+        "query value leaked into the log: {text}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn query_shape_is_empty_when_the_request_has_no_query() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("query-shape-none");
+    let _ = std::fs::remove_file(&path);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/articles", "shape-2").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "shape-2").await?;
+    assert_eq!(line["query_shape"], "");
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn long_request_id_is_cut_to_128_bytes_and_not_sent_to_the_backend() -> TestResult {
     let decider = StubDecider::start().await?;
     let upstream = Upstream::start().await?;

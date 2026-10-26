@@ -53,7 +53,7 @@ container runtime or systemd watch the process.
   process but has no lock is stale.
 - **`stop`** sends the graceful shutdown that `-s quit` sends, then waits until the
   router has exited. It prints `stopped (pid N)`. The wait is the
-  [worker_shutdown_timeout](/configuration#worker_shutdown_timeout) plus 5 seconds,
+  [worker_shutdown_timeout](/configuration#worker-shutdown-timeout) plus 5 seconds,
   or 35 seconds (30 seconds plus 5) when that directive is not set. If the router is still running after
   the wait, `stop` exits 1 and says so. It does not kill the process. With no pid
   file, or with a stale one, `stop` prints `not running` and exits 0, as
@@ -309,7 +309,7 @@ at least 1, or a score from 0 to 1.
 | `quit` | `SIGQUIT` | Shuts down gracefully. |
 
 In this version `stop` and `quit` both wait for requests in flight, as
-[worker_shutdown_timeout](/configuration#worker_shutdown_timeout) describes. There
+[worker_shutdown_timeout](/configuration#worker-shutdown-timeout) describes. There
 is no fast shutdown yet.
 
 The pid comes from the file named by the [`pid`](/configuration#pid) directive,

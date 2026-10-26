@@ -199,6 +199,84 @@ fn decode_name(raw: &str) -> String {
         .collect()
 }
 
+/// Describes the shape of a query string for the `$query_shape` log variable.
+///
+/// The output keeps the parameter names and the class of each value, and never
+/// the value text: `p=42&s=secret+words` becomes `p=<num>&s=<text>`. Parameters
+/// are separated by `&` or `;` as in [`redact_query`], and empty pieces are
+/// skipped. At most 16 parameters are shown, then `<more>`. Returns `None` when
+/// the query has no parameter at all.
+pub(crate) fn query_shape(query: &str) -> Option<String> {
+    const MAX_PARAMETERS: usize = 16;
+    let mut parameters = query
+        .split(is_parameter_separator)
+        .filter(|piece| !piece.is_empty());
+    let mut shapes: Vec<String> = parameters
+        .by_ref()
+        .take(MAX_PARAMETERS)
+        .map(parameter_shape)
+        .collect();
+    if parameters.next().is_some() {
+        shapes.push("<more>".to_owned());
+    }
+    (!shapes.is_empty()).then(|| shapes.join("&"))
+}
+
+/// Describes one non-empty query parameter as `name=<class>`, or `<bare>` when it has no `=`.
+fn parameter_shape(parameter: &str) -> String {
+    match parameter.split_once('=') {
+        None => "<bare>".to_owned(),
+        Some((raw_name, raw_value)) => {
+            let name = decode_name(raw_name);
+            let name = if is_plain_name(&name) {
+                name
+            } else {
+                "<name>".to_owned()
+            };
+            format!("{name}={}", value_class(raw_value))
+        }
+    }
+}
+
+/// Whether a decoded parameter name is a plain identifier: an ASCII letter or `_`
+/// first, then up to 31 ASCII letters, digits, `_`, `.`, `-`, `[` or `]`.
+fn is_plain_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let starts_well = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    starts_well
+        && name.len() <= 32
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '[' | ']'))
+}
+
+/// The class of a raw parameter value, taken after form decoding: `<empty>`,
+/// `<num>` (1 to 20 digits), `<word>` (1 to 64 letters, digits, `_` or `-`) or `<text>`.
+fn value_class(raw_value: &str) -> &'static str {
+    let value = decode_value(raw_value);
+    if value.is_empty() {
+        "<empty>"
+    } else if value.len() <= 20 && value.bytes().all(|b| b.is_ascii_digit()) {
+        "<num>"
+    } else if value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        "<word>"
+    } else {
+        "<text>"
+    }
+}
+
+/// Decodes a parameter value the way form data does. The value is placed after a
+/// dummy name so that the form parser decodes it; the raw value holds no `&` or `;`.
+fn decode_value(raw: &str) -> String {
+    form_urlencoded::parse(format!("v={raw}").as_bytes())
+        .map(|(_, value)| value.into_owned())
+        .collect()
+}
+
 /// Copies the headers that may be sent, dropping credentials and redacted names.
 pub(crate) fn sanitize_headers(headers: &HeaderMap, extra: &[String]) -> Vec<(String, String)> {
     headers
@@ -801,6 +879,73 @@ mod tests {
     #[case::trailing_separators_are_kept("token=t;&", "token=[REDACTED];&")]
     fn sensitive_query_parameters_are_redacted(#[case] query: &str, #[case] expected: &str) {
         assert_eq!(redact_query(query, &[]), expected);
+    }
+
+    #[rstest]
+    #[case::empty_query_is_none("", None)]
+    #[case::only_separators_is_none("&", None)]
+    #[case::empty_pieces_are_none("&&;", None)]
+    #[case::number_value_is_num("p=123", Some("p=<num>"))]
+    #[case::word_value_is_word("feed=rss2", Some("feed=<word>"))]
+    #[case::plus_makes_text("s=hello+world", Some("s=<text>"))]
+    #[case::empty_value_is_empty("q=", Some("q=<empty>"))]
+    #[case::piece_without_equals_is_bare("abc", Some("<bare>"))]
+    #[case::semicolon_separates("a=1;b=x", Some("a=<num>&b=<word>"))]
+    #[case::percent_encoded_name_is_decoded("%70=1", Some("p=<num>"))]
+    #[case::name_with_space_is_not_plain("a+b=1", Some("<name>=<num>"))]
+    #[case::thirty_three_char_name_is_not_plain(
+        "abcdefghijklmnopqrstuvwxyzabcdefg=1",
+        Some("<name>=<num>")
+    )]
+    #[case::thirty_two_char_name_is_plain(
+        "abcdefghijklmnopqrstuvwxyzabcdef=1",
+        Some("abcdefghijklmnopqrstuvwxyzabcdef=<num>")
+    )]
+    #[case::twenty_one_digits_is_word("n=123456789012345678901", Some("n=<word>"))]
+    #[case::twenty_digits_is_num("n=12345678901234567890", Some("n=<num>"))]
+    #[case::sixty_five_chars_is_text(
+        "v=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmno",
+        Some("v=<text>")
+    )]
+    #[case::sixty_four_chars_is_word(
+        "v=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijkl",
+        Some("v=<word>")
+    )]
+    #[case::seventeen_parameters_show_sixteen_then_more(
+        "a=1&b=1&c=1&d=1&e=1&f=1&g=1&h=1&i=1&j=1&k=1&l=1&m=1&n=1&o=1&p=1&q=1",
+        Some(
+            "a=<num>&b=<num>&c=<num>&d=<num>&e=<num>&f=<num>&g=<num>&h=<num>&i=<num>&j=<num>&k=<num>&l=<num>&m=<num>&n=<num>&o=<num>&p=<num>&<more>"
+        )
+    )]
+    #[case::sixteen_parameters_have_no_more(
+        "a=1&b=1&c=1&d=1&e=1&f=1&g=1&h=1&i=1&j=1&k=1&l=1&m=1&n=1&o=1&p=1",
+        Some(
+            "a=<num>&b=<num>&c=<num>&d=<num>&e=<num>&f=<num>&g=<num>&h=<num>&i=<num>&j=<num>&k=<num>&l=<num>&m=<num>&n=<num>&o=<num>&p=<num>"
+        )
+    )]
+    fn query_shape_describes_names_and_value_classes(
+        #[case] query: &str,
+        #[case] expected: Option<&str>,
+    ) {
+        assert_eq!(query_shape(query).as_deref(), expected);
+    }
+
+    #[test]
+    fn query_shape_never_contains_value_text() {
+        let shape = query_shape("token=Secr3tValue&email=a%40b.example");
+        assert_eq!(shape.as_deref(), Some("token=<word>&email=<text>"));
+        let shape = shape.unwrap_or_default();
+        assert!(!shape.contains("Secr3tValue"));
+        assert!(!shape.contains("b.example"));
+    }
+
+    proptest! {
+        #[test]
+        fn query_shape_output_uses_only_shape_characters(query in "\\PC{0,128}") {
+            let shape = query_shape(&query).unwrap_or_default();
+            prop_assert!(shape.chars().all(|c| c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '.' | '-' | '[' | ']' | '<' | '>' | '=' | '&')));
+        }
     }
 
     #[test]

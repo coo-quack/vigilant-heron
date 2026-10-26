@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added: the `$query_shape` log variable and a `query_shape` field in the built-in
+  `json` format. It records the names of the query parameters and the kind of each
+  value (`p=<num>&s=<text>`), never the values, so a log shows which kinds of
+  requests a site receives. See [Logging](/logging#query-shape).
 - Added: `vigilant-heron suggest-skip-rules <access-log>` reads a `json` access log
   and suggests skip rules for request shapes that the model judged harmless many
   times, from many clients, over several days, and never blocked. It only prints the
