@@ -189,6 +189,11 @@ jobs:
   mutants-diff:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      # cargo runs the test binaries through prlimit (6 GiB of address space, 4 GiB
+      # per file), so a mutant that loops while allocating or writing is killed, and
+      # counts as caught, instead of taking the runner down. The compiler is not limited.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=6442450944 --fsize=4294967296 --
     permissions:
       contents: read
     steps:
