@@ -76,6 +76,8 @@ const JEV_URL: &str = "https://api.typesafe.ai/v1/systemone";
 const JEV_MODEL: &str = "jev-latest";
 /// The variable read for the Jev token when `api_token_env` is omitted.
 const JEV_TOKEN_ENV: &str = "TYPESAFE_API_KEY";
+/// The model used when `model` is omitted with backend strands.
+const STRANDS_MODEL: &str = "strands-decider";
 /// Longest request id that is logged; longer values are cut.
 pub(crate) const MAX_REQUEST_ID_BYTES: usize = 128;
 /// File extensions that skip the backend when `static_extensions` is not given.
@@ -376,6 +378,15 @@ pub enum BackendConfig {
         model: String,
         /// Bearer token, read from the environment variable named in the config.
         token: ApiToken,
+    },
+    /// Strands Decider, a self-hosted server that speaks the System One protocol.
+    /// The server has no authentication, so the token is optional.
+    Strands {
+        /// Model identifier sent in the request, such as `strands-decider`.
+        model: String,
+        /// Bearer token, read from the environment variable named in the config.
+        /// `None` when `api_token_env` is omitted, and no `Authorization` header is sent.
+        token: Option<ApiToken>,
     },
 }
 
@@ -1516,11 +1527,11 @@ where
                 once(&mut seen, child)?;
                 backend_line = child;
                 backend_name = match one_arg(child)? {
-                    name @ ("jev" | "clef" | "http") => name,
+                    name @ ("jev" | "clef" | "strands" | "http") => name,
                     other => {
                         return Err(invalid(
                             child,
-                            format!("\"backend\" must be jev, clef or http, got {other}"),
+                            format!("\"backend\" must be jev, clef, strands or http, got {other}"),
                         ));
                     }
                 };
@@ -1674,6 +1685,24 @@ where
             BackendConfig::Clef {
                 model,
                 token: read_token(token_line, &env_name, lookup)?,
+            }
+        }
+        "strands" => {
+            let model_text = model.unwrap_or_else(|| STRANDS_MODEL.to_owned());
+            if !is_valid_model_id(&model_text) {
+                return Err(invalid(
+                    model_line,
+                    format!(
+                        "\"model\" must be 1 to 100 characters from [A-Za-z0-9._-], got {model_text}"
+                    ),
+                ));
+            }
+            let token = token_env
+                .map(|env_name| read_token(token_line, &env_name, lookup))
+                .transpose()?;
+            BackendConfig::Strands {
+                model: model_text,
+                token,
             }
         }
         _ => {
@@ -2277,6 +2306,82 @@ mod tests {
             "    backend jev;\n    model \"jev latest\";\n    api_token_env TEST_TOKEN;\n",
         );
         assert!(message(parse(&text)).contains("1 to 100 characters"));
+    }
+
+    #[test]
+    fn strands_requires_a_url() {
+        let text = "listen 127.0.0.1:8080;\ndecision {\n    backend strands;\n}\n\
+                    site example.com {\n    upstream http://upstream:80;\n}\n";
+        assert!(message(parse(text)).contains("\"url\" is required with backend strands"));
+    }
+
+    #[test]
+    fn strands_model_defaults_to_strands_decider() -> Result<(), ConfigError> {
+        let config = parse(&with_decision("    backend strands;\n"))?;
+        assert!(matches!(
+            &config.decision.backend,
+            BackendConfig::Strands { model, .. } if model == "strands-decider"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn strands_keeps_a_custom_valid_model() -> Result<(), ConfigError> {
+        let config = parse(&with_decision(
+            "    backend strands;\n    model my-decider.2B_v1;\n",
+        ))?;
+        assert!(matches!(
+            &config.decision.backend,
+            BackendConfig::Strands { model, .. } if model == "my-decider.2B_v1"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn strands_rejects_an_invalid_model_with_the_model_line() {
+        let text = with_decision("    backend strands;\n    model \"strands decider\";\n");
+        // Line 1 listen, 2 decision, 3 url, 4 backend, 5 model.
+        let error = message(parse(&text));
+        assert!(error.contains("test.conf:5:"));
+        assert!(error.contains("1 to 100 characters"));
+    }
+
+    #[test]
+    fn strands_without_api_token_env_sends_no_token() -> Result<(), ConfigError> {
+        let config = parse(&with_decision("    backend strands;\n"))?;
+        assert!(matches!(
+            &config.decision.backend,
+            BackendConfig::Strands { token: None, .. }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn strands_with_api_token_env_reads_the_token() -> Result<(), ConfigError> {
+        let config = parse(&with_decision(
+            "    backend strands;\n    api_token_env TEST_TOKEN;\n",
+        ))?;
+        assert!(matches!(
+            &config.decision.backend,
+            BackendConfig::Strands { token: Some(token), .. } if token.expose() == "tok-123"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn strands_names_a_token_variable_that_is_not_set() {
+        let text = with_decision("    backend strands;\n    api_token_env ABSENT;\n");
+        let result = Config::parse_str_with_lookup(&text, "test.conf", |_| None);
+        assert!(message(result).contains("environment variable ABSENT"));
+    }
+
+    #[test]
+    fn the_backend_error_lists_strands() {
+        let text = with_decision("    backend bogus;\n");
+        assert!(
+            message(parse(&text))
+                .contains("\"backend\" must be jev, clef, strands or http, got bogus")
+        );
     }
 
     #[rstest]

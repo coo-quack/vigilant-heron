@@ -124,23 +124,27 @@ impl AppState<Backend> {
             queue_timeout: config.decision.queue_timeout,
             slots: Arc::clone(&slots),
         };
-        let backend = match &config.decision.backend {
-            BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, limits)),
-            BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
-                client,
-                url,
-                model.as_str().to_owned(),
-                token.clone(),
-                limits,
-            )),
-            BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
-                client,
-                url,
-                model.clone(),
-                token.clone(),
-                limits,
-            )),
-        };
+        let backend =
+            match &config.decision.backend {
+                BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, limits)),
+                BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
+                    client,
+                    url,
+                    model.as_str().to_owned(),
+                    Some(token.clone()),
+                    limits,
+                )),
+                BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
+                    client,
+                    url,
+                    model.clone(),
+                    Some(token.clone()),
+                    limits,
+                )),
+                BackendConfig::Strands { model, token } => Backend::SystemOne(
+                    SystemOneBackend::new(client, url, model.clone(), token.clone(), limits),
+                ),
+            };
         // The request-id header identifies the request to the log only.
         let mut backend_redact = config.decision.redact_headers.clone();
         if let Some(name) = &config.request_id_header {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added: decision backend `strands` (`decision.backend strands;`) for a self-hosted
+  Strands Decider server, which speaks the System One protocol. `model` defaults to
+  `strands-decider`, `url` is required, and `api_token_env` is optional: without it,
+  no `Authorization` header is sent.
 - Behaviour change: a client that holds its `max_concurrency_per_client` share of
   decision calls is now answered 429 with an empty body, and the backend is not
   called. Before, that excess followed `on_rate_limit`, which defaults to `allow`,

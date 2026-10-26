@@ -291,7 +291,7 @@ impl DecisionBackend for HttpDecisionBackend {
 pub(crate) enum Backend {
     /// The JSON protocol over HTTP.
     Http(HttpDecisionBackend),
-    /// The System One protocol: Cloudflare Clef, `TypeSafe` Jev, or a server that speaks it.
+    /// The System One protocol: Cloudflare Clef, `TypeSafe` Jev, Strands Decider, or a server that speaks it.
     SystemOne(SystemOneBackend),
 }
 
