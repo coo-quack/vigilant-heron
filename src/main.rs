@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
 use pidfile::PidFile;
 use tokio::signal::unix::{SignalKind, signal};
@@ -167,6 +167,23 @@ async fn run(
     }
     // Registered before the listener is bound, so a stop sent once the pid file exists is handled.
     let shutdown = shutdown_signal();
+    // The lock comes before the bind, so a second router with the same pid file exits without
+    // binding or touching the pid file. Any other failure to lock is logged and the router still
+    // runs, as a failure to write the pid file is.
+    let mut pid_file = match PidFile::lock(&config.pid_file).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(anyhow!("{error}"));
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %config.pid_file.display(),
+                "cannot lock the pid file; `-s` and `stop` will not find this process"
+            );
+            PidFile::unlocked(&config.pid_file)
+        }
+    };
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
@@ -174,17 +191,13 @@ async fn run(
     // accepts connections. A failure to write it is logged and the router still runs, so an
     // existing deployment whose directory is not writable keeps working; `-s` then reports the
     // missing file.
-    let _pid_file = match PidFile::create(&config.pid_file) {
-        Ok(file) => Some(file),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                path = %config.pid_file.display(),
-                "cannot write the pid file; `-s` will not find this process"
-            );
-            None
-        }
-    };
+    if let Err(error) = pid_file.write() {
+        tracing::warn!(
+            %error,
+            path = %config.pid_file.display(),
+            "cannot write the pid file; `-s` will not find this process"
+        );
+    }
     tracing::info!(listen = %config.listen, "vigilant-heron is listening");
     // A reload stages the new error log destination before the configuration is
     // put into service, and the staged destination is committed only after that.

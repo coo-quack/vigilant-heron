@@ -528,6 +528,94 @@ fn signal_with_a_stale_pid_file_fails_with_exit_one() -> Result<(), std::io::Err
     Ok(())
 }
 
+/// Starts a `sleep` that the test owns, so a stale pid file can name a live process.
+fn live_stranger() -> Result<Child, std::io::Error> {
+    Ok(Child(Command::new("sleep").arg("30").spawn()?))
+}
+
+#[test]
+fn a_stale_pid_file_naming_a_live_process_is_not_signalled() -> Result<(), std::io::Error> {
+    // The pid file is left behind with no lock held, as a crashed router leaves it. The pid
+    // now belongs to an unrelated process, which must receive no signal.
+    let fixture = Fixture::new("signal-live-stale")?;
+    fixture.write(&router_config(1, &fixture.pid, 9, ""))?;
+    let stranger = live_stranger()?;
+    let stranger_pid = stranger.0.id();
+    std::fs::write(&fixture.pid, format!("{stranger_pid}\n"))?;
+    for word in ["reload", "stop"] {
+        let output = fixture.signal(word)?;
+        assert_eq!(output.status.code(), Some(1), "{word}: {}", text(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("is stale"), "{word}: {stderr}");
+        assert!(
+            alive(stranger_pid),
+            "-s {word} signalled the unrelated process {stranger_pid}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stop_does_not_signal_a_live_process_named_by_a_stale_pid_file() -> Result<(), std::io::Error> {
+    let fixture = Fixture::new("stop-live-stale")?;
+    fixture.write(&router_config(1, &fixture.pid, 9, ""))?;
+    let stranger = live_stranger()?;
+    let stranger_pid = stranger.0.id();
+    std::fs::write(&fixture.pid, format!("{stranger_pid}\n"))?;
+    let output = fixture.lifecycle("stop")?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("not running"));
+    assert!(
+        alive(stranger_pid),
+        "stop signalled the unrelated process {stranger_pid}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_second_router_with_the_same_pid_file_exits() -> Result<(), std::io::Error> {
+    let fixture = Fixture::new("second-router")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    fixture.write(&router_config(port, &fixture.pid, upstream.port, ""))?;
+    assert_eq!(fixture.lifecycle("start")?.status.code(), Some(0));
+    let first = read_pid(&fixture.pid).ok_or_else(|| std::io::Error::other("no pid"))?;
+
+    let second_conf = fixture.dir.join("second.conf");
+    std::fs::write(
+        &second_conf,
+        router_config(free_port()?, &fixture.pid, upstream.port, ""),
+    )?;
+    let mut second = Child(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&second_conf)
+            .env_remove("VIGILANT_HERON_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let status = wait_for_exit(&mut second, Duration::from_secs(10));
+    let mut stderr = String::new();
+    if let Some(mut pipe) = second.0.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    assert_eq!(status.and_then(|status| status.code()), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "another router is using the pid file {}",
+            fixture.pid.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(read_pid(&fixture.pid), Some(first), "the pid file changed");
+    assert!(
+        wait_for(port, "example.com", "/", 200).is_some(),
+        "the first router stopped serving"
+    );
+    Ok(())
+}
+
 /// Starts the router in the foreground with `conf`, and waits until its pid file exists.
 fn foreground(conf: &Path, pid: &Path) -> Result<Child, std::io::Error> {
     let child = Child(
@@ -729,6 +817,24 @@ fn signal_stop_exits_zero_and_removes_the_pid_file() -> Result<(), std::io::Erro
 // ---------------------------------------------------------------------------
 // start
 // ---------------------------------------------------------------------------
+
+#[test]
+fn start_proceeds_past_a_stale_pid_file_naming_a_live_process() -> Result<(), std::io::Error> {
+    let fixture = Fixture::new("start-live-stale")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    fixture.write(&router_config(port, &fixture.pid, upstream.port, ""))?;
+    let stranger = live_stranger()?;
+    let stranger_pid = stranger.0.id();
+    std::fs::write(&fixture.pid, format!("{stranger_pid}\n"))?;
+    let output = fixture.lifecycle("start")?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let pid = read_pid(&fixture.pid).ok_or_else(|| std::io::Error::other("no pid"))?;
+    assert_ne!(pid, stranger_pid, "the pid file still names the stranger");
+    assert!(alive(stranger_pid), "start signalled the unrelated process");
+    assert!(wait_for(port, "example.com", "/", 200).is_some());
+    Ok(())
+}
 
 #[test]
 fn start_serves_in_the_background_and_writes_the_child_pid() -> Result<(), std::io::Error> {
@@ -972,6 +1078,19 @@ fn stop_fails_without_killing_a_process_that_outlives_the_bound() -> Result<(), 
             .spawn()?,
     );
     std::fs::write(&fixture.pid, format!("{}\n", stubborn.0.id()))?;
+    // A running router holds the lock of its pid file, so the test holds it for the process
+    // that stands in for the router. Without the lock, stop would take the file for a stale one.
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(format!("{}.lock", fixture.pid.display()))?;
+    // `lock_file` keeps the lock until the test ends.
+    rustix::fs::flock(
+        &lock_file,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .map_err(std::io::Error::from)?;
     let began = Instant::now();
     let output = fixture.lifecycle("stop")?;
     let took = began.elapsed();
