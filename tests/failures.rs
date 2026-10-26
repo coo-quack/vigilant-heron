@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
-use common::{BoxError, Reply, TestResult, Upstream, closed_port_url, send, start_proxy_config};
+use common::{
+    BoxError, GatedDecider, Reply, TestResult, Upstream, closed_port_url, send, start_proxy_config,
+};
 use http::{Method, StatusCode};
 use rstest::rstest;
 use vigilant_heron::Config;
@@ -683,5 +685,81 @@ async fn fail_closed_path_wins_over_client_busy() -> TestResult {
     let line = wait_for_access_line(&log, "closed-excess").await?;
     assert_eq!(line["reason"], "fail_closed_path");
     assert_eq!(line["decision_error"], "client_busy");
+    proxy.stop().await
+}
+
+/// Time spent waiting for a decision slot counts against `timeout`: a call that
+/// queues behind a running one gets only the rest of its timeout once it has a slot.
+#[tokio::test]
+async fn time_in_the_slot_queue_counts_against_the_decision_timeout() -> TestResult {
+    let decider = GatedDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+real_ip_from 127.0.0.0/8;
+real_ip_header x-real-ip;
+
+decision {{
+    backend http;
+    url "{decide}";
+    timeout 2000ms;
+    max_concurrency 1;
+    queue_timeout 2000ms;
+    inspect_body 512;
+}}
+
+default_status 421;
+
+site example.com {{
+    upstream "{upstream}";
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    on_decision_error block;
+}}
+"#,
+        decide = decider.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy_config(Config::parse_str(&text, "test.conf")?).await?;
+    let base = proxy.base();
+
+    // The first call takes the only slot and waits at the backend.
+    let holder_base = base.clone();
+    let holder =
+        tokio::spawn(
+            async move { get_as(&holder_base, "/holder", "203.0.113.1", "slot-holder").await },
+        );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while decider.calls() == 0 {
+        if Instant::now() > deadline {
+            return Err("the holding request never reached the backend".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // The second call queues for the slot. The fixed sleep lets it queue for a while
+    // before the first call finishes; the queue wait is then one second of its two.
+    let started = Instant::now();
+    let queued_base = base.clone();
+    let queued = tokio::spawn(async move {
+        let reply = get_as(&queued_base, "/queued", "203.0.113.2", "slot-queued").await;
+        reply.map(|reply| (reply, started.elapsed()))
+    });
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    decider.release(1);
+    assert_eq!(holder.await??.status.as_u16(), 200, "the holder is judged");
+
+    let (reply, elapsed) = queued.await??;
+    assert_eq!(
+        reply.status.as_u16(),
+        403,
+        "the queued call times out and on_decision_error block applies"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the queued call answered after {elapsed:?}; its timeout of 2000 ms counts from its arrival"
+    );
     proxy.stop().await
 }
