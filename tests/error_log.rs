@@ -328,3 +328,60 @@ fn a_reload_that_changes_no_restart_setting_warns_about_none() -> TestResult {
     assert!(!read(&log).contains("restart is needed"), "{}", read(&log));
     Ok(())
 }
+
+#[test]
+fn an_error_log_destination_of_stdout_writes_to_standard_output() -> TestResult {
+    use std::io::Read as _;
+    use std::sync::{Arc, Mutex};
+
+    let dir = test_dir("stdout")?;
+    let path = dir.join("vigilant-heron.conf");
+    std::fs::write(&path, config("stdout info"))?;
+    let child = Command::new(env!("CARGO_BIN_EXE_vigilant-heron"))
+        .arg("--config")
+        .arg(&path)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut server = Server {
+        child,
+        config: path,
+    };
+    let Some(mut stdout) = server.child.stdout.take() else {
+        return Err("stdout is not piped".into());
+    };
+    let output = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&output);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 1024];
+        while let Ok(read) = stdout.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(chunk.get(..read).unwrap_or_default());
+            if let Ok(mut buffer) = sink.lock() {
+                buffer.push_str(&text);
+            }
+        }
+    });
+    // The startup line shows that the server is up. Only then is it stopped, so
+    // that the signal handlers are installed and the stop line is written too.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_buffer(&output).contains("vigilant-heron is listening") {
+        if Instant::now() > deadline {
+            return Err("the startup line never reached stdout".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.signal("-TERM")?;
+    server.child.wait()?;
+    reader.join().map_err(|_| "stdout reader panicked")?;
+    assert!(read_buffer(&output).contains("vigilant-heron is listening"));
+    Ok(())
+}
+
+fn read_buffer(buffer: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
+    buffer.lock().map(|text| text.clone()).unwrap_or_default()
+}
