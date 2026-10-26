@@ -134,30 +134,24 @@ jobs:
           outputs: type=local,dest=${{ runner.temp }}/dist
           cache-from: type=gha,scope=release-docker-cache
 
-      # Each binary must need glibc 2.39 or older (docs/install.md promises Ubuntu
-      # 24.04 and Debian 13), and the x86_64 one must report this version.
+      # scripts/check-release-binaries.sh checks the glibc floor and the version;
+      # the ci.yml release-build job runs the same check on every PR.
       - name: Package and check release binaries
         env:
           VERSION: ${{ needs.check.outputs.version }}
         run: |
           set -euo pipefail
+          bash "$GITHUB_WORKSPACE/scripts/check-release-binaries.sh" "$RUNNER_TEMP/dist" "$VERSION"
           cd "$RUNNER_TEMP"
           mkdir assets
           for pair in amd64:x86_64 arm64:aarch64; do
             arch="${pair%%:*}"
             name="vigilant-heron-${pair#*:}-unknown-linux-gnu"
-            bin="dist/linux_$arch/vigilant-heron"
-            need=$(readelf --dyn-syms -W "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/^GLIBC_//' | sort -V | tail -n 1)
-            if [ "$(printf '%s\n' "$need" 2.39 | sort -V | tail -n 1)" != "2.39" ]; then
-              echo "$name needs glibc $need, newer than the documented 2.39" >&2
-              exit 1
-            fi
             mkdir "$name"
-            install -m 755 "$bin" "$name/vigilant-heron"
+            install -m 755 "dist/linux_$arch/vigilant-heron" "$name/vigilant-heron"
             cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/README.md" "$name/"
             tar -czf "assets/$name.tar.gz" "$name"
           done
-          "vigilant-heron-x86_64-unknown-linux-gnu/vigilant-heron" -v | grep -qx "vigilant-heron version $VERSION"
           (cd assets && sha256sum -- *.tar.gz > SHA256SUMS)
           cat assets/SHA256SUMS
 

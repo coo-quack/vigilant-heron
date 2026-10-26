@@ -24,6 +24,9 @@ bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
 pnpm run dup                                               # duplication job
+docker buildx build --target binaries --platform linux/amd64,linux/arm64 \
+  --output type=local,dest=dist .                         # release-build job; then, on Linux:
+bash scripts/check-release-binaries.sh dist "$(cargo pkgid | sed 's/.*[#@]//')"
 ```
 
 `cargo install --locked cargo-deny cargo-machete cargo-llvm-cov` installs the three
