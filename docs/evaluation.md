@@ -51,8 +51,16 @@ The report's findings on where each model fails:
   all 15 prompt-injection rows were still blocked on dev and holdout together.
 
 The report measured latency and cost from a home connection in Japan through the
-router: clef-flash had a p50 of about 400 ms and jev-latest about 146 ms. Its
-paid runs cost 4.55 JPY in total.
+router: clef-flash had a p50 of about 400 ms and jev-latest about 146 ms. The
+2026-10-25 paid runs cost 4.55 JPY in total.
+
+Report: [Clef-flash recheck on the current code](https://github.com/coo-quack/vigilant-heron/blob/develop/eval/reports/2026-10-26-clef-flash-recheck.md)
+(2026-10-26). Clef-flash ran again on the current code, on the same splits with a
+3000 ms timeout. Its headline numbers match the 2026-10-25 run. Through the router,
+the decision p50 was about 375 ms, and 82% of calls were slower than the default
+300 ms `timeout`. The recheck suggests about 1000 ms for Clef-flash, where 3.3% of
+calls are still slower. The 2026-10-26 run cost 2.08 JPY, so the evaluation's paid
+spend is 6.63 JPY in total.
 
 ## Built-in rules
 

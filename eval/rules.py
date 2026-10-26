@@ -299,15 +299,21 @@ def pipeline_metrics(rule_results, model_scores, split):
     allow_model_flagged = 0
     flagged_ids = []
     missing = 0
+    unscored_ids = []
     for item in rows:
         score = model_scores.get(item["id"])
         if score is None:
             missing += 1
             continue
-        model_block = (
-            float(score["attack"]) >= MODEL_BLOCK_THRESHOLD
-            or float(score["ai_instruction"]) >= MODEL_INSTRUCTION_THRESHOLD
-        )
+        if score.get("attack") is None or score.get("ai_instruction") is None:
+            # The router allowed the row without scores (decision error), so the model did not block it.
+            unscored_ids.append(item["id"])
+            model_block = False
+        else:
+            model_block = (
+                float(score["attack"]) >= MODEL_BLOCK_THRESHOLD
+                or float(score["ai_instruction"]) >= MODEL_INSTRUCTION_THRESHOLD
+            )
         rule_block = rule_blocked(item)
         if item["label"] == "block":
             per_kind[item["kind"]][1] += 1
@@ -331,6 +337,7 @@ def pipeline_metrics(rule_results, model_scores, split):
         "allow_model_flagged": allow_model_flagged,
         "flagged_ids": flagged_ids,
         "missing": missing,
+        "unscored_ids": unscored_ids,
     }
 
 
@@ -365,6 +372,11 @@ def pipeline_report(rule_results, backend, model_scores):
             lines.append(f"- allow rows flagged by the pipeline: {', '.join(metrics['flagged_ids'])}")
         if metrics["missing"]:
             lines.append(f"- rows without model results: {metrics['missing']}")
+        if metrics["unscored_ids"]:
+            lines.append(
+                "- rows without model scores (decision error; counted as not blocked by the model): "
+                + ", ".join(metrics["unscored_ids"])
+            )
         lines.append("")
     return "\n".join(lines)
 
