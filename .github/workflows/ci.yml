@@ -15,6 +15,7 @@ env:
   # on the first cargo call, so no third-party toolchain action is needed.
   CARGO_DENY_VERSION: 0.20.2
   CARGO_MACHETE_VERSION: 0.9.2
+  CARGO_LLVM_COV_VERSION: 0.9.1
 
 jobs:
   # Advisories, licenses, banned crates and registry sources (deny.toml).
@@ -79,7 +80,15 @@ jobs:
             ~/.cargo/git
             target
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo test --workspace --locked
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-${{ env.CARGO_LLVM_COV_VERSION }}
+      - run: command -v cargo-llvm-cov || cargo install --locked cargo-llvm-cov --version "$CARGO_LLVM_COV_VERSION"
+      # The tests run once, instrumented. The job fails when they fail or when
+      # fewer than 90% of the lines run, so new code comes with its tests.
+      - run: rustup component add llvm-tools
+      - run: cargo llvm-cov --workspace --locked --fail-under-lines 90
 
   # The router behind a real nginx, with the stub decision backend, built from
   # the same Dockerfile that produces the published image.
