@@ -185,5 +185,5 @@ repository goes public and rulesets can require them.
 ## Pull Requests
 
 - Follow [Conventional Commits](https://www.conventionalcommits.org/) (`feat:`, `fix:`, `docs:`, `ci:`, `chore:`)
-- Keep the CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`)
-  unchanged: they are the required status checks registered in coo-quack/iac
+- Keep the CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`,
+  `duplication`, `bench`, `release-build`) unchanged: they are the required status checks registered in coo-quack/iac
