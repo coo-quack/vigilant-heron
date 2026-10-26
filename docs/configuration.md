@@ -550,18 +550,18 @@ Rejected with an error that names `client_max_body_size`, which is set at the to
 ### `redact_header`
 
 - **Syntax:** `redact_header <name> ...;`
-- **Default:** none. `cookie`, `authorization`, `proxy-authorization`, `x-api-key` and `x-auth-token` are always removed, and so is any header with a credential-like name (such as `x-csrf-token`).
+- **Default:** none. `cookie`, `authorization`, `proxy-authorization`, `x-api-key` and `x-auth-token` are always removed. So is any header with a credential-like name (such as `x-csrf-token`, `x-hub-signature-256` or `x-functions-key`). See [How it works](/how-it-works) for the full rule.
 - **Context:** decision.
 
-Extra header names removed before the event is sent to the backend. Repeatable. They cannot be logged either.
+Extra header names removed before the event is sent to the backend. Repeatable. Each name is compared case-insensitively with the whole header name. Use this for a header the default rules keep but that your site treats as secret. They cannot be logged either.
 
 ### `redact_field`
 
 - **Syntax:** `redact_field <name> ...;`
-- **Default:** none. Field names with password-, token-, card-number-like or other sensitive parts and words are redacted already (see [How it works](/how-it-works)).
+- **Default:** none. Field names with password-, token-, signature-, card-number-like or other sensitive parts and words are redacted already (see [How it works](/how-it-works)).
 - **Context:** decision.
 
-Extra form, JSON and query-string field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. Repeatable.
+Extra field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. This applies to form, JSON, multipart and XML bodies, and to the query string. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. For a multipart part, the name is the `name` in its `Content-Disposition`. For an XML element, it is the local name without the prefix, so `ticket_ref` also redacts `<ns:ticket_ref>`. Repeatable.
 
 ## Site block
 

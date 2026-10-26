@@ -572,6 +572,8 @@ struct Trace<'a> {
     limit_conn: Mutex<Option<&'static str>>,
     /// The connection's shutdown bookkeeping, given to a tunnel this request starts.
     tunnels: tunnel::Lifetime,
+    /// The phase of the client connection, set to tunnelling when this request starts a tunnel.
+    phase: &'a PhaseCell,
 }
 
 /// Answers one request on a connection and records it.
@@ -608,6 +610,7 @@ async fn handle<B: DecisionBackend>(
         limit_req: Mutex::new(None),
         limit_conn: Mutex::new(None),
         tunnels: connection.lifetime.clone(),
+        phase: connection.phase.as_ref(),
     };
     let mut held = Vec::new();
     let mut response = pipeline(state, &parts, body, &done, &trace, peer, &mut held).await;
@@ -854,6 +857,7 @@ async fn pipeline<B: DecisionBackend>(
         ctx,
         websocket: location.map_or(site.websocket, |location| location.websocket),
         client_upgrade: &trace.upgrade,
+        phase: trace.phase,
     };
     let outcome = respond(&delivery, parts, body, peer, &decision, held).await;
     let mut response = outcome.response;
@@ -957,6 +961,8 @@ struct Delivery<'a> {
     websocket: bool,
     /// The client connection's upgrade, which the tunnel takes when the upstream switches protocols.
     client_upgrade: &'a Mutex<Option<OnUpgrade>>,
+    /// The phase of the client connection, which a started tunnel moves to tunnelling.
+    phase: &'a PhaseCell,
 }
 
 /// Forwards an allowed request, or answers a block or redirect.
@@ -1021,6 +1027,9 @@ async fn respond(
                         crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
                     }
                     if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
+                        // From here on the client connection carries tunnel bytes, not requests:
+                        // its reads are neither timed nor scanned, and no response is written to it.
+                        delivery.phase.set(Phase::Tunnelling);
                         tunnel::spawn(
                             client,
                             upstream,

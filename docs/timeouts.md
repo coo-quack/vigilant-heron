@@ -75,6 +75,10 @@ The header limits are checked on the first bytes of each request. A request
 pipelined behind another on the same connection is not checked by them, only by
 hyper's own buffer limit. hyper's limit of 100 header fields is unchanged.
 
+The header limits and `client_header_timeout` do not apply to the bytes of a
+`proxy_websocket` tunnel once it is open. A tunnel is bounded only by
+`proxy_read_timeout`, which applies to its silence in either direction.
+
 ## Concurrency
 
 | Setting | Limits | Default |

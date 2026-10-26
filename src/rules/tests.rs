@@ -1312,6 +1312,19 @@ fn cve_9103_matches_the_endpoint_in_its_normalized_forms(#[case] method: &str, #
 }
 
 #[rstest]
+#[case::upper("GET", "/API/V1/LOGIN/AUTO_LOGIN")]
+#[case::mixed("GET", "/Api/V1/Login/Auto_Login")]
+#[case::upper_post("POST", "/API/V1/LOGIN/AUTO_LOGIN")]
+#[case::upper_trailing_segment("GET", "/API/V1/LOGIN/AUTO_LOGIN/extra")]
+#[case::upper_semicolon_suffix("GET", "/API/V1/LOGIN/AUTO_LOGIN;x")]
+fn cve_2026_9103_blocks_the_endpoint_in_any_case(#[case] method: &str, #[case] path: &str) {
+    assert_eq!(
+        builtin_hit(method, path, None, UA, b"").as_deref(),
+        Some("vh-cve-2026-9103")
+    );
+}
+
+#[rstest]
 #[case::login_root("/api/v1/login")]
 #[case::login_root_slash("/api/v1/login/")]
 #[case::other_endpoint("/api/v1/logout")]
@@ -1326,6 +1339,17 @@ fn cve_9103_leaves_other_login_paths_alone(#[case] path: &str) {
 #[case::double_slash("//api/v1/validate/code")]
 #[case::percent_encoded_letter("/api/v1/validate/%63ode")]
 fn cve_8481_blocks_post_to_the_endpoint_in_its_normalized_forms(#[case] path: &str) {
+    assert_eq!(
+        builtin_hit("POST", path, None, UA, b"{\"code\": \"x\"}").as_deref(),
+        Some("vh-cve-2026-8481")
+    );
+}
+
+#[rstest]
+#[case::upper("/API/V1/VALIDATE/CODE")]
+#[case::mixed("/Api/V1/Validate/Code")]
+#[case::upper_trailing_slash("/API/V1/VALIDATE/CODE/")]
+fn cve_2026_8481_blocks_the_endpoint_in_any_case(#[case] path: &str) {
     assert_eq!(
         builtin_hit("POST", path, None, UA, b"{\"code\": \"x\"}").as_deref(),
         Some("vh-cve-2026-8481")

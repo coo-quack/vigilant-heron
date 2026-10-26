@@ -48,6 +48,7 @@ const PHASE_HEADER: u8 = 0;
 const PHASE_KEEP_ALIVE: u8 = 1;
 const PHASE_BUSY: u8 = 2;
 const PHASE_CLOSING: u8 = 3;
+const PHASE_TUNNEL: u8 = 4;
 
 /// What a client connection is waiting for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +62,9 @@ pub(crate) enum Phase {
     /// The response is complete but the request body is not. Reads report end of
     /// stream, so the connection closes instead of reading the rest of the body.
     Closing,
+    /// The connection has been upgraded and spliced into a tunnel. The bytes that
+    /// follow are not a request: they are neither timed nor scanned.
+    Tunnelling,
 }
 
 /// The phase of one client connection, shared by its transport and its request handler.
@@ -91,6 +95,7 @@ impl PhaseCell {
             PHASE_KEEP_ALIVE => Phase::AwaitingKeepAlive,
             PHASE_BUSY => Phase::Busy,
             PHASE_CLOSING => Phase::Closing,
+            PHASE_TUNNEL => Phase::Tunnelling,
             _ => Phase::AwaitingHeader,
         }
     }
@@ -102,6 +107,7 @@ impl PhaseCell {
             Phase::AwaitingKeepAlive => PHASE_KEEP_ALIVE,
             Phase::Busy => PHASE_BUSY,
             Phase::Closing => PHASE_CLOSING,
+            Phase::Tunnelling => PHASE_TUNNEL,
         };
         self.phase.store(code, Ordering::Release);
         // A parked reader may have no timer armed for the new phase, so it is woken.
@@ -377,6 +383,10 @@ impl<S> ClientIo<S> {
     /// `on` lingers when the body was not read in full, which is the `Closing` phase.
     /// `always` lingers once the connection has carried a request.
     fn lingers_on_close(&self) -> bool {
+        // A tunnel closes when its own splice ends; there is no unread request to discard.
+        if self.phase.get() == Phase::Tunnelling {
+            return false;
+        }
         match self.timers.linger {
             LingeringClose::Off => false,
             LingeringClose::Always => self.saw_request,
@@ -541,9 +551,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ClientIo<S> {
                 io::ErrorKind::TimedOut,
                 "client header timeout",
             ))),
-            Phase::AwaitingKeepAlive | Phase::Busy | Phase::Closing => Poll::Ready(Err(
-                io::Error::new(io::ErrorKind::TimedOut, "keep-alive timeout"),
-            )),
+            Phase::AwaitingKeepAlive | Phase::Busy | Phase::Closing | Phase::Tunnelling => {
+                Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "keep-alive timeout",
+                )))
+            }
         }
     }
 }
@@ -560,12 +573,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientIo<S> {
             return this.poll_linger(cx);
         }
         let phase = this.phase.get();
+        if phase == Phase::Tunnelling {
+            // The connection is a tunnel: bytes are copied, never parsed or timed.
+            this.stop_timing_reads();
+            return Pin::new(&mut this.inner).poll_read(cx, buf);
+        }
         match phase {
             Phase::Closing => {
                 this.stop_timing_reads();
                 return Poll::Ready(Ok(()));
             }
-            Phase::Busy => this.stop_timing_reads(),
+            Phase::Busy | Phase::Tunnelling => this.stop_timing_reads(),
             Phase::AwaitingHeader | Phase::AwaitingKeepAlive => {
                 let armed = this.read_timer.as_ref().map(|(armed, _)| *armed);
                 if armed != Some(phase) {

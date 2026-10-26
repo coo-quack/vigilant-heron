@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- Fixed: the opt-in virtual patches `vh-cve-2026-9103` (`/api/v1/login/auto_login`)
+  and `vh-cve-2026-8481` (`/api/v1/validate/code`) compared the path case-sensitively,
+  so a request such as `/API/V1/LOGIN/AUTO_LOGIN` got past them. Both rules now match
+  the path in any letter case. Which requests they block is otherwise unchanged.
+- Security: more credentials are kept out of the decision backend. Headers named
+  with `signature` (for example `x-hub-signature-256`, `svix-signature` and
+  `x-slack-signature`), with `ticket` or `authentication` as a word, or ending in
+  `key`, `authkey` or `sessionkey` (for example `x-functions-key`, `x-master-key`
+  and `x-admin-key`) are now dropped. Body fields with `signature` in their name are
+  redacted. The rules for `ticket`, `authentication`
+  and the `key` suffix apply to header names only, so an ordinary `key` or `ticket`
+  body or query field is still sent. Multipart parts whose `name` is sensitive have
+  their values replaced, and XML elements such as `<password>` and `<wsse:Password>`
+  have their text replaced. Form bodies split on `;` as well as `&`, so
+  `a=1;password=x` hides the password. A file part is redacted by its field name
+  only. Its content is not scanned.
+- Fixed: a `proxy_websocket` tunnel was read as if it were HTTP requests. After the
+  `101 Switching Protocols`, a tunnelled chunk of more than 8 KiB without a line
+  break (a binary WebSocket frame, for example) was answered with 414 and the
+  connection was closed, and a tunnel open longer than `client_header_timeout`
+  (60s by default) received a 408 while it was still active. Tunnelled bytes are
+  now copied as they arrive, with no header limits and no header timer.
+- Fixed: a zone keyed on a long client-chosen value, such as a request header,
+  could use far more memory than its declared size, because each state stored the
+  whole key. States now store a fixed-size digest of the key, so the declared size
+  bounds the memory again.
 - Added: decision backend `strands` (`decision.backend strands;`) for a self-hosted
   Strands Decider server, which speaks the System One protocol. `model` defaults to
   `strands-decider`, `url` is required, and `api_token_env` is optional: without it,
