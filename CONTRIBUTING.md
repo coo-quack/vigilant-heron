@@ -22,6 +22,7 @@ cargo test --workspace --locked                            # test job
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
+cargo bench --bench hot_path                              # benchmarks (bench job runs them once with -- --test)
 ```
 
 `cargo install --locked cargo-deny cargo-machete` installs the two tools.
@@ -52,6 +53,29 @@ cargo machete                                              # deadcode job
   router image, the stub decider, an upstream). Its tests are `#[ignore]`d in
   the normal run; `scripts/e2e.sh` starts the stack and runs them.
 - Expected values are never changed to match what the code happens to do.
+
+## Benchmarks
+
+`benches/hot_path.rs` measures the request hot path through the public API:
+`check_request` for four kinds of request (a plain page, a page a skip rule
+forwards, a long request that goes through every built-in rule, and a request a
+built-in rule blocks), `suggest_skip_rules` over 10,000 access log lines, and
+loading the sample configuration. `check_request` reads the configuration file on
+each call, so its times include the cost that `config_load` measures on its own.
+
+Timings on a laptop or a shared runner are noisy, so compare runs on the same
+machine. Save a baseline before a change, then compare after it:
+
+```bash
+cargo bench --bench hot_path -- --save-baseline before
+# make the change
+cargo bench --bench hot_path -- --baseline before
+```
+
+The `bench` CI job only runs the benchmarks once to check that they build and
+run. The `Bench` workflow (`.github/workflows/bench.yml`) runs them every Sunday
+at 18:43 UTC and uploads `target/criterion` as the `criterion-<run_id>` artifact, kept for 90
+days, so results can be compared week to week.
 
 ## Branching Strategy
 

@@ -81,6 +81,23 @@ jobs:
           key: test-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
       - run: cargo test --workspace --locked
 
+  # Timings on shared runners are too noisy to gate on, so this job only proves
+  # that the benchmarks build and run once. bench.yml records the timings weekly.
+  bench:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bench-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+      - run: cargo bench --locked --bench hot_path -- --test
+
   # The router behind a real nginx, with the stub decision backend, built from
   # the same Dockerfile that produces the published image.
   e2e:

@@ -80,3 +80,8 @@ tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
 proptest = "=1.12.0"
 rstest = "=0.28.0"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
+criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hot_path"
+harness = false

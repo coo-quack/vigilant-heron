@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added: `check_request_with`, the library form of `check_request` that takes an
+  already loaded `Config`, so a caller that checks many requests loads the
+  configuration once.
 - Added: the `$query_shape` log variable and a `query_shape` field in the built-in
   `json` format. It records the names of the query parameters and the kind of each
   value (`p=<num>&s=<text>`), never the values, so a log shows which kinds of
