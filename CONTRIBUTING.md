@@ -23,6 +23,7 @@ cargo llvm-cov --workspace --locked --fail-under-lines 90  # test job: tests and
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
+pnpm run dup                                               # duplication job
 ```
 
 `cargo install --locked cargo-deny cargo-machete cargo-llvm-cov` installs the three
@@ -41,6 +42,8 @@ tools, and `rustup component add llvm-tools` adds what `cargo llvm-cov` needs.
   dependencies are caught by `cargo machete`.
 - Every public item has a doc comment; fallible functions document their
   errors under `# Errors`.
+- Duplicated code in `src/` may not grow beyond the `threshold` in
+  `.jscpd.json`. List the clones with `pnpm run dup`.
 - Comments and documentation are written in English.
 - Line coverage of the tests stays at 90% or more. The `test` job runs the tests
   under `cargo llvm-cov` and fails below that, so new code needs its tests.

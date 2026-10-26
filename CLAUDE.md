@@ -24,6 +24,7 @@ Shadow mode records what it would have done without blocking.
 - `bash scripts/e2e.sh` — e2e suite against the Compose stack in `e2e/`
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
+- `pnpm run dup` — duplicated code in src/ (jscpd)
 
 ## Project Structure
 
@@ -112,6 +113,7 @@ Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
 deny.toml        # cargo-deny policy: advisories, licenses, sources
+.jscpd.json      # jscpd settings for the duplication check (pnpm run dup)
 .cargo/mutants.toml # cargo-mutants settings (exclusions, timeout multiplier)
 clippy.toml      # Clippy settings (allow the lints in tests)
 rust-toolchain.toml # Toolchain pin
