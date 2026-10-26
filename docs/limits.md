@@ -38,7 +38,9 @@ A zone is defined at the top level with a key and a size.
 Zones may appear anywhere in the top level. Each name is used once across both
 kinds. The size is the memory of the zone. A `limit_req` zone holds `size / 128`
 states, and a `limit_conn` zone holds `size / 64`, the nginx state sizes. A size
-that holds no state is an error.
+that holds no state is an error. Each state keeps a fixed-size digest of its key,
+not the key text, so a long key, such as a client-chosen header, does not use
+more memory than a short one.
 
 ### The key
 

@@ -8,6 +8,10 @@
   connection was closed, and a tunnel open longer than `client_header_timeout`
   (60s by default) received a 408 while it was still active. Tunnelled bytes are
   now copied as they arrive, with no header limits and no header timer.
+- Fixed: a zone keyed on a long client-chosen value, such as a request header,
+  could use far more memory than its declared size, because each state stored the
+  whole key. States now store a fixed-size digest of the key, so the declared size
+  bounds the memory again.
 - Added: decision backend `strands` (`decision.backend strands;`) for a self-hosted
   Strands Decider server, which speaks the System One protocol. `model` defaults to
   `strands-decider`, `url` is required, and `api_token_env` is optional: without it,

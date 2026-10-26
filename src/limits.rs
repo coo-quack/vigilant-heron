@@ -19,8 +19,10 @@
 //!
 //! Time comes from [`tokio::time`], so tests can pause and advance it.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
+use std::hash::BuildHasher;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -871,12 +873,23 @@ struct Entry {
     active: u32,
 }
 
+/// A fixed-size digest of a rendered limit key, which names the key's state.
+type KeyDigest = u128;
+
 /// The states of a zone, with least-recently-used order.
+///
+/// The states are keyed by a digest of the rendered key, not by the key text.
+/// The key comes from the request, so its length is up to the client; a digest
+/// has a fixed size, which keeps the memory of a zone bounded by its declared
+/// size whatever the keys are. The digest uses two hashers with random keys
+/// chosen when the zone is created, so a client cannot find two keys that share
+/// a state.
 #[derive(Debug)]
 struct Table {
     capacity: usize,
-    entries: HashMap<String, Entry>,
-    order: BTreeMap<u64, String>,
+    hashers: (RandomState, RandomState),
+    entries: HashMap<KeyDigest, Entry>,
+    order: BTreeMap<u64, KeyDigest>,
     clock: u64,
 }
 
@@ -888,15 +901,25 @@ impl Table {
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
+            hashers: (RandomState::new(), RandomState::new()),
             entries: HashMap::new(),
             order: BTreeMap::new(),
             clock: 0,
         }
     }
 
+    /// The digest of a rendered key. Two 64-bit hashes with independent random
+    /// keys make one 128-bit value, which a client cannot match with another key
+    /// in practice.
+    fn digest(&self, key: &str) -> KeyDigest {
+        let high = u128::from(self.hashers.0.hash_one(key));
+        let low = u128::from(self.hashers.1.hash_one(key));
+        (high << 64) | low
+    }
+
     /// Returns the state of `key`, creating it, and marks it most recently used.
-    fn entry(&mut self, key: &str, now: Instant) -> Result<&mut Entry, Exhausted> {
-        match self.entries.get(key).map(|entry| entry.stamp) {
+    fn entry(&mut self, key: KeyDigest, now: Instant) -> Result<&mut Entry, Exhausted> {
+        match self.entries.get(&key).map(|entry| entry.stamp) {
             Some(stamp) => {
                 self.order.remove(&stamp);
             }
@@ -908,8 +931,8 @@ impl Table {
         }
         self.clock = self.clock.saturating_add(1);
         let stamp = self.clock;
-        self.order.insert(stamp, key.to_owned());
-        let entry = self.entries.entry(key.to_owned()).or_insert(Entry {
+        self.order.insert(stamp, key);
+        let entry = self.entries.entry(key).or_insert(Entry {
             stamp,
             excess: 0,
             last: now,
@@ -926,18 +949,18 @@ impl Table {
             .iter()
             .find(|(_, key)| {
                 self.entries
-                    .get(key.as_str())
+                    .get(*key)
                     .is_some_and(|entry| entry.active == 0)
             })
-            .map(|(stamp, key)| (*stamp, key.clone()));
+            .map(|(stamp, key)| (*stamp, *key));
         let (stamp, key) = victim.ok_or(Exhausted)?;
         self.order.remove(&stamp);
         self.entries.remove(&key);
         Ok(())
     }
 
-    fn remove(&mut self, key: &str) {
-        if let Some(entry) = self.entries.remove(key) {
+    fn remove(&mut self, key: KeyDigest) {
+        if let Some(entry) = self.entries.remove(&key) {
             self.order.remove(&entry.stamp);
         }
     }
@@ -1006,7 +1029,8 @@ impl ZoneStore {
             return Ok(Admission::passed());
         };
         let mut table = lock(&self.table);
-        let entry = table.entry(key, now)?;
+        let digest = table.digest(key);
+        let entry = table.entry(digest, now)?;
         let elapsed = now.saturating_duration_since(entry.last).as_nanos();
         let drained =
             elapsed.saturating_mul(u128::from(UNITS_PER_REQUEST)) / u128::from(interval_ns);
@@ -1052,7 +1076,7 @@ impl ZoneStore {
             wait,
             pending: Some(Pending {
                 zone: Arc::clone(self),
-                key: key.to_owned(),
+                digest,
             }),
         })
     }
@@ -1073,11 +1097,12 @@ impl ZoneStore {
         now: Instant,
     ) -> Result<ConnAdmission, Exhausted> {
         let mut table = lock(&self.table);
-        let entry = table.entry(key, now)?;
+        let digest = table.digest(key);
+        let entry = table.entry(digest, now)?;
         let over = entry.active >= max;
         if over && !dry_run {
             if entry.active == 0 {
-                table.remove(key);
+                table.remove(digest);
             }
             return Ok(ConnAdmission {
                 status: ConnStatus::Rejected,
@@ -1093,16 +1118,16 @@ impl ZoneStore {
             },
             permit: Some(ConnPermit {
                 zone: Arc::clone(self),
-                key: key.to_owned(),
+                digest,
             }),
         })
     }
 
     /// Releases one count of `key`. A `limit_conn` state with no requests left is removed.
-    fn release(&self, key: &str) {
+    fn release(&self, digest: KeyDigest) {
         let remove_idle = matches!(self.def.kind, ZoneKind::Conn);
         let mut table = lock(&self.table);
-        let idle = match table.entries.get_mut(key) {
+        let idle = match table.entries.get_mut(&digest) {
             Some(entry) => {
                 entry.active = entry.active.saturating_sub(1);
                 entry.active == 0
@@ -1110,7 +1135,7 @@ impl ZoneStore {
             None => false,
         };
         if idle && remove_idle {
-            table.remove(key);
+            table.remove(digest);
         }
     }
 
@@ -1195,12 +1220,12 @@ impl Admission {
 #[derive(Debug)]
 pub(crate) struct Pending {
     zone: Arc<ZoneStore>,
-    key: String,
+    digest: KeyDigest,
 }
 
 impl Drop for Pending {
     fn drop(&mut self) {
-        self.zone.release(&self.key);
+        self.zone.release(self.digest);
     }
 }
 
@@ -1216,12 +1241,12 @@ pub(crate) struct ConnAdmission {
 #[derive(Debug)]
 pub(crate) struct ConnPermit {
     zone: Arc<ZoneStore>,
-    key: String,
+    digest: KeyDigest,
 }
 
 impl Drop for ConnPermit {
     fn drop(&mut self) {
-        self.zone.release(&self.key);
+        self.zone.release(self.digest);
     }
 }
 
@@ -2041,6 +2066,72 @@ mod tests {
         drop(first);
         let third = zone.acquire("k", 1, false, now).ok();
         assert_eq!(third.map(|a| a.status), Some(ConnStatus::Passed));
+    }
+
+    #[test]
+    fn zone_memory_does_not_grow_with_key_length() {
+        // Two states of a zone of two, with keys of 8,000 bytes each.
+        let zone = store(2, 1_000_000_000);
+        let now = Instant::now();
+        let limit = req(5, 5);
+        let long_a = "a".repeat(8_000);
+        let long_b = "b".repeat(8_000);
+        let long_c = "c".repeat(8_000);
+        for key in [&long_a, &long_b] {
+            let status = zone.admit(key, &limit, false, now).ok().map(|a| a.status);
+            assert_eq!(status, Some(ReqStatus::Passed));
+        }
+        {
+            let table = lock(&zone.table);
+            // Each state is ordered by a fixed-size digest, not by the key text.
+            let digests: Vec<KeyDigest> = table.order.values().copied().collect();
+            assert_eq!(digests.len(), 2);
+            assert!(digests.contains(&table.digest(&long_a)));
+            assert!(digests.contains(&table.digest(&long_b)));
+        }
+        // A third long key evicts the least recently used state; the zone stays at two.
+        let status = zone
+            .admit(&long_c, &limit, false, now)
+            .ok()
+            .map(|a| a.status);
+        assert_eq!(status, Some(ReqStatus::Passed));
+        let table = lock(&zone.table);
+        assert_eq!(table.entries.len(), 2);
+        assert!(!table.entries.contains_key(&table.digest(&long_a)));
+        assert!(table.entries.contains_key(&table.digest(&long_c)));
+    }
+
+    #[test]
+    fn distinct_keys_keep_distinct_states_with_digests() {
+        let zone = store(10, 1_000_000_000);
+        let now = Instant::now();
+        // Burst and undelayed are zero: a second request in the same instant is rejected.
+        let limit = req(0, 0);
+        let long = "x".repeat(8_000);
+        let near = format!("{}y", "x".repeat(7_999));
+        let keys = [
+            "k1",
+            "k2",
+            "k1",
+            long.as_str(),
+            near.as_str(),
+            long.as_str(),
+        ];
+        let mut statuses = Vec::new();
+        for key in keys {
+            statuses.push(zone.admit(key, &limit, false, now).ok().map(|a| a.status));
+        }
+        assert_eq!(
+            statuses,
+            vec![
+                Some(ReqStatus::Passed),
+                Some(ReqStatus::Passed),
+                Some(ReqStatus::Rejected),
+                Some(ReqStatus::Passed),
+                Some(ReqStatus::Passed),
+                Some(ReqStatus::Rejected),
+            ]
+        );
     }
 
     #[test]
