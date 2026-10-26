@@ -763,3 +763,51 @@ site example.com {{
     );
     proxy.stop().await
 }
+
+/// A client over its share whose request body is still unread gets 429, and the connection closes.
+#[tokio::test]
+async fn client_busy_refusal_with_an_unread_body_closes_the_connection() -> TestResult {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.explicit_failures = false;
+    setup.max_concurrency = 4;
+    setup.per_client = Some(1);
+    setup.timeout_ms = 1000;
+    let proxy = start_proxy_config(setup.config()?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let holder = tokio::spawn(async move {
+        get_as(
+            &holder_base,
+            "/articles/slowanswer",
+            "203.0.113.1",
+            "unread-holder",
+        )
+        .await
+    });
+    wait_until_backend_busy(&fake).await?;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy.addr).await?;
+    stream
+        .write_all(b"POST /articles/normal HTTP/1.1\r\nHost: example.com\r\nX-Real-IP: 203.0.113.1\r\nContent-Length: 900\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 600]).await?;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if stream.read(&mut byte).await? == 0 {
+            break;
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    holder.await??;
+
+    assert!(head.starts_with("http/1.1 429"), "{head}");
+    assert!(head.contains("connection: close"), "{head}");
+    proxy.stop().await
+}

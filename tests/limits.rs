@@ -1117,6 +1117,251 @@ async fn access_list_deny_with_a_body_gets_403_while_the_client_keeps_sending() 
 }
 
 #[tokio::test]
+async fn a_streamed_body_of_exactly_the_limit_is_forwarded() -> TestResult {
+    // Two chunks of 512 bytes make 1024 bytes, which is exactly client_max_body_size.
+    let (upstream, _task) = start_hashing_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        "client_max_body_size 1k;",
+        "",
+    ))
+    .await?;
+    let (head, body) = chunked_head(2, 512);
+    let received = raw_request(&proxy.base(), &head, &body).await?;
+    assert_eq!(status_of(&received.bytes), Some(200));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_declared_body_of_exactly_the_limit_is_forwarded() -> TestResult {
+    let (upstream, _task) = start_hashing_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        "client_max_body_size 1k;",
+        "",
+    ))
+    .await?;
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[("content-type", "text/plain")],
+        Bytes::from(vec![b'a'; 1024]),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["length"], json!(1024));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_body_of_exactly_inspect_body_bytes_is_not_marked_truncated() -> TestResult {
+    let (upstream, _task) = start_hashing_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream, "", "")).await?;
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[("content-type", "text/plain")],
+        Bytes::from(vec![b'a'; 512]),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or(Value::Null);
+    assert_eq!(event["event"]["meta"]["body_truncated"], json!(false));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_body_that_stalls_after_the_sniffed_prefix_gets_408() -> TestResult {
+    // The upstream reads the whole body, so the stall is met while forwarding, after the sniff.
+    let (upstream, _task) = start_hashing_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        "client_body_timeout 300ms;",
+        "",
+    ))
+    .await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: 2000\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 600]).await?;
+    let received = read_until_closed(&mut stream, SETTLE).await;
+    assert_eq!(status_of(&received.bytes), Some(408));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_block_after_the_body_was_read_in_full_keeps_the_connection_open() -> TestResult {
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream, "", "")).await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 100\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 100]).await?;
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 403);
+    assert!(
+        !head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_unread_body_refused_for_an_unknown_host_closes_the_connection() -> TestResult {
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream, "", "")).await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: unknown.test\r\nContent-Length: 4000\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 1000]).await?;
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 421);
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_unread_body_refused_for_an_invalid_host_closes_the_connection() -> TestResult {
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream, "", "")).await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: bad$host.test\r\nContent-Length: 4000\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 1000]).await?;
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 400);
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_unread_body_refused_by_the_access_list_without_a_site_closes_the_connection()
+-> TestResult {
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream, "deny all;", "")).await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: unknown.test\r\nContent-Length: 4000\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 1000]).await?;
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 403);
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_refused_upstream_with_an_unread_body_closes_the_connection() -> TestResult {
+    let upstream = closed_port_url().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream, "", "")).await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4000\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 1000]).await?;
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 502);
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_redirect_of_a_request_with_an_unread_body_closes_the_connection() -> TestResult {
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(StubBehavior {
+        attack: 0.95,
+        ..StubBehavior::default()
+    });
+    let text = config(&stub.decide_url(), &upstream, "", "").replacen(
+        "action block;",
+        "action redirect https://example.org/;",
+        1,
+    );
+    let proxy = start_proxy(&text).await?;
+    let mut stream = connect(&proxy.base()).await?;
+    stream
+        .write_all(b"POST /x HTTP/1.1\r\nHost: example.com\r\nContent-Length: 4000\r\n\r\n")
+        .await?;
+    stream.write_all(&[b'a'; 1000]).await?;
+    let (status, head, _) = read_response(&mut stream).await?;
+    assert_eq!(status, 302);
+    assert!(
+        head.to_ascii_lowercase().contains("connection: close"),
+        "{head}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn header_section_above_hyper_default_buffer_is_read_within_the_configured_limit()
+-> TestResult {
+    // Six fields of 90000 bytes make about 540 KB: each fits a 128k buffer and the section fits 8 x 128k,
+    // but the section is larger than the buffer the HTTP parser allocates by default. The path is
+    // denied by the proxy, so the answer comes from the proxy and not from a parser of the upstream.
+    let (upstream, _hits, _task) = start_counting_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream,
+        "large_client_header_buffers 8 128k;",
+        "",
+    ))
+    .await?;
+    let fill = "a".repeat(90_000);
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/blocked",
+        "example.com",
+        &[
+            ("x-fill-0", fill.as_str()),
+            ("x-fill-1", fill.as_str()),
+            ("x-fill-2", fill.as_str()),
+            ("x-fill-3", fill.as_str()),
+            ("x-fill-4", fill.as_str()),
+            ("x-fill-5", fill.as_str()),
+        ],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn a_header_section_larger_than_hyper_default_buffer_is_parsed() -> TestResult {
     let (upstream, hits, _task) = start_counting_upstream().await?;
     let stub = StubDecider::start().await?;
