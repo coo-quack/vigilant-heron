@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added: the `$query_shape` log variable and a `query_shape` field in the built-in
+  `json` format. It records the names of the query parameters and the kind of each
+  value (`p=<num>&s=<text>`), never the values, so a log shows which kinds of
+  requests a site receives. See [Logging](/logging#query-shape).
 - Added: each GitHub Release has Linux binaries for x86_64 and aarch64 (glibc 2.39
   or newer) and a `SHA256SUMS` file. See
   [Download a release binary](/install#download-a-release-binary).

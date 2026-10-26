@@ -41,6 +41,7 @@ pub(crate) enum Field {
     Host,
     Method,
     Path,
+    QueryShape,
     Status,
     Action,
     Reason,
@@ -72,6 +73,7 @@ impl Field {
             "host" => Self::Host,
             "method" => Self::Method,
             "path" => Self::Path,
+            "query_shape" => Self::QueryShape,
             "status" => Self::Status,
             "action" => Self::Action,
             "reason" => Self::Reason,
@@ -195,7 +197,7 @@ impl LogFormat {
 /// The built-in JSON template. Every value is a JSON string; a missing value is `""`.
 const JSON_TEMPLATE: &str = concat!(
     r#"{"time":"$time_iso8601","request_id":"$request_id","client_ip":"$client_ip","#,
-    r#""site":"$site","host":"$host","method":"$method","path":"$path","status":"$status","#,
+    r#""site":"$site","host":"$host","method":"$method","path":"$path","query_shape":"$query_shape","status":"$status","#,
     r#""action":"$action","reason":"$reason","rule_id":"$rule_id","would_have":"$would_have","attack":"$attack","#,
     r#""ai_instruction":"$ai_instruction","category":"$category","#,
     r#""decision_error":"$decision_error","retry_after":"$retry_after","#,
@@ -284,6 +286,8 @@ pub(crate) struct AccessRecord<'a> {
     pub(crate) method: &'a str,
     /// Raw request path without the query.
     pub(crate) path: &'a str,
+    /// Raw query string, without the "?", when the request had one.
+    pub(crate) query: Option<&'a str>,
     /// Status of the response.
     pub(crate) status: u16,
     /// `allow`, `block`, `redirect`, or `reject` for requests answered before a decision.
@@ -334,6 +338,7 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::Host => text(record.host),
         Field::Method => text(record.method),
         Field::Path => text(record.path),
+        Field::QueryShape => record.query.and_then(crate::sanitize::query_shape),
         Field::Status => Some(record.status.to_string()),
         Field::Action => text(record.action),
         Field::Reason => text(record.reason),
@@ -510,6 +515,7 @@ mod tests {
             host: "example.com",
             method: "GET",
             path: "/articles",
+            query: None,
             status: 200,
             action: "allow",
             reason: "model",
