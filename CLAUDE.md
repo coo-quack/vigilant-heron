@@ -12,7 +12,7 @@ Shadow mode records what it would have done without blocking.
 
 - Rust (toolchain pinned in `rust-toolchain.toml`, edition 2024)
 - tokio, hyper 1, hyper-util (server and pooled client)
-- serde, toml, serde_json; thiserror in the library, anyhow only in `main.rs`
+- serde, toml, serde_json; thiserror in the library, anyhow only in the binary (`main.rs` and its modules `cli.rs` and `lifecycle.rs`)
 - Tests: built-in harness, rstest, proptest; e2e with Docker Compose
 
 ## Commands
@@ -54,6 +54,7 @@ src/
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
   server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
   error.rs       # Error types
+  test_support.rs # Builds sites and configurations for the unit tests
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
@@ -64,26 +65,51 @@ tests/
   rules.rs       # Access list and rule decisions in-process: order, shadow mode, logging, backend failures
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   block.rs       # block_status and block_page responses, including 444 and location overrides
-  cli.rs         # The binary in -t mode: results, exit codes, no bind
+  docs.rs        # Keeps docs/ in step with the parser's directive lists
+  error_log.rs   # The error log across SIGHUP and SIGUSR1, with the real binary
+  rate_limits.rs # limit_req and limit_conn: locations, log variables, dry run and shadow, gated upstream
+  common/        # Shared helpers: in-process upstream, stub and gated decision backends, client, fake System One endpoint
+  cli.rs         # The binary: -h, -v, -t and -T, -s signals (reload, reopen, stop, quit), start, stop and restart, the startup log
   headers.rs     # proxy_set_header: variables, removal, inheritance, location replacement
   websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
   reload.rs      # serve_reloadable: valid, broken, zone state kept or reset, in-flight requests finish
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack
-  vigilant-heron.conf # Router for the http backend, with four sites (one for uploads)
+  vigilant-heron.conf # Router for the http backend, with nine sites, one per e2e check (enforce, redirect, shadow, rate limits, path limits, WebSocket, uploads, Langflow patches, access list)
   config-clef.conf    # Second router that uses backend clef against the stub
   config-jev.conf     # Third router that uses backend jev against the stub
   rules.d/       # Rule file included by vigilant-heron.conf (e2e only)
   compose.yaml   # nginx edge, three routers, stub decider, upstream
+scripts/
+  e2e.sh         # The whole e2e suite, run by the CI job e2e: binary phase, then the Compose stack
+  e2e-cli.sh     # Binary phase: the release binary run as docs/getting-started.md shows
+  e2e-image.sh   # Image phase: the Compose-built image with the e2e configuration
 eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
   rules.py       # Built-in rules on dev and holdout, and the combined pipeline (stdlib only)
+  dataset/       # Labelled dev and holdout sets (JSON lines)
+  config.template.conf # Router configuration template; run.py fills the @PLACEHOLDERS@
+  README.md      # The Clef-flash evaluation: what it measures and how to run it
   reports/       # Written reports of each measurement
 examples/
   vigilant-heron.conf # Fully commented sample configuration
   rules.d/local.conf  # Commented sample rules, for an include
+```
+
+Top-level and documentation files:
+
+```
+docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
+.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml)
+Dockerfile       # Container image build
+package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
+Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
+deny.toml        # cargo-deny policy: advisories, licenses, sources
+clippy.toml      # Clippy settings (allow the lints in tests)
+rust-toolchain.toml # Toolchain pin
+README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents
 ```
 
 ## Key Constraints
