@@ -1,9 +1,10 @@
 # Decision backends
 
 The `backend` in the `decision` block selects the protocol. The default is `jev`.
-`jev` calls TypeSafe Jev, `clef` calls Cloudflare Clef on Workers AI, and `http`
-posts a JSON protocol to a URL of your choice. `jev` and `clef` use the same
-System One request and answer shapes, so they share one implementation.
+`jev` calls TypeSafe Jev, `clef` calls Cloudflare Clef on Workers AI, `strands`
+calls a self-hosted Strands Decider server, and `http` posts a JSON protocol to a
+URL of your choice. `jev`, `clef` and `strands` use the same System One request
+and answer shapes, so they share one implementation.
 
 ## What the backend is asked
 
@@ -51,6 +52,55 @@ decision {
 
 `model` is required with `clef`, and so are `url` and `api_token_env`. Clef
 sends the sanitized event to Cloudflare, so read [Security](/security) first.
+
+## Strands Decider (self-hosted)
+
+[Strands Decider](https://github.com/strands-labs/strands-decider) is an
+Apache-2.0 decision model that you run yourself. Its server serves
+`POST /v1/systemone` and `GET /health`, and it speaks the System One shape, so
+`backend strands` needs no other change. Start it with:
+
+```sh
+strands-decider serve <checkpoint> --device cuda --host 127.0.0.1 --port 8099
+```
+
+The published checkpoints are `StrandsAgents/strands-decider-2B-qwen3.5-v1-2610`
+and `StrandsAgents/strands-decider-E4B-gemma4-v1-2610`. Then point the router at it:
+
+```nginx
+decision {
+    backend strands;
+    url http://127.0.0.1:8099/v1/systemone;
+    timeout 1000ms;
+}
+```
+
+With `backend strands`, `url` is required. `model` defaults to `strands-decider`.
+`api_token_env` is optional. Without it, the router sends no `Authorization`
+header. With it, the router sends the token as a bearer token, and the variable
+must be set and not blank.
+
+Read these before you run it:
+
+- **The server has no authentication.** Keep it on `127.0.0.1` or on a private
+  network. To reach it from elsewhere, put an authenticating proxy in front of
+  it and set `api_token_env` so that the proxy receives the token.
+- **The model sees 4,096 tokens.** The published checkpoints use a 4,096-token
+  window. By default, a prompt longer than the window is cut at its end, and the
+  server does not report it. An attacker can pad a request so that the part
+  carrying the payload falls past the window. Lower `inspect_body`, for example
+  `inspect_body 2k;`, or run the server with `--strict-window`. That option
+  answers HTTP 422 for an overlong prompt instead, and the router treats it as a
+  decision error, which `on_decision_error` handles.
+- **Accuracy on this router's questions has not been measured yet.** The
+  figures below come from JevBench, not from these questions.
+- **Concurrent requests are not verified.** The server's documentation says its
+  behaviour under concurrent requests is not verified and recommends it for
+  local experiments only.
+
+Latency was measured on one NVIDIA L4, over localhost, on the 231 JevBench
+tasks. The 2B checkpoint took a p50 of 99 ms and a p95 of 436 ms. The E4B
+checkpoint took a p50 of 132 ms and a p95 of 1,212 ms.
 
 ## Tokens
 

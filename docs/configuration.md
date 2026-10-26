@@ -468,16 +468,16 @@ The `decision` block selects and configures the backend. It is required.
 
 ### `backend`
 
-- **Syntax:** `backend jev | clef | http;`
+- **Syntax:** `backend jev | clef | strands | http;`
 - **Default:** `jev`.
 - **Context:** decision.
 
-The protocol. `jev` calls TypeSafe Jev, `clef` calls Cloudflare Clef on Workers AI, and `http` posts the JSON protocol described in [Decision backends](/decision-backends#http-protocol).
+The protocol. `jev` calls TypeSafe Jev, `clef` calls Cloudflare Clef on Workers AI, `strands` calls a self-hosted Strands Decider server (see [Decision backends](/decision-backends#strands-decider-self-hosted)), and `http` posts the JSON protocol described in [Decision backends](/decision-backends#http-protocol).
 
 ### `url`
 
 - **Syntax:** `url <http or https URI>;`
-- **Default:** `https://api.typesafe.ai/v1/systemone` with `jev`. Required with `clef` and `http`.
+- **Default:** `https://api.typesafe.ai/v1/systemone` with `jev`. Required with `clef`, `strands` and `http`.
 - **Context:** decision.
 
 Absolute URI of the backend.
@@ -485,15 +485,15 @@ Absolute URI of the backend.
 ### `model`
 
 - **Syntax:** `model <name>;`
-- **Default:** `jev-latest` with `jev`. Required with `clef`.
+- **Default:** `jev-latest` with `jev`, `strands-decider` with `strands`. Required with `clef`.
 - **Context:** decision.
 
-With `clef`, `clef-flash` or `clef`. With `jev`, a model identifier of 1 to 100 characters from `A-Za-z0-9._-`. Not valid with `http`.
+With `clef`, `clef-flash` or `clef`. With `jev` and `strands`, a model identifier of 1 to 100 characters from `A-Za-z0-9._-`. Not valid with `http`.
 
 ### `api_token_env`
 
 - **Syntax:** `api_token_env <variable name>;`
-- **Default:** `TYPESAFE_API_KEY` with `jev`. Required with `clef`.
+- **Default:** `TYPESAFE_API_KEY` with `jev`. Required with `clef`. Optional with `strands`: when omitted, no `Authorization` header is sent.
 - **Context:** decision.
 
 Name of the environment variable that holds the bearer token. The token itself is never written in the file. The process fails to start when the variable is unset or blank. Not valid with `http`.

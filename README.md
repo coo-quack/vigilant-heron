@@ -12,7 +12,7 @@ Use it when you want a second screen in front of an application, with its own lo
 ```
 client ──► nginx / Cloudflare ──► vigilant-heron ──► your site (upstream)
                                       │
-                                      └──► decision model (Jev, Clef, or your own)
+                                      └──► decision model (Jev, Clef, Strands Decider, or your own)
 ```
 
 ## Install
@@ -148,7 +148,7 @@ The full reference is in [`docs/`](docs/).
 - [Troubleshooting](docs/troubleshooting.md): common symptoms and their fixes
 - [Configuration](docs/configuration.md): every directive, with its default and context
 - [How it works](docs/how-it-works.md): the request path in detail, shadow mode, failure behavior
-- [Decision backends](docs/decision-backends.md): Jev, Clef, and the JSON protocol for your own model
+- [Decision backends](docs/decision-backends.md): Jev, Clef, Strands Decider, and the JSON protocol for your own model
 - [Rules](docs/rules.md) and [built-in rules](docs/builtin-rules.md): access list, rule syntax, the built-in signatures
 - [Limits](docs/limits.md) and [timeouts](docs/timeouts.md): request-rate and connection limits, timers
 - [Logging](docs/logging.md): access and error logs, log formats, variables

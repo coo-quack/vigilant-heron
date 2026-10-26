@@ -1,5 +1,6 @@
-//! The System One decision backends: Cloudflare Clef on Workers AI and `TypeSafe`
-//! Jev. Both speak the same request and response shape.
+//! The System One decision backends: Cloudflare Clef on Workers AI, `TypeSafe`
+//! Jev, and Strands Decider, a self-hosted server. All speak the same request and
+//! response shape.
 //!
 //! The router asks three questions about each sanitized event: whether it is an
 //! attack, whether it addresses an AI, and which kind of attack it is. The
@@ -113,7 +114,7 @@ impl ClefModel {
     }
 }
 
-/// The bearer token for the Clef endpoint.
+/// The bearer token for a System One endpoint.
 ///
 /// `Debug` and `Display` print `[REDACTED]`, so the token stays out of logs and
 /// error messages.
@@ -265,12 +266,13 @@ fn category_answer(answers: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Calls a System One endpoint: Clef on Workers AI, Jev, or a server that speaks the same protocol.
+/// Calls a System One endpoint: Clef on Workers AI, Jev, Strands Decider, or a server that speaks the same protocol.
 pub(crate) struct SystemOneBackend {
     client: DecisionClient,
     url: Uri,
     model: String,
-    token: ApiToken,
+    /// Bearer token sent with each request. `None` sends no `Authorization` header.
+    token: Option<ApiToken>,
     limits: Limits,
 }
 
@@ -280,7 +282,7 @@ impl SystemOneBackend {
         client: DecisionClient,
         url: Uri,
         model: String,
-        token: ApiToken,
+        token: Option<ApiToken>,
         limits: Limits,
     ) -> Self {
         Self {
@@ -299,7 +301,7 @@ impl DecisionBackend for SystemOneBackend {
         let body = post_json(
             &self.client,
             &self.url,
-            Some(self.token.expose()),
+            self.token.as_ref().map(ApiToken::expose),
             payload,
             &self.limits,
         )
