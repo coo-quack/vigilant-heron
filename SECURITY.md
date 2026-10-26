@@ -20,10 +20,12 @@ rules are chosen, rolled out and removed, and what rules cannot cover, is descri
 For every request that is not skipped or blocked by a rule, the router sends
 the request line, headers and up to `inspect_body_bytes` of the body to the
 configured decision backend. It drops `Cookie`, `Authorization`,
-`Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token` and any header listed in
-`redact_headers`, and replaces the values of password-, pass-, token-, card-,
-PIN-, OTP-, session- and credential-like form and JSON fields, and of the fields
-named in `redact_field`, with `[REDACTED]` before sending. Multipart
+`Proxy-Authorization`, `X-Api-Key`, `X-Auth-Token`, any other header with a
+credential-like name (such as `X-Csrf-Token` or `X-Session-Id`) and any header
+listed in `redact_headers`. It replaces the values of password-, pass-, token-,
+card-, PIN-, OTP-, session- and credential-like form, JSON and query-string
+parameters, and of the fields named in `redact_field`, with `[REDACTED]` before
+sending. Multipart
 (`multipart/form-data`) bodies are only lexically redacted, so a sensitive field
 inside one can still reach the backend in some layouts. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the
@@ -220,6 +222,9 @@ failure and on the site settings:
   `on_rate_limit` and never `on_decision_error`. `error` covers timeouts (also
   after a slot was obtained), connection failures, other non-2xx statuses,
   `success: false`, and malformed or out-of-range answers.
+- A client that already holds its `max_concurrency_per_client` share is in a
+  group of its own, `client_busy`. It follows `on_client_busy`, which defaults to
+  `"block"`: the client gets 429 with an empty body, and the backend is not called.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
   `"block"` (the default) applies the site's `action`, `"allow"` forwards the
   request.
@@ -231,12 +236,13 @@ failure and on the site settings:
   is saturated. Shadow mode still forwards every request, rules included.
 
 The defaults allow requests when the backend fails or is saturated, so a provider
-outage does not block legitimate traffic. The cost is that an attacker who makes the
+outage does not block legitimate traffic. A client over its share is refused by
+default, because that is the case the per-client cap exists for. The cost is that an attacker who makes the
 backend unavailable on purpose can get requests past the model, and a site that
 keeps `on_rate_limit "allow"` or `on_decision_error "allow"` accepts that. Keep
 `fail_closed_paths` on sensitive paths, which block whatever the setting.
 
-Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in the rate-limit group, so only that client follows `on_rate_limit`, and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
+Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, which is in its own group, so only that client follows `on_client_busy` (`block` by default), and other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, keep `on_client_busy "block"`, set `on_rate_limit "block"`, and limit each client with `limit_req` and `limit_conn`.
 
 The per-client cap also covers a single client that keeps many requests in flight
 on its own. A distributed DoS attack from many addresses is not prevented by it.

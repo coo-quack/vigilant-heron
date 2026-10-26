@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Behaviour change: a client that holds its `max_concurrency_per_client` share of
+  decision calls is now answered 429 with an empty body, and the backend is not
+  called. Before, that excess followed `on_rate_limit`, which defaults to `allow`,
+  so it was forwarded without the model. The new site directive `on_client_busy
+  allow|block;` (default `block`) controls it, and `on_rate_limit` no longer
+  affects it. Set `on_client_busy allow` to keep the old forwarding. Shadow mode
+  records the 429 as the would-have action. The decision log `reason` is
+  `client_busy_allowed` or `client_busy_blocked`.
+- The query string sent to the decision backend is redacted. A parameter whose
+  decoded name is sensitive, by the same rule as body fields, or named in
+  `redact_field`, has its value replaced by `[REDACTED]`. Other parameters are sent
+  as the client sent them.
+- Headers with a credential-like name are no longer sent to the decision backend,
+  for example `x-csrf-token`, `x-xsrf-token`, `x-amz-security-token`,
+  `x-access-token` and `x-session-id`. `host`, `user-agent`, `accept`, `referer`,
+  `origin`, `x-forwarded-for` and the other headers the model uses are still sent.
 - `start`, `stop` and `restart` run the router in the background on a host. `start`
   checks the file first, refuses when a router already runs, and prints
   `started (pid N)`. `stop` sends the graceful shutdown and waits until the process

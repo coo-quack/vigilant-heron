@@ -164,6 +164,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "block_threshold",
     "instruction_threshold",
     "on_rate_limit",
+    "on_client_busy",
     "on_decision_error",
     "deny_path",
     "fail_closed_path",
@@ -409,6 +410,8 @@ pub struct SiteConfig {
     pub fail_closed_paths: Vec<String>,
     /// What happens when the backend rate-limits the request or no slot is free in time.
     pub on_rate_limit: FailureAction,
+    /// What happens when a client already holds its `max_concurrency_per_client` share.
+    pub on_client_busy: FailureAction,
     /// What happens when the backend fails in any other way.
     pub on_decision_error: FailureAction,
     /// File extensions that may skip the backend, lowercased.
@@ -1808,6 +1811,7 @@ fn parse_site(
     let mut deny_paths = Vec::new();
     let mut fail_closed_paths = Vec::new();
     let mut on_rate_limit = FailureAction::Allow;
+    let mut on_client_busy = FailureAction::Block;
     let mut on_decision_error = FailureAction::Allow;
     let mut static_extensions: Option<Vec<String>> = None;
     let mut static_locations: Vec<String> = Vec::new();
@@ -1899,6 +1903,10 @@ fn parse_site(
             "on_rate_limit" => {
                 once(&mut seen, child)?;
                 on_rate_limit = parse_failure(child, one_arg(child)?)?;
+            }
+            "on_client_busy" => {
+                once(&mut seen, child)?;
+                on_client_busy = parse_failure(child, one_arg(child)?)?;
             }
             "on_decision_error" => {
                 once(&mut seen, child)?;
@@ -2067,6 +2075,7 @@ fn parse_site(
         deny_paths,
         fail_closed_paths,
         on_rate_limit,
+        on_client_busy,
         on_decision_error,
         static_extensions: static_extensions.unwrap_or_else(|| {
             DEFAULT_STATIC_EXTENSIONS
@@ -2163,6 +2172,7 @@ mod tests {
         assert_eq!(site.instruction_threshold, 0.8);
         // Restored to allow: the fail-closed default was reverted (see CHANGELOG).
         assert_eq!(site.on_rate_limit, FailureAction::Allow);
+        assert_eq!(site.on_client_busy, FailureAction::Block);
         assert_eq!(site.on_decision_error, FailureAction::Allow);
         assert_eq!(site.mode, Mode::Enforce);
         assert_eq!(site.action, SiteAction::Block);
@@ -2425,6 +2435,36 @@ mod tests {
             message(parse(&with_site("    on_rate_limit deny;\n")))
                 .contains("\"on_rate_limit\" must be \"allow\" or \"block\"")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn on_client_busy_defaults_to_block_and_accepts_allow_and_block() -> Result<(), ConfigError> {
+        let allowed = parse(&with_site("    on_client_busy allow;\n"))?;
+        assert_eq!(first_site(&allowed)?.on_client_busy, FailureAction::Allow);
+        let blocked = parse(&with_site("    on_client_busy block;\n"))?;
+        assert_eq!(first_site(&blocked)?.on_client_busy, FailureAction::Block);
+        Ok(())
+    }
+
+    #[test]
+    fn on_client_busy_rejects_other_values_and_duplicates() {
+        assert!(
+            message(parse(&with_site("    on_client_busy deny;\n")))
+                .contains("\"on_client_busy\" must be \"allow\" or \"block\"")
+        );
+        assert!(
+            message(parse(&with_site(
+                "    on_client_busy allow;\n    on_client_busy block;\n"
+            )))
+            .contains("duplicate directive \"on_client_busy\"")
+        );
+    }
+
+    #[test]
+    fn on_rate_limit_does_not_change_on_client_busy() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    on_rate_limit block;\n"))?;
+        assert_eq!(first_site(&config)?.on_client_busy, FailureAction::Block);
         Ok(())
     }
 

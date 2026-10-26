@@ -10,6 +10,8 @@ use serde_json::Value;
 /// Replacement for the value of a sensitive field.
 pub(crate) const REDACTED: &str = "[REDACTED]";
 
+/// Credential headers dropped by name. Other headers are dropped when their name is
+/// sensitive under [`is_sensitive_key`], so `x-csrf-token` and `x-session-id` are dropped too.
 const DROPPED_HEADERS: [&str; 5] = [
     "cookie",
     "authorization",
@@ -112,7 +114,9 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
             untrusted: Untrusted {
                 method: input.method.as_str().to_owned(),
                 path: input.path.to_owned(),
-                query: input.query.map(str::to_owned),
+                query: input
+                    .query
+                    .map(|query| redact_query(query, input.redact_fields)),
                 headers: sanitize_headers(input.headers, input.redact_headers),
                 body,
             },
@@ -125,6 +129,31 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
     }
 }
 
+/// Redacts the values of sensitive parameters in a query string.
+///
+/// A parameter is redacted by the same rule as a body field, applied to its decoded
+/// name. The other parameters are copied as they were sent, so their order and
+/// encoding are kept. A parameter without `=` has no value and is copied as it is.
+fn redact_query(query: &str, redact_fields: &[String]) -> String {
+    query
+        .split('&')
+        .map(|parameter| match parameter.split_once('=') {
+            Some((name, _)) if is_redacted_key(&decode_name(name), redact_fields) => {
+                format!("{name}={REDACTED}")
+            }
+            _ => parameter.to_owned(),
+        })
+        .collect::<Vec<String>>()
+        .join("&")
+}
+
+/// Decodes a parameter name the way form data does (`+` is a space, `%XX` is a byte).
+fn decode_name(raw: &str) -> String {
+    form_urlencoded::parse(raw.as_bytes())
+        .map(|(name, _)| name.into_owned())
+        .collect()
+}
+
 /// Copies the headers that may be sent, dropping credentials and redacted names.
 pub(crate) fn sanitize_headers(headers: &HeaderMap, extra: &[String]) -> Vec<(String, String)> {
     headers
@@ -132,6 +161,7 @@ pub(crate) fn sanitize_headers(headers: &HeaderMap, extra: &[String]) -> Vec<(St
         .filter(|(name, _)| {
             let name = name.as_str();
             !DROPPED_HEADERS.contains(&name)
+                && !is_sensitive_key(name)
                 && !extra
                     .iter()
                     .any(|dropped| dropped.eq_ignore_ascii_case(name))
@@ -485,6 +515,78 @@ mod tests {
         assert!(kept.iter().all(|(kept_name, _)| kept_name != name));
         assert!(kept.iter().any(|(kept_name, _)| kept_name == "user-agent"));
         Ok(())
+    }
+
+    #[rstest]
+    #[case::csrf_token("x-csrf-token")]
+    #[case::xsrf_token("x-xsrf-token")]
+    #[case::amz_security_token("x-amz-security-token")]
+    #[case::access_token("x-access-token")]
+    #[case::session_id("x-session-id")]
+    #[case::secret("x-client-secret")]
+    #[case::jwt("cf-access-jwt-assertion")]
+    fn sensitive_named_headers_are_dropped(#[case] name: &str) -> Result<(), BoxError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_static("secret"),
+        );
+        headers.insert(http::header::ACCEPT, HeaderValue::from_static("*/*"));
+        let kept = sanitize_headers(&headers, &[]);
+        assert_eq!(kept, vec![("accept".to_owned(), "*/*".to_owned())]);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::host("host")]
+    #[case::user_agent("user-agent")]
+    #[case::content_type("content-type")]
+    #[case::content_length("content-length")]
+    #[case::accept("accept")]
+    #[case::accept_language("accept-language")]
+    #[case::accept_encoding("accept-encoding")]
+    #[case::referer("referer")]
+    #[case::origin("origin")]
+    #[case::sec_websocket_key("sec-websocket-key")]
+    #[case::sec_websocket_version("sec-websocket-version")]
+    #[case::sec_websocket_extensions("sec-websocket-extensions")]
+    #[case::sec_websocket_protocol("sec-websocket-protocol")]
+    #[case::sec_fetch_site("sec-fetch-site")]
+    #[case::x_forwarded_for("x-forwarded-for")]
+    #[case::x_forwarded_proto("x-forwarded-proto")]
+    #[case::x_real_ip("x-real-ip")]
+    #[case::cf_connecting_ip("cf-connecting-ip")]
+    #[case::x_request_id("x-request-id")]
+    fn headers_the_model_needs_are_kept(#[case] name: &str) -> Result<(), BoxError> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_static("value"),
+        );
+        let kept = sanitize_headers(&headers, &[]);
+        assert_eq!(kept, vec![(name.to_owned(), "value".to_owned())]);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::plain("a=1&b=two", "a=1&b=two")]
+    #[case::sensitive_value("token=abc&c=3", "token=[REDACTED]&c=3")]
+    #[case::keeps_order_and_encoding(
+        "z=1&password=%26x+y&a=b%20c",
+        "z=1&password=[REDACTED]&a=b%20c"
+    )]
+    #[case::encoded_name("pass%77ord=x&q=y", "pass%77ord=[REDACTED]&q=y")]
+    #[case::name_without_value("token&flag", "token&flag")]
+    #[case::empty_value_is_redacted("api_key=", "api_key=[REDACTED]")]
+    #[case::ordinary_names_are_kept("pinned_note=1&shipping=2", "pinned_note=1&shipping=2")]
+    fn sensitive_query_parameters_are_redacted(#[case] query: &str, #[case] expected: &str) {
+        assert_eq!(redact_query(query, &[]), expected);
+    }
+
+    #[test]
+    fn redact_field_names_also_redact_query_parameters() {
+        let fields = ["lang".to_owned()];
+        assert_eq!(redact_query("lang=ja&q=x", &fields), "lang=[REDACTED]&q=x");
     }
 
     #[test]

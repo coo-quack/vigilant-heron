@@ -528,7 +528,9 @@ Most backend calls in flight at the same time. At least 1.
 - **Default:** `8`, or `max_concurrency` when that is smaller.
 - **Context:** decision.
 
-Most backend calls in flight for one client address, keyed by the client address that the realip settings choose. A request from a client that already holds its share is not queued: it is a rate limit for that client (`decision_error=client_busy`, in the `on_rate_limit` group), so other clients keep getting the model. It must be at least 1 and at most `max_concurrency`. This limits a denial-of-service (DoS) attack from one address, but not one from many addresses. See [How it works](/how-it-works#failure-behavior).
+Most backend calls in flight for one client address, keyed by the client address that the realip settings choose. A request from a client that already holds its share is not queued. It is refused for that client alone (`decision_error=client_busy`), and the site's `on_client_busy` decides what happens to it: by default it gets 429, so other clients keep getting the model. It must be at least 1 and at most `max_concurrency`. This limits a denial-of-service (DoS) attack from one address, but not one from many addresses.
+
+Behind a shared address, such as an office or school NAT, or a proxy whose real client address is not set up with `real_ip_from`, many legitimate users look like one client. If they hit the 429, raise this value, or set `on_client_busy allow` so that the excess skips the model (rules still apply). See [How it works](/how-it-works#failure-behavior).
 
 ### `inspect_body`
 
@@ -548,7 +550,7 @@ Rejected with an error that names `client_max_body_size`, which is set at the to
 ### `redact_header`
 
 - **Syntax:** `redact_header <name> ...;`
-- **Default:** none. `cookie`, `authorization`, `proxy-authorization`, `x-api-key` and `x-auth-token` are always removed.
+- **Default:** none. `cookie`, `authorization`, `proxy-authorization`, `x-api-key` and `x-auth-token` are always removed, and so is any header with a credential-like name (such as `x-csrf-token`).
 - **Context:** decision.
 
 Extra header names removed before the event is sent to the backend. Repeatable. They cannot be logged either.
@@ -559,7 +561,7 @@ Extra header names removed before the event is sent to the backend. Repeatable. 
 - **Default:** none. Field names with password-, token-, card-like or other sensitive words are redacted already (see [How it works](/how-it-works)).
 - **Context:** decision.
 
-Extra form and JSON field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. Repeatable.
+Extra form, JSON and query-string field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. Repeatable.
 
 ## Site block
 
@@ -611,13 +613,21 @@ Attack score, from 0 to 1, at or above which a request is blocked.
 
 AI-instruction score, from 0 to 1, at or above which a request is blocked.
 
+### `on_client_busy`
+
+- **Syntax:** `on_client_busy allow | block;`
+- **Default:** `block`.
+- **Context:** site.
+
+What happens when a client already holds its `max_concurrency_per_client` share of backend calls (`decision_error=client_busy`). The default `block` answers 429 with an empty body and does not call the backend. `allow` forwards the request without the model, and rules still apply. The setting is separate from `on_rate_limit`, so changing that does not change this. Earlier versions let such a request through, because it followed `on_rate_limit`, which defaults to `allow`. See [the changelog](/changelog).
+
 ### `on_rate_limit`
 
 - **Syntax:** `on_rate_limit allow | block;`
 - **Default:** `allow`.
 - **Context:** site.
 
-What happens when the backend answers HTTP 429, when no slot is free within `queue_timeout`, or when a client already holds its `max_concurrency_per_client` share (`client_busy`). Rules are not affected. A denial-of-service (DoS) attack against the backend can use this to make requests skip the model, so a site that prefers safety over availability should set `block`, and limit each client with `limit_req` and `limit_conn`. See [How it works](/how-it-works#failure-behavior).
+What happens when the backend answers HTTP 429, or when no slot is free within `queue_timeout` (`backend_busy`). A client over its `max_concurrency_per_client` share is governed by `on_client_busy` instead. Rules are not affected. A denial-of-service (DoS) attack against the backend can use this to make requests skip the model, so a site that prefers safety over availability should set `block`, and limit each client with `limit_req` and `limit_conn`. See [How it works](/how-it-works#failure-behavior).
 
 ### `on_decision_error`
 
