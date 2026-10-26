@@ -1120,4 +1120,164 @@ mod tests {
         assert_eq!(answer, RESPONSE_414);
         Ok(())
     }
+
+    #[rstest]
+    #[case::at_the_line_limit(14, Ok(true))]
+    #[case::one_byte_over_the_line_limit(13, Err(HeadViolation::RequestLineTooLong))]
+    fn a_request_line_is_refused_only_past_its_limit(
+        #[case] line: usize,
+        #[case] expected: Result<bool, HeadViolation>,
+    ) {
+        // "GET / HTTP/1.1" is 14 bytes.
+        assert_eq!(
+            scan_in_chunks(b"GET / HTTP/1.1\r\n\r\n", 1, limits(line, 100)),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[case::exactly_the_total_limit(18, Ok(true))]
+    #[case::one_byte_over_the_total_limit(17, Err(HeadViolation::HeaderTooLarge))]
+    fn a_header_section_is_refused_only_past_the_total_limit(
+        #[case] total: usize,
+        #[case] expected: Result<bool, HeadViolation>,
+    ) {
+        // "GET / HTTP/1.1\r\n\r\n" is 18 bytes, the blank line included.
+        assert_eq!(
+            scan_in_chunks(b"GET / HTTP/1.1\r\n\r\n", 1, limits(100, total)),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_busy_connection_reports_the_busy_phase() {
+        let cell = PhaseCell::new();
+        cell.set(Phase::Busy);
+        assert_eq!(cell.get(), Phase::Busy);
+    }
+
+    #[test]
+    fn only_an_idle_connection_moves_back_to_the_header_wait() {
+        let cell = PhaseCell::new();
+        assert!(
+            !cell.begin_header(),
+            "a connection awaiting its first header is not idle"
+        );
+        cell.set(Phase::AwaitingKeepAlive);
+        assert!(cell.begin_header());
+        assert_eq!(cell.get(), Phase::AwaitingHeader);
+        cell.set(Phase::Busy);
+        assert!(!cell.begin_header(), "a busy connection is not idle");
+    }
+
+    /// A writer that accepts no bytes on its first write, then records every byte it gets.
+    #[derive(Default)]
+    struct RefusingOnce {
+        refused: bool,
+        written: Vec<u8>,
+    }
+
+    impl AsyncRead for RefusingOnce {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for RefusingOnce {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if this.refused {
+                this.written.extend_from_slice(buf);
+                Poll::Ready(Ok(buf.len()))
+            } else {
+                this.refused = true;
+                Poll::Ready(Ok(0))
+            }
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_the_socket_refuses_is_not_retried() -> Result<(), BoxError> {
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(
+            RefusingOnce::default(),
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.begin_linger(RESPONSE_408, None, false);
+        io.shutdown().await?;
+        assert!(
+            io.inner.written.is_empty(),
+            "a write that accepts no bytes ends the answer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_write_during_a_lingering_close_fails() -> Result<(), BoxError> {
+        let (_client, server) = socket_pair().await?;
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(
+            server,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.begin_linger(&[], None, true);
+        let single = io.write(b"x").await.err().map(|error| error.kind());
+        assert_eq!(single, Some(io::ErrorKind::BrokenPipe));
+        let vectored = io
+            .write_vectored(&[IoSlice::new(b"x")])
+            .await
+            .err()
+            .map(|error| error.kind());
+        assert_eq!(vectored, Some(io::ErrorKind::BrokenPipe));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_write_after_a_lingering_close_has_ended_fails() -> Result<(), BoxError> {
+        let (_client, server) = socket_pair().await?;
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = closing(server, timers);
+        io.shutdown().await?;
+        let single = io.write(b"x").await.err().map(|error| error.kind());
+        assert_eq!(single, Some(io::ErrorKind::BrokenPipe));
+        let vectored = io
+            .write_vectored(&[IoSlice::new(b"x")])
+            .await
+            .err()
+            .map(|error| error.kind());
+        assert_eq!(vectored, Some(io::ErrorKind::BrokenPipe));
+        Ok(())
+    }
 }

@@ -467,4 +467,31 @@ mod tests {
         assert!(removed, "the pid file was not removed on drop");
         Ok(())
     }
+
+    #[test]
+    fn the_directory_of_a_path_is_its_parent() {
+        assert_eq!(
+            directory_of(Path::new("/run/vigilant-heron/router.pid")),
+            Path::new("/run/vigilant-heron")
+        );
+    }
+
+    #[test]
+    fn a_bare_file_name_is_looked_up_in_the_current_directory() {
+        assert_eq!(directory_of(Path::new("router.pid")), Path::new("."));
+    }
+
+    #[test]
+    fn a_directory_at_the_pid_path_is_not_mistaken_for_a_file_that_exists() -> std::io::Result<()> {
+        let dir = scratch_dir("directory-at-path", 0o700)?;
+        let path = dir.join("router.pid");
+        std::fs::create_dir(&path)?;
+        std::fs::write(path.join("inside"), "")?;
+        let error = create_exclusive(&path).err();
+        let still_a_directory = path.is_dir();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(still_a_directory);
+        assert!(error.is_some_and(|error| error.kind() != ErrorKind::AlreadyExists));
+        Ok(())
+    }
 }

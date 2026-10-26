@@ -3311,4 +3311,81 @@ mod connection_limit_tests {
         );
         assert!(text.contains("test.conf:5:"), "{text}");
     }
+
+    /// A configuration that is valid as written, for the tests of this module.
+    const PLAIN_BASE: &str = "listen 127.0.0.1:8080;\n\
+        decision {\n    backend http;\n    url http://stub-decider:9000/decide;\n}\n\
+        site example.com {\n    upstream http://upstream:80;\n}\n";
+
+    fn parse_plain(text: &str) -> Result<Config, ConfigError> {
+        Config::parse_str_with_lookup(text, "test.conf", |_| None)
+    }
+
+    #[test]
+    fn max_connections_must_be_at_least_one_and_is_taken_as_written() -> Result<(), ConfigError> {
+        assert!(
+            message(parse_plain(&format!("max_connections 0;\n{PLAIN_BASE}")))
+                .contains("\"max_connections\" must be at least 1")
+        );
+        assert_eq!(
+            parse_plain(&format!("max_connections 5;\n{PLAIN_BASE}"))?.max_connections,
+            5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_per_client_share_equal_to_the_global_cap_is_allowed() -> Result<(), ConfigError> {
+        let config = parse_plain(
+            "listen 127.0.0.1:8080;\ndecision {\n    backend http;\n    url http://stub-decider:9000/decide;\n    max_concurrency 10;\n    max_concurrency_per_client 10;\n}\nsite example.com {\n    upstream http://upstream:80;\n}\n",
+        )?;
+        assert_eq!(config.decision.max_concurrency_per_client, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn a_syslog_tag_must_not_be_empty() {
+        let text = message(parse_plain(&format!(
+            "access_log syslog:server=192.0.2.10:514,tag=;\n{PLAIN_BASE}"
+        )));
+        assert!(text.contains("invalid syslog option \"tag=\""), "{text}");
+    }
+
+    #[test]
+    fn error_log_can_write_to_stdout_or_stderr_by_name() -> Result<(), ConfigError> {
+        let out = parse_plain(&format!("error_log stdout;\n{PLAIN_BASE}"))?;
+        assert_eq!(out.error_log.destination, Destination::Stdout);
+        let err = parse_plain(&format!("error_log stderr;\n{PLAIN_BASE}"))?;
+        assert_eq!(err.error_log.destination, Destination::Stderr);
+        Ok(())
+    }
+
+    #[test]
+    fn an_upstream_must_use_the_http_scheme_and_name_a_host() {
+        for upstream in ["ftp://upstream:80", "http:/path-only", "http:upstream"] {
+            let text = message(parse_plain(&format!(
+                "listen 127.0.0.1:8080;\ndecision {{\n    backend http;\n    url http://stub-decider:9000/decide;\n}}\nsite example.com {{\n    upstream {upstream};\n}}\n"
+            )));
+            assert!(
+                text.contains("must be an absolute http:// URI"),
+                "{upstream}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_settings_reads_the_worker_shutdown_timeout() -> Result<(), std::io::Error> {
+        let dir = std::env::temp_dir().join(format!("vh-process-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("router.conf");
+        std::fs::write(&path, format!("worker_shutdown_timeout 7s;\n{PLAIN_BASE}"))?;
+        let settings = process_settings(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = settings.map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(
+            settings.worker_shutdown_timeout,
+            Some(Duration::from_secs(7))
+        );
+        Ok(())
+    }
 }
