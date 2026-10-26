@@ -1218,7 +1218,7 @@ fn request_id<B>(state: &AppState<B>, headers: &HeaderMap) -> Option<String> {
 }
 
 /// The value of a valid `Content-Length` header.
-fn content_length(headers: &HeaderMap) -> Option<u64> {
+pub(crate) fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get(CONTENT_LENGTH)?
         .to_str()

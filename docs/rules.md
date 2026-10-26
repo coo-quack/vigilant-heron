@@ -4,6 +4,50 @@ Two deterministic checks run before the decision backend: an access list by
 client address, and rules that match the request. Both use nginx syntax, and both
 can be written at the top level or inside a `site`.
 
+## Write your own rule
+
+Follow these five steps to add a rule. The example blocks a retired admin path.
+
+1. **Write the rule file.** Put the rule in a file under `rules.d/`, such as
+   `rules.d/local.conf`, and include it from the top level of the configuration with
+   `include rules.d/*.conf;`. The sample file `examples/rules.d/local.conf` has more
+   examples. Rule ids must not start with `vh-`, which is reserved for the built-in
+   rules.
+
+   ```nginx
+   rule local-old-admin {
+       description "retired admin path";
+       action block;
+       site www.example.com;
+       path ^~ /old-admin;
+   }
+   ```
+
+2. **Check the syntax.** Run `vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf`.
+   It reports the file and line of any error. It does not show what a rule matches.
+
+3. **Test the rule on sample requests.** Save one request that the rule must block and
+   one normal request that it must not block, as raw HTTP files. Then run
+   `test-request` on each. The `rules:` line names the rule that matched, and the
+   `result:` line gives the action. See [Check a request with test-request](/cli#check-a-request-with-test-request).
+
+   ```console
+   $ vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf test-request old-admin.http
+   ```
+
+4. **Reload the running router.** Run `vigilant-heron -s reload`. The router applies the
+   new file and keeps its open connections. A file that fails the check keeps the old
+   configuration.
+
+5. **Check the access log.** Send a request that the rule should match, and look at its
+   log line. `rule_id` is the id of the rule, and `reason` is `rule`. On a shadow site,
+   `would_have=block` shows that the request would have been blocked, and the request
+   is still forwarded. See [Logging](/logging).
+
+For a new site, it is safer to start the site with `mode shadow;`, check the log for
+`would_have=block` on the requests you expect, and switch to `mode enforce;` only after
+that. Rules run in both modes.
+
 ## Access list
 
 ```nginx

@@ -44,9 +44,11 @@ fn check_configuration(path: &Path) -> anyhow::Result<Config> {
         .map_err(|error| anyhow!("{error}\nconfiguration file {} test failed", path.display()))
 }
 
-/// Reads the pid of a live process named by the pid file. A missing or stale file gives
-/// `None`. A process owned by another user still counts as live. A malformed file, or one
-/// that [`pidfile::read_pid`] does not trust, is an error, and nothing is signalled.
+/// Reads the pid of a running router named by the pid file. A missing or stale file gives
+/// `None`: a router counts as running only while it holds the lock of the pid file, so a
+/// pid that a crashed router left behind is never taken for a live process. A process owned
+/// by another user still counts as live. A malformed file, or one that [`pidfile::read_pid`]
+/// does not trust, is an error, and nothing is signalled.
 fn live_pid(pid_file: &Path) -> anyhow::Result<Option<i32>> {
     let raw = match pidfile::read_pid(pid_file) {
         Ok(raw) => raw,
@@ -55,6 +57,11 @@ fn live_pid(pid_file: &Path) -> anyhow::Result<Option<i32>> {
             return Err(error).with_context(|| format!("the pid file {}", pid_file.display()));
         }
     };
+    let locked = pidfile::lock_held(pid_file)
+        .with_context(|| format!("the lock of the pid file {}", pid_file.display()))?;
+    if !locked {
+        return Ok(None);
+    }
     let pid = Pid::from_raw(raw).ok_or_else(|| anyhow!("invalid process id {raw}"))?;
     match test_kill_process(pid) {
         Ok(()) | Err(Errno::PERM) => Ok(Some(raw)),

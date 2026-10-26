@@ -5,11 +5,12 @@ mod lifecycle;
 mod pidfile;
 
 use std::future::Future;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use anyhow::Context;
+use anyhow::{Context, anyhow};
 use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
 use pidfile::PidFile;
 use tokio::signal::unix::{SignalKind, signal};
@@ -59,6 +60,9 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Test { dump } => Ok(test_configuration(&resolve_config(config), dump)),
+        Command::TestRequest { file, client } => {
+            Ok(test_request(&resolve_config(config), &file, client))
+        }
         Command::Start => lifecycle::start(&resolve_config(config)),
         Command::Stop => lifecycle::stop(&resolve_config(config)),
         Command::Restart => lifecycle::restart(&resolve_config(config)),
@@ -118,6 +122,51 @@ fn test_configuration(path: &Path, dump: bool) -> ExitCode {
     }
 }
 
+/// Runs `test-request`: reads the raw request from `file` (or stdin for `-`), checks it
+/// against the configuration, and prints the report to stdout. Errors go to stderr, exit 1.
+fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
+    let mut stderr = std::io::stderr();
+    let raw = match read_request(file) {
+        Ok(raw) => raw,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "vigilant-heron: cannot read the request file {}: {error}",
+                file.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    match vigilant_heron::check_request(config, &raw, client) {
+        Ok(check) => {
+            let report = check.to_string();
+            let mut stdout = std::io::stdout();
+            if stdout
+                .write_all(report.as_bytes())
+                .and_then(|()| stdout.flush())
+                .is_err()
+            {
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            let _ = writeln!(stderr, "vigilant-heron: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reads a request file whole, or standard input for `-`.
+fn read_request(file: &Path) -> std::io::Result<Vec<u8>> {
+    if file == Path::new("-") {
+        let mut raw = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut raw)?;
+        return Ok(raw);
+    }
+    std::fs::read(file)
+}
+
 /// Builds the multi-thread runtime. Without `worker_threads`, tokio uses one worker per CPU core.
 fn build_runtime(worker_threads: Option<usize>) -> anyhow::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -167,6 +216,23 @@ async fn run(
     }
     // Registered before the listener is bound, so a stop sent once the pid file exists is handled.
     let shutdown = shutdown_signal();
+    // The lock comes before the bind, so a second router with the same pid file exits without
+    // binding or touching the pid file. Any other failure to lock is logged and the router still
+    // runs, as a failure to write the pid file is.
+    let mut pid_file = match PidFile::lock(&config.pid_file).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err(anyhow!("{error}"));
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %config.pid_file.display(),
+                "cannot lock the pid file; `-s` and `stop` will not find this process"
+            );
+            PidFile::unlocked(&config.pid_file)
+        }
+    };
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("binding {}", config.listen))?;
@@ -174,17 +240,13 @@ async fn run(
     // accepts connections. A failure to write it is logged and the router still runs, so an
     // existing deployment whose directory is not writable keeps working; `-s` then reports the
     // missing file.
-    let _pid_file = match PidFile::create(&config.pid_file) {
-        Ok(file) => Some(file),
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                path = %config.pid_file.display(),
-                "cannot write the pid file; `-s` will not find this process"
-            );
-            None
-        }
-    };
+    if let Err(error) = pid_file.write() {
+        tracing::warn!(
+            %error,
+            path = %config.pid_file.display(),
+            "cannot write the pid file; `-s` will not find this process"
+        );
+    }
     tracing::info!(listen = %config.listen, "vigilant-heron is listening");
     // A reload stages the new error log destination before the configuration is
     // put into service, and the staged destination is committed only after that.

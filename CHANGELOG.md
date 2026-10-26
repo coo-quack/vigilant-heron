@@ -2,6 +2,23 @@
 
 ## v0.1.0 (2026-10-26)
 
+- Added: `vigilant-heron test-request <file> [--client <address>]` reports what the
+  router would do with one raw HTTP/1.1 request before deployment: the site, the access
+  list, `deny_path`, the rules that match, and whether the request would go to the
+  decision backend. It runs the server's own checks, never calls the upstream or the
+  backend, and does not simulate `limit_req` or `limit_conn` counts. See
+  [Check a request with test-request](/cli#check-a-request-with-test-request).
+- Fixed: a stale pid file could make `-s`, `stop`, `restart` and `start` act on an
+  unrelated process. When a router died without removing its pid file and the OS
+  gave its pid to another process, `-s stop` or `stop` signalled that process, and
+  `start` refused with "already running". A running router now holds an exclusive
+  lock on `<pid file>.lock`, and those commands treat a pid file as running only
+  while the lock is held. A stale file is never signalled. Also, two routers with
+  the same `pid` path no longer overwrite each other's pid file: the second exits
+  with `another router is using the pid file <path>`.
+- Changed: releases now run the tests and the advisory check (`cargo deny` and
+  `pnpm audit`) in a job without write access, and the publishing job keeps no
+  credential in its checkout. The version tag is created through the REST API.
 - Fixed: the opt-in virtual patches `vh-cve-2026-9103` (`/api/v1/login/auto_login`)
   and `vh-cve-2026-8481` (`/api/v1/validate/code`) compared the path case-sensitively,
   so a request such as `/API/V1/LOGIN/AUTO_LOGIN` got past them. Both rules now match

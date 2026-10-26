@@ -528,6 +528,94 @@ fn signal_with_a_stale_pid_file_fails_with_exit_one() -> Result<(), std::io::Err
     Ok(())
 }
 
+/// Starts a `sleep` that the test owns, so a stale pid file can name a live process.
+fn live_stranger() -> Result<Child, std::io::Error> {
+    Ok(Child(Command::new("sleep").arg("30").spawn()?))
+}
+
+#[test]
+fn a_stale_pid_file_naming_a_live_process_is_not_signalled() -> Result<(), std::io::Error> {
+    // The pid file is left behind with no lock held, as a crashed router leaves it. The pid
+    // now belongs to an unrelated process, which must receive no signal.
+    let fixture = Fixture::new("signal-live-stale")?;
+    fixture.write(&router_config(1, &fixture.pid, 9, ""))?;
+    let stranger = live_stranger()?;
+    let stranger_pid = stranger.0.id();
+    std::fs::write(&fixture.pid, format!("{stranger_pid}\n"))?;
+    for word in ["reload", "stop"] {
+        let output = fixture.signal(word)?;
+        assert_eq!(output.status.code(), Some(1), "{word}: {}", text(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("is stale"), "{word}: {stderr}");
+        assert!(
+            alive(stranger_pid),
+            "-s {word} signalled the unrelated process {stranger_pid}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn stop_does_not_signal_a_live_process_named_by_a_stale_pid_file() -> Result<(), std::io::Error> {
+    let fixture = Fixture::new("stop-live-stale")?;
+    fixture.write(&router_config(1, &fixture.pid, 9, ""))?;
+    let stranger = live_stranger()?;
+    let stranger_pid = stranger.0.id();
+    std::fs::write(&fixture.pid, format!("{stranger_pid}\n"))?;
+    let output = fixture.lifecycle("stop")?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("not running"));
+    assert!(
+        alive(stranger_pid),
+        "stop signalled the unrelated process {stranger_pid}"
+    );
+    Ok(())
+}
+
+#[test]
+fn a_second_router_with_the_same_pid_file_exits() -> Result<(), std::io::Error> {
+    let fixture = Fixture::new("second-router")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    fixture.write(&router_config(port, &fixture.pid, upstream.port, ""))?;
+    assert_eq!(fixture.lifecycle("start")?.status.code(), Some(0));
+    let first = read_pid(&fixture.pid).ok_or_else(|| std::io::Error::other("no pid"))?;
+
+    let second_conf = fixture.dir.join("second.conf");
+    std::fs::write(
+        &second_conf,
+        router_config(free_port()?, &fixture.pid, upstream.port, ""),
+    )?;
+    let mut second = Child(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&second_conf)
+            .env_remove("VIGILANT_HERON_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let status = wait_for_exit(&mut second, Duration::from_secs(10));
+    let mut stderr = String::new();
+    if let Some(mut pipe) = second.0.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    assert_eq!(status.and_then(|status| status.code()), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "another router is using the pid file {}",
+            fixture.pid.display()
+        )),
+        "{stderr}"
+    );
+    assert_eq!(read_pid(&fixture.pid), Some(first), "the pid file changed");
+    assert!(
+        wait_for(port, "example.com", "/", 200).is_some(),
+        "the first router stopped serving"
+    );
+    Ok(())
+}
+
 /// Starts the router in the foreground with `conf`, and waits until its pid file exists.
 fn foreground(conf: &Path, pid: &Path) -> Result<Child, std::io::Error> {
     let child = Child(
@@ -729,6 +817,24 @@ fn signal_stop_exits_zero_and_removes_the_pid_file() -> Result<(), std::io::Erro
 // ---------------------------------------------------------------------------
 // start
 // ---------------------------------------------------------------------------
+
+#[test]
+fn start_proceeds_past_a_stale_pid_file_naming_a_live_process() -> Result<(), std::io::Error> {
+    let fixture = Fixture::new("start-live-stale")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    fixture.write(&router_config(port, &fixture.pid, upstream.port, ""))?;
+    let stranger = live_stranger()?;
+    let stranger_pid = stranger.0.id();
+    std::fs::write(&fixture.pid, format!("{stranger_pid}\n"))?;
+    let output = fixture.lifecycle("start")?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    let pid = read_pid(&fixture.pid).ok_or_else(|| std::io::Error::other("no pid"))?;
+    assert_ne!(pid, stranger_pid, "the pid file still names the stranger");
+    assert!(alive(stranger_pid), "start signalled the unrelated process");
+    assert!(wait_for(port, "example.com", "/", 200).is_some());
+    Ok(())
+}
 
 #[test]
 fn start_serves_in_the_background_and_writes_the_child_pid() -> Result<(), std::io::Error> {
@@ -972,6 +1078,19 @@ fn stop_fails_without_killing_a_process_that_outlives_the_bound() -> Result<(), 
             .spawn()?,
     );
     std::fs::write(&fixture.pid, format!("{}\n", stubborn.0.id()))?;
+    // A running router holds the lock of its pid file, so the test holds it for the process
+    // that stands in for the router. Without the lock, stop would take the file for a stale one.
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(format!("{}.lock", fixture.pid.display()))?;
+    // `lock_file` keeps the lock until the test ends.
+    rustix::fs::flock(
+        &lock_file,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )
+    .map_err(std::io::Error::from)?;
     let began = Instant::now();
     let output = fixture.lifecycle("stop")?;
     let took = began.elapsed();
@@ -1212,5 +1331,244 @@ fn a_router_started_with_start_is_not_restarted_after_a_crash() -> Result<(), st
         fetch(port, "example.com", "/").is_none(),
         "something restarted the router"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// test-request: what the router would do with one sample request
+// ---------------------------------------------------------------------------
+
+/// Writes `request` to `name` in `dir` and runs `test-request` on it with the configuration `conf`.
+fn test_request(
+    dir: &Path,
+    name: &str,
+    request: &str,
+    conf: &Path,
+    extra: &[&str],
+) -> Result<Output, std::io::Error> {
+    let file = write_file(dir, name, request)?;
+    let mut args = vec![
+        "test-request",
+        file.to_str().unwrap_or_default(),
+        "-c",
+        conf.to_str().unwrap_or_default(),
+    ];
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+/// The stdout of an output, as text.
+fn stdout_of(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn test_request_reports_a_request_blocked_by_a_built_in_rule() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-builtin")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_request(
+        &dir,
+        "sqli.txt",
+        "GET /items?id=1%20UNION%20SELECT%20password%20FROM%20users HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("site: example.com (shadow off)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("access list: allowed"), "{stdout}");
+    assert!(
+        stdout.contains("rules: vh-sqli-001 matched (block): UNION SELECT in a query string"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("result: blocked with 403 by rule vh-sqli-001"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_a_request_blocked_by_deny_path() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-deny-path")?;
+    let conf = write_file(
+        &dir,
+        "router.conf",
+        "listen 127.0.0.1:8080;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n    deny_path /xmlrpc.php;\n}\n",
+    )?;
+    let output = test_request(
+        &dir,
+        "xmlrpc.txt",
+        "GET /xmlrpc.php HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("deny_path: matched \"/xmlrpc.php\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("result: blocked with 403 by deny_path /xmlrpc.php"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_a_skip_rule_forwarding_without_the_backend() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-skip-rule")?;
+    let skip = "rule local-health {\n    description \"health probe\";\n    action skip;\n    path = /healthz;\n}\n";
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", skip))?;
+    let output = test_request(
+        &dir,
+        "healthz.txt",
+        "GET /healthz HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains(
+            "rules: local-health matched (skip): health probe; path readings [\"/healthz\"]"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "result: forwarded to http://127.0.0.1:9/ without the decision backend (skip rule local-health)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("would be sent"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_a_request_that_would_go_to_the_backend() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-backend")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_request(
+        &dir,
+        "search.txt",
+        "GET /search?q=hello HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains(
+            "result: would be sent to the decision backend (http); the verdict is not known without calling it"
+        ),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_an_access_list_denial_for_the_given_client() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-access")?;
+    let access = "allow 10.0.0.0/8;\ndeny all;\n";
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", access))?;
+    let request = "GET /search?q=hello HTTP/1.1\nHost: example.com\n\n";
+
+    let denied = test_request(
+        &dir,
+        "denied.txt",
+        request,
+        &conf,
+        &["--client", "203.0.113.9"],
+    )?;
+    let stdout = stdout_of(&denied);
+    assert_eq!(denied.status.code(), Some(0), "{}", text(&denied));
+    assert!(stdout.contains("access list: denied"), "{stdout}");
+    assert!(
+        stdout.contains("result: blocked with 403 by the access list"),
+        "{stdout}"
+    );
+
+    let allowed = test_request(
+        &dir,
+        "allowed.txt",
+        request,
+        &conf,
+        &["--client", "10.1.2.3"],
+    )?;
+    let stdout = stdout_of(&allowed);
+    assert_eq!(allowed.status.code(), Some(0), "{}", text(&allowed));
+    assert!(stdout.contains("access list: allowed"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_a_shadow_site_that_would_block_and_forwards() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("test-request-shadow")?;
+    let conf = write_file(
+        &dir,
+        "router.conf",
+        "listen 127.0.0.1:8080;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n    mode shadow;\n}\n",
+    )?;
+    let output = test_request(
+        &dir,
+        "sqli.txt",
+        "GET /items?id=1%20UNION%20SELECT%20password%20FROM%20users HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("site: example.com (shadow on)"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "result: forwarded to http://127.0.0.1:9/ (shadow mode: would have been blocked with 403 by rule vh-sqli-001)"
+        ),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_an_unknown_host_with_the_default_status() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-unknown-host")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_request(
+        &dir,
+        "other.txt",
+        "GET / HTTP/1.1\nHost: other.example\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("site: none"), "{stdout}");
+    assert!(
+        stdout.contains("result: rejected with 421 (unknown host"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_refuses_a_malformed_request_file_with_exit_one() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-malformed")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_request(
+        &dir,
+        "broken.txt",
+        "GET / HTTP/1.1\nHost example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("line 2"), "{stderr}");
     Ok(())
 }

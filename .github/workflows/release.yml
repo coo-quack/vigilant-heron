@@ -50,8 +50,46 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  release:
+  # Tests and the advisory check (the same tools and steps as the ci.yml audit
+  # job) run without write access, and the checkout keeps no credential.
+  verify:
     needs: check
+    # A dry run always verifies. A real run verifies only when the version tag is new.
+    if: needs.check.outputs.dry_run == 'true' || needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Keep in step with ci.yml.
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}
+      - run: command -v cargo-deny || cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
+      - run: cargo deny --locked check
+      # The documentation site's dependencies (docs/, package.json). pnpm comes
+      # from corepack, which reads the packageManager field.
+      - run: corepack enable pnpm
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24.22.1'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
+
+  # Publishes the image, tag and release. The checkout keeps no credential, so
+  # the token below is not left in .git/config.
+  publish:
+    needs: [check, verify]
     # A dry run always builds. A real run builds only when the version tag is new.
     if: needs.check.outputs.dry_run == 'true' || needs.check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
@@ -60,9 +98,8 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Run tests
-        run: cargo test --workspace --locked
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
@@ -89,15 +126,16 @@ jobs:
 
       - name: Create git tag
         if: needs.check.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: v${{ needs.check.outputs.version }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          VERSION="v${{ needs.check.outputs.version }}"
           if git ls-remote --tags origin "$VERSION" | grep -q "$VERSION"; then
             echo "Tag $VERSION already exists, skipping"
           else
-            git tag "$VERSION"
-            git push origin "$VERSION"
+            gh api "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/$VERSION" \
+              -f sha="$GITHUB_SHA"
           fi
 
       - name: Extract changelog
