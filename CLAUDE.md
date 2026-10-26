@@ -20,6 +20,7 @@ Shadow mode records what it would have done without blocking.
 - `cargo fmt --all` — format
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — lint
 - `cargo test --workspace --locked` — unit and integration tests
+- `cargo llvm-cov --workspace --locked --fail-under-lines 90` — the tests with line coverage; CI fails below 90%
 - `bash scripts/e2e.sh` — e2e suite against the Compose stack in `e2e/`
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
