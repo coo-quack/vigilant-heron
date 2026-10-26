@@ -370,8 +370,8 @@ async fn a_reload_keeps_the_per_client_share_of_a_call_in_flight() -> TestResult
     .await?;
     assert_eq!(
         queued.status,
-        StatusCode::FORBIDDEN,
-        "the second call is refused as busy, as it would be without the reload"
+        StatusCode::TOO_MANY_REQUESTS,
+        "the second call is refused as client_busy (429), as it would be without the reload"
     );
     assert_eq!(
         decider.calls(),

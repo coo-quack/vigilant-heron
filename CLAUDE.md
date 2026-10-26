@@ -102,7 +102,7 @@ Top-level and documentation files:
 
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
