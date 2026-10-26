@@ -613,6 +613,46 @@ mod tests {
         assert_eq!(civil(0), (1970, 1, 1, 0, 0, 0));
     }
 
+    fn days_in_month(year: i64, month: u32) -> u32 {
+        match month {
+            2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    #[test]
+    fn civil_matches_the_gregorian_calendar_for_every_day_from_1600_to_2400() {
+        // 1600-01-01T00:00:00Z, then every following day with a fixed time of day.
+        let mut seconds: i64 = -11_676_096_000;
+        let (mut year, mut month, mut day) = (1600_i64, 1_u32, 1_u32);
+        while year <= 2400 {
+            assert_eq!(
+                civil(seconds + 13 * 3600 + 37 * 60 + 42),
+                (year, month, day, 13, 37, 42),
+                "unix seconds {seconds}"
+            );
+            seconds += 86_400;
+            day += 1;
+            if day > days_in_month(year, month) {
+                day = 1;
+                month += 1;
+                if month > 12 {
+                    month = 1;
+                    year += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn times_before_the_epoch_are_placed_before_it() {
+        let before = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(iso8601(before), "1969-12-31T23:59:59+00:00");
+        assert_eq!(time_local(before), "31/Dec/1969:23:59:59 +0000");
+    }
+
     #[test]
     fn a_request_header_is_logged_under_its_underscore_name() {
         let mut headers = HeaderMap::new();

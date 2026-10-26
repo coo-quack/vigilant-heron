@@ -888,6 +888,7 @@ mod tests {
     #[case::number_value_is_num("p=123", Some("p=<num>"))]
     #[case::word_value_is_word("feed=rss2", Some("feed=<word>"))]
     #[case::plus_makes_text("s=hello+world", Some("s=<text>"))]
+    #[case::dash_and_underscore_are_word_characters("q=new-item_2", Some("q=<word>"))]
     #[case::empty_value_is_empty("q=", Some("q=<empty>"))]
     #[case::piece_without_equals_is_bare("abc", Some("<bare>"))]
     #[case::semicolon_separates("a=1;b=x", Some("a=<num>&b=<word>"))]
@@ -1460,6 +1461,26 @@ mod tests {
         "--BB\nContent-Disposition: form-data; name=\"secret\"\n\nabc\n--BB--\n",
         "--BB\nContent-Disposition: form-data; name=\"secret\"\n\n[REDACTED]\n--BB--\n"
     )]
+    #[case::lf_blank_line_before_crlf_in_value(
+        "multipart/form-data; boundary=BB",
+        "--BB\nContent-Disposition: form-data; name=\"password\"\n\na\r\n\r\nb\n--BB--\n",
+        "--BB\nContent-Disposition: form-data; name=\"password\"\n\n[REDACTED]\n--BB--\n"
+    )]
+    #[case::crlf_blank_line_before_lf_in_value(
+        "multipart/form-data; boundary=BB",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\n\nmore\r\n--BB--\r\n",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+    )]
+    #[case::lf_framing_redacts_a_second_part(
+        "multipart/form-data; boundary=BB",
+        "--BB\nContent-Disposition: form-data; name=\"name\"\n\nalice\n--BB\nContent-Disposition: form-data; name=\"password\"\n\nhunter2\n--BB--\n",
+        "--BB\nContent-Disposition: form-data; name=\"name\"\n\nalice\n--BB\nContent-Disposition: form-data; name=\"password\"\n\n[REDACTED]\n--BB--\n"
+    )]
+    #[case::padding_after_the_opening_delimiter_keeps_the_framing(
+        "multipart/form-data; boundary=BB",
+        "--BB      \r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n--BB      \r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB--\r\n",
+        "--BB      \r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n--BB      \r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+    )]
     fn sensitive_multipart_part_values_are_redacted(
         #[case] content_type: &str,
         #[case] body: &str,
@@ -1575,6 +1596,54 @@ mod tests {
     fn xml_self_closing_and_empty_sensitive_elements_are_kept() {
         let body = "<req><password/><token></token></req>";
         assert_eq!(redact(Some("application/xml"), body.as_bytes()), body);
+    }
+
+    #[test]
+    fn text_after_a_self_closing_sensitive_element_is_kept() {
+        let body = "<req><password/>ok</req>";
+        assert_eq!(redact(Some("application/xml"), body.as_bytes()), body);
+    }
+
+    #[test]
+    fn only_the_element_name_decides_not_its_attributes() {
+        let body = "<note kind=\"password\">hello</note>";
+        assert_eq!(redact(Some("application/xml"), body.as_bytes()), body);
+    }
+
+    #[test]
+    fn xml_comment_is_not_an_element() {
+        let body = "<!--password-->hello</x>";
+        assert_eq!(redact(Some("application/xml"), body.as_bytes()), body);
+    }
+
+    #[test]
+    fn empty_tag_is_copied_and_the_scan_goes_on() {
+        assert_eq!(
+            redact(Some("application/xml"), b"a<>b<token>x</token>"),
+            "a<>b<token>[REDACTED]</token>"
+        );
+    }
+
+    #[test]
+    fn form_field_value_runs_to_the_next_separator_even_with_a_space() {
+        assert_eq!(
+            redact(
+                Some("application/x-www-form-urlencoded"),
+                b"password=hunter 2&q=y"
+            ),
+            "password=[REDACTED]&q=y"
+        );
+    }
+
+    #[test]
+    fn form_body_redacts_a_percent_encoded_sensitive_name() {
+        assert_eq!(
+            redact(
+                Some("application/x-www-form-urlencoded"),
+                b"pass%77ord=x&q=y"
+            ),
+            "pass%77ord=[REDACTED]&q=y"
+        );
     }
 
     #[rstest]

@@ -858,4 +858,53 @@ mod tests {
         assert!(text.contains("rule learned-1 {"), "{text}");
         assert!(text.contains("Learning thresholds: judged >= 50, clients >= 10, days >= 3, attack <= 0.3, ai_instruction <= 0.3, never blocked."), "{text}");
     }
+
+    #[test]
+    fn a_shape_with_no_judged_request_is_never_learned_even_with_zero_thresholds() {
+        let options = SuggestOptions {
+            min_judged: 0,
+            min_clients: 0,
+            min_days: 0,
+            ..SuggestOptions::default()
+        };
+        let line = judged_value(1, 0, "GET", "/", "p=<num>", "", "");
+        let text = line.to_string();
+        let report = suggest_skip_rules(text.as_bytes(), &options)
+            .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
+        assert!(report.candidates.is_empty(), "{report}");
+        assert!(report.needs_review.is_empty(), "{report}");
+    }
+
+    #[test]
+    fn json_number_scores_are_judged_like_string_scores() {
+        let lines: Vec<Value> = (0..50)
+            .map(|i| {
+                json!({
+                    "time": format!("2026-01-{:02}T10:00:00Z", i % 3 + 1),
+                    "client_ip": format!("192.0.2.{}", i % 10),
+                    "site": "example.test",
+                    "method": "GET",
+                    "path": "/",
+                    "query_shape": "p=<num>",
+                    "action": "allow",
+                    "reason": "model",
+                    "would_have": "",
+                    "attack": 0.1,
+                    "ai_instruction": 0.1,
+                })
+            })
+            .collect();
+        let report = run(&lines);
+        assert_eq!(report.candidates.len(), 1, "{report}");
+        assert_eq!(report.candidates.first().map(|c| c.judged), Some(50));
+    }
+
+    #[test]
+    fn a_shape_that_needs_review_is_not_reported_as_no_shape_meeting_the_thresholds() {
+        let lines: Vec<Value> = (0..50)
+            .map(|i| judged_value(i % 10, i % 3, "GET", "/", "<name>=<num>", "0.1", "0.1"))
+            .collect();
+        let text = run(&lines).to_string();
+        assert!(!text.contains("No shape meets the thresholds."), "{text}");
+    }
 }
