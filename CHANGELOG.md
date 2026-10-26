@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Changed: releases now run the tests and the advisory check (`cargo deny` and
+  `pnpm audit`) in a job without write access, and the publishing job keeps no
+  credential in its checkout. The version tag is created through the REST API.
 - Fixed: the opt-in virtual patches `vh-cve-2026-9103` (`/api/v1/login/auto_login`)
   and `vh-cve-2026-8481` (`/api/v1/validate/code`) compared the path case-sensitively,
   so a request such as `/API/V1/LOGIN/AUTO_LOGIN` got past them. Both rules now match
