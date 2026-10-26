@@ -2,10 +2,13 @@
 
 [![CI](https://github.com/coo-quack/vigilant-heron/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/coo-quack/vigilant-heron/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docs](https://img.shields.io/badge/docs-coo--quack.github.io-blue.svg)](https://coo-quack.github.io/vigilant-heron/)
 
 vigilant-heron is a reverse-proxy router. It sits between your edge (nginx or Cloudflare) and your site, and it checks each web request before the request reaches the site. Obvious attacks are blocked by fixed rules. Anything less obvious is sent to a decision model, which returns scores for the request. The router then blocks, redirects, or forwards the request.
 
 Use it when you want a second screen in front of an application, with its own logs, its own limits, and a choice of model.
+
+**Documentation:** <https://coo-quack.github.io/vigilant-heron/>
 
 > **Status:** early development. It has not been validated on real traffic. Run every new site in shadow mode first.
 
@@ -150,10 +153,10 @@ In shadow mode, steps 1 to 6 still run and are logged, but every request is forw
 
 ## Documentation
 
-The full reference is in [`docs/`](docs/).
+The full documentation is published at <https://coo-quack.github.io/vigilant-heron/>. The links below open its sources in [`docs/`](docs/).
 
 - [Getting started](docs/getting-started.md): a minimal configuration, a test attack, shadow mode, enforce mode
-- [Installation](docs/install.md): Docker, building from source, nginx or Cloudflare in front, updates
+- [Installation](docs/install.md): release binaries, Docker, building from source, nginx or Cloudflare in front, updates
 - [Command line](docs/cli.md): every option, `-T`, and `-s` signals
 - [Troubleshooting](docs/troubleshooting.md): common symptoms and their fixes
 - [Configuration](docs/configuration.md): every directive, with its default and context
