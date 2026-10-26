@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{BoxError, StubBehavior, StubDecider, TestResult, Upstream, send};
+use common::{BoxError, GatedDecider, StubBehavior, StubDecider, TestResult, Upstream, send};
 use http::{Method, StatusCode};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -304,5 +304,138 @@ async fn a_request_in_flight_finishes_with_the_configuration_it_started_with() -
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    running.stop().await
+}
+
+/// A configuration with one decision slot, `on_rate_limit block`, and a decision
+/// backend that holds its calls until the test releases them. `realip` trusts the
+/// `X-Real-IP` header, so a test can send calls from several client addresses.
+fn one_slot_config(decide_url: &str, upstream: &str, status: u16, realip: bool) -> String {
+    let trusted = if realip {
+        "real_ip_from 127.0.0.0/8;\nreal_ip_header x-real-ip;\n\n"
+    } else {
+        ""
+    };
+    config(decide_url, upstream, status, "on_rate_limit block;")
+        .replace(
+            "inspect_body 512;",
+            "inspect_body 512;\n    max_concurrency 1;",
+        )
+        .replace("default_status", &format!("{trusted}default_status"))
+}
+
+/// Waits until the backend has received `count` calls, for up to five seconds.
+async fn wait_for_calls(decider: &GatedDecider, count: usize) -> TestResult {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while decider.calls() < count {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the request never reached the decision".into());
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reload_keeps_the_per_client_share_of_a_call_in_flight() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decider = GatedDecider::start().await?;
+    let file = temp_file("client-share.conf")?;
+    write(
+        &file,
+        &one_slot_config(&decider.decide_url(), &upstream.url(), 421, false),
+    )?;
+    let running = Running::start(&file).await?;
+    let base = running.base.clone();
+    let in_flight = tokio::spawn(async move {
+        send(&base, Method::GET, "/", "example.com", &[], Bytes::new()).await
+    });
+    wait_for_calls(&decider, 1).await?;
+
+    // Same file, so the limits are unchanged: the call in flight still holds the share.
+    write(
+        &file,
+        &one_slot_config(&decider.decide_url(), &upstream.url(), 404, false),
+    )?;
+    running.request_reload().await?;
+    wait_for_status(&running.base, StatusCode::NOT_FOUND).await?;
+    let queued = send(
+        &running.base,
+        Method::GET,
+        "/",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(
+        queued.status,
+        StatusCode::FORBIDDEN,
+        "the second call is refused as busy, as it would be without the reload"
+    );
+    assert_eq!(
+        decider.calls(),
+        1,
+        "the second call never reached the backend"
+    );
+
+    decider.release(1);
+    assert_eq!(in_flight.await??.status, StatusCode::OK);
+    running.stop().await
+}
+
+#[tokio::test]
+async fn a_reload_keeps_the_decision_slots_of_a_call_in_flight() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decider = GatedDecider::start().await?;
+    let file = temp_file("decision-slots.conf")?;
+    write(
+        &file,
+        &one_slot_config(&decider.decide_url(), &upstream.url(), 421, true),
+    )?;
+    let running = Running::start(&file).await?;
+    let base = running.base.clone();
+    let in_flight = tokio::spawn(async move {
+        send(
+            &base,
+            Method::GET,
+            "/",
+            "example.com",
+            &[("x-real-ip", "203.0.113.1")],
+            Bytes::new(),
+        )
+        .await
+    });
+    wait_for_calls(&decider, 1).await?;
+
+    // Same file: the one decision slot is still taken, so another client's call is refused.
+    write(
+        &file,
+        &one_slot_config(&decider.decide_url(), &upstream.url(), 404, true),
+    )?;
+    running.request_reload().await?;
+    wait_for_status(&running.base, StatusCode::NOT_FOUND).await?;
+    let queued = send(
+        &running.base,
+        Method::GET,
+        "/",
+        "example.com",
+        &[("x-real-ip", "203.0.113.2")],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(
+        queued.status,
+        StatusCode::FORBIDDEN,
+        "the second client is refused as busy, as it would be without the reload"
+    );
+    assert_eq!(
+        decider.calls(),
+        1,
+        "the second call never reached the backend"
+    );
+
+    decider.release(1);
+    assert_eq!(in_flight.await??.status, StatusCode::OK);
     running.stop().await
 }

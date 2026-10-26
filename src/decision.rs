@@ -138,6 +138,11 @@ impl ClientSlots {
         })
     }
 
+    /// The most calls one address may have in flight.
+    pub(crate) fn limit(&self) -> usize {
+        self.limit
+    }
+
     /// Takes one call for `client`, or returns `None` when the client already holds its share.
     pub(crate) fn take(self: &Arc<Self>, client: IpAddr) -> Option<ClientSlot> {
         let mut held = self
