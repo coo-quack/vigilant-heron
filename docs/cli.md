@@ -19,6 +19,8 @@ follow nginx's, so `-t`, `-T` and `-s` do what they do in nginx.
 | `restart` | Check the configuration, then stop and start the background router. |
 | `test-request <file>` | Report what the router would do with one raw HTTP request, without calling the decision backend. See [Check a request with test-request](#check-a-request-with-test-request). |
 | `--client <address>` | The client address that `test-request` uses for the access list. The default is `127.0.0.1`. |
+| `suggest-skip-rules <file>` | Suggest skip rules from a `json` access log, for review. Nothing is applied. See [Learn skip rules from the access log](#learn-skip-rules-from-the-access-log). |
+| `--site`, `--min-judged`, `--min-clients`, `--min-days`, `--max-attack`, `--max-ai-instruction` | Filter and thresholds of `suggest-skip-rules`. |
 
 An unknown option, a missing value, or an invalid `-s` word prints the reason and
 the usage to stderr, and exits 1. `-h` and `-v` win over the other options. `-s`
@@ -234,6 +236,66 @@ The command exits 0 whenever the report is printed, whatever the verdict. A file
 cannot be read, a request that is not valid HTTP/1.1, or an invalid configuration
 prints the reason to stderr and exits 1. `test-request` cannot be combined with `-t`,
 `-T`, `-s`, `start`, `stop` or `restart`.
+
+## Learn skip rules from the access log
+
+A skip rule forwards a request without calling the decision model, which saves
+cost and time. Some requests the model always finds harmless, such as a page
+with the same query parameters every time. `suggest-skip-rules` finds those
+shapes in the access log, so you can decide which ones to skip. It only prints
+the candidates. It never changes the configuration.
+
+Follow these steps.
+
+1. **Check the log format.** The command needs the access log in the built-in
+   `json` format, written by a version that includes the
+   [`query_shape`](/logging#query-shape) field.
+   Lines written by an older version are counted as unusable and ignored.
+2. **Run the command.** Give the log file, or `-` to read standard input:
+
+   ```console
+   $ vigilant-heron suggest-skip-rules /var/log/vigilant-heron/access.json
+   ```
+
+3. **Read the candidates.** Each candidate shows how many requests the model
+   judged, how many clients and days they came from, and the highest scores.
+   Below it is the rule text.
+4. **Read the needs-review list.** A shape with a free-text value, such as
+   `q=<text>`, meets the thresholds but gets no rule text. A rule for free text
+   would let any value through, so you write that rule yourself, if you want one.
+5. **Copy the rules you choose** into a file under `rules.d/`, such as
+   `rules.d/learned.conf`, and include it from the configuration.
+6. **Check the configuration.** Run `vigilant-heron -t -c <path>`.
+7. **Reload the running router.** Run `vigilant-heron -s reload`.
+
+A learned rule is a decision to stop asking the model about that shape. Review the
+evidence before you copy a rule, and check the sample requests with `test-request`.
+
+The command reads only the log. It does not read the configuration, so `-c` cannot
+be given. It contacts nothing and writes no file.
+
+The default thresholds are these. A shape must meet all of them to become a candidate.
+
+- `--min-judged 50`: at least 50 requests that the model answered.
+- `--min-clients 10`: at least 10 different client addresses among those requests.
+- `--min-days 3`: at least 3 different UTC dates among those requests.
+- `--max-attack 0.3`: no answered request scored above 0.3 for `attack`.
+- `--max-ai-instruction 0.3`: no answered request scored above 0.3 for
+  `ai_instruction`. A missing score counts as 0.
+- Never blocked: no request in the shape was blocked or redirected, judged or not.
+  In shadow mode, a request that would have been blocked counts as blocked.
+
+A shape that a skip rule or the static skip already covers is not a candidate. The
+report counts it in its last line.
+
+A candidate gets a rule only when the method is `GET` or `HEAD`, the site name is a
+plain host name, the path has only ASCII letters, digits and `/ _ . - ~`, and each
+query parameter has a value that is a number (`<num>`) or empty (`<empty>`). The
+other candidates go to the needs-review list. Free-text values are never turned
+into rules, because a rule for them would let any value through.
+
+Use `--site <name>` to keep the groups of one site. The thresholds take a count of
+at least 1, or a score from 0 to 1.
 
 ## Signal the running router with -s
 

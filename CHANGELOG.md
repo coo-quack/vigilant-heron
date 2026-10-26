@@ -6,6 +6,11 @@
   `json` format. It records the names of the query parameters and the kind of each
   value (`p=<num>&s=<text>`), never the values, so a log shows which kinds of
   requests a site receives. See [Logging](/logging#query-shape).
+- Added: `vigilant-heron suggest-skip-rules <access-log>` reads a `json` access log
+  and suggests skip rules for request shapes that the model judged harmless many
+  times, from many clients, over several days, and never blocked. It only prints the
+  rules for review. See
+  [Learn skip rules from the access log](/cli#learn-skip-rules-from-the-access-log).
 - Added: each GitHub Release has Linux binaries for x86_64 and aarch64 (glibc 2.39
   or newer) and a `SHA256SUMS` file. See
   [Download a release binary](/install#download-a-release-binary).
