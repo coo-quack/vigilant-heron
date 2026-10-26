@@ -2,10 +2,13 @@
 
 [![CI](https://github.com/coo-quack/vigilant-heron/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/coo-quack/vigilant-heron/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Docs](https://img.shields.io/badge/docs-coo--quack.github.io-blue.svg)](https://coo-quack.github.io/vigilant-heron/)
 
 vigilant-heron is a reverse-proxy router. It sits between your edge (nginx or Cloudflare) and your site, and it checks each web request before the request reaches the site. Obvious attacks are blocked by fixed rules. Anything less obvious is sent to a decision model, which returns scores for the request. The router then blocks, redirects, or forwards the request.
 
 Use it when you want a second screen in front of an application, with its own logs, its own limits, and a choice of model.
+
+**Documentation:** <https://coo-quack.github.io/vigilant-heron/>
 
 > **Status:** early development. It has not been validated on real traffic. Run every new site in shadow mode first.
 
@@ -17,7 +20,26 @@ client ──► nginx / Cloudflare ──► vigilant-heron ──► your site
 
 ## Install
 
-Build from source. You need the Rust toolchain that `rust-toolchain.toml` names. `rustup` installs it on the first build:
+Download a Linux binary (x86_64 or aarch64, glibc 2.39 or newer) from the [latest release](https://github.com/coo-quack/vigilant-heron/releases/latest):
+
+```bash
+ARCH=$(uname -m)   # x86_64 or aarch64
+curl -fsSLO "https://github.com/coo-quack/vigilant-heron/releases/latest/download/vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz"
+tar -xzf "vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz"
+sudo install -m 755 "vigilant-heron-$ARCH-unknown-linux-gnu/vigilant-heron" /usr/local/bin/
+```
+
+Check the download against `SHA256SUMS` before you install it, as [Installation](docs/install.md) shows.
+
+**Docker.** Run the published image:
+
+```bash
+docker run --rm ghcr.io/coo-quack/vigilant-heron:latest --version
+```
+
+The container runs as `nonroot`, so its configuration must set `listen 0.0.0.0:8080;` and a writable pid file, for example `pid /tmp/vigilant-heron.pid;`. See [Installation](docs/install.md) for the full Docker example, Docker Compose, nginx and Cloudflare in front, and systemd.
+
+**From source.** On macOS or another system, build from source. You need the Rust toolchain that `rust-toolchain.toml` names; `rustup` installs it on the first build:
 
 ```bash
 git clone https://github.com/coo-quack/vigilant-heron.git
@@ -27,15 +49,6 @@ cargo build --release --locked
 ```
 
 To put the binary on your `PATH`, run `cargo install --locked --path .` in the clone.
-
-**Docker.** No image is published yet, so build it from the Dockerfile:
-
-```bash
-docker build -t vigilant-heron .
-docker run --rm vigilant-heron --version
-```
-
-The container runs as `nonroot`, so its configuration must set `listen 0.0.0.0:8080;` and a writable pid file, for example `pid /tmp/vigilant-heron.pid;`. See [Installation](docs/install.md) for the full Docker example, Docker Compose, nginx and Cloudflare in front, and systemd.
 
 ## Quick start
 
@@ -140,10 +153,10 @@ In shadow mode, steps 1 to 6 still run and are logged, but every request is forw
 
 ## Documentation
 
-The full reference is in [`docs/`](docs/).
+The full documentation is published at <https://coo-quack.github.io/vigilant-heron/>. The links below open its sources in [`docs/`](docs/).
 
 - [Getting started](docs/getting-started.md): a minimal configuration, a test attack, shadow mode, enforce mode
-- [Installation](docs/install.md): Docker, building from source, nginx or Cloudflare in front, updates
+- [Installation](docs/install.md): release binaries, Docker, building from source, nginx or Cloudflare in front, updates
 - [Command line](docs/cli.md): every option, `-T`, and `-s` signals
 - [Troubleshooting](docs/troubleshooting.md): common symptoms and their fixes
 - [Configuration](docs/configuration.md): every directive, with its default and context

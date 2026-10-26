@@ -86,8 +86,8 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level=high
 
-  # Publishes the image, tag and release. The checkout keeps no credential, so
-  # the token below is not left in .git/config.
+  # Publishes the image, the tag, and the release with its binaries. The checkout
+  # keeps no credential, so the token below is not left in .git/config.
   publish:
     needs: [check, verify]
     # A dry run always builds. A real run builds only when the version tag is new.
@@ -124,6 +124,43 @@ jobs:
           cache-from: type=gha,scope=release-docker-cache
           cache-to: type=gha,mode=max,scope=release-docker-cache
 
+      # The same build as the image, from the same cache, exported as files.
+      - name: Build release binaries
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: binaries
+          platforms: linux/amd64,linux/arm64
+          outputs: type=local,dest=${{ runner.temp }}/dist
+          cache-from: type=gha,scope=release-docker-cache
+
+      # Each binary must need glibc 2.39 or older (docs/install.md promises Ubuntu
+      # 24.04 and Debian 13), and the x86_64 one must report this version.
+      - name: Package and check release binaries
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          mkdir assets
+          for pair in amd64:x86_64 arm64:aarch64; do
+            arch="${pair%%:*}"
+            name="vigilant-heron-${pair#*:}-unknown-linux-gnu"
+            bin="dist/linux_$arch/vigilant-heron"
+            need=$(readelf --dyn-syms -W "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/^GLIBC_//' | sort -V | tail -n 1)
+            if [ "$(printf '%s\n' "$need" 2.39 | sort -V | tail -n 1)" != "2.39" ]; then
+              echo "$name needs glibc $need, newer than the documented 2.39" >&2
+              exit 1
+            fi
+            mkdir "$name"
+            install -m 755 "$bin" "$name/vigilant-heron"
+            cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/README.md" "$name/"
+            tar -czf "assets/$name.tar.gz" "$name"
+          done
+          "vigilant-heron-x86_64-unknown-linux-gnu/vigilant-heron" -v | grep -qx "vigilant-heron version $VERSION"
+          (cd assets && sha256sum -- *.tar.gz > SHA256SUMS)
+          cat assets/SHA256SUMS
+
       - name: Create git tag
         if: needs.check.outputs.dry_run != 'true'
         env:
@@ -155,9 +192,11 @@ jobs:
         run: |
           VERSION="v${{ needs.check.outputs.version }}"
           if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists, skipping"
+            echo "Release $VERSION already exists, uploading the binaries"
+            gh release upload "$VERSION" "$RUNNER_TEMP"/assets/* --clobber
           else
             gh release create "$VERSION" \
               --title "$VERSION" \
-              --notes-file "$RUNNER_TEMP/release-notes.md"
+              --notes-file "$RUNNER_TEMP/release-notes.md" \
+              "$RUNNER_TEMP"/assets/*
           fi

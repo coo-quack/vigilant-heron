@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Added: each GitHub Release has Linux binaries for x86_64 and aarch64 (glibc 2.39
+  or newer) and a `SHA256SUMS` file. See
+  [Download a release binary](/install#download-a-release-binary).
+- Fixed: `docker build -t vigilant-heron .` without `--target` built the e2e stub
+  decision backend instead of the router. The router is now the Dockerfile's last
+  stage.
+
 ## v0.1.0 (2026-10-26)
 
 - Added: `vigilant-heron test-request <file> [--client <address>]` reports what the
