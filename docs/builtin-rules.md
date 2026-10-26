@@ -53,8 +53,8 @@ checks that this table lists exactly the ids of `builtin.conf`.
 | `vh-expr-003` | Template and expression injection | on | The Spring class loader property path (`class.module.classloader`) | any |
 | `vh-xxe-001` | XML external entities | on | An entity declared with `SYSTEM` in the body prefix | body |
 | `vh-scanner-001` | Known scanners | on | The user agent of a known scanner (sqlmap, nikto, nuclei, masscan, zgrab, acunetix, havij, commix, wpscan, dirbuster, gobuster or nmap) | header user-agent |
-| `vh-cve-2026-9103` | Opt-in virtual patch (CVE-2026-9103, IBM Langflow OSS) | off | Any request to `/api/v1/login/auto_login`, which issues superuser tokens without authentication when `AUTO_LOGIN` is enabled, which is the default | path |
-| `vh-cve-2026-8481` | Opt-in virtual patch (CVE-2026-8481, IBM Langflow OSS) | off | A `POST` to `/api/v1/validate/code`, which runs user-supplied Python through `exec()` without a sandbox; an authenticated user can exploit it, so the rule also covers a stolen or self-registered account | method and path |
+| `vh-cve-2026-9103` | Opt-in virtual patch (CVE-2026-9103, IBM Langflow OSS) | off | Any request to `/api/v1/login/auto_login` in any letter case, which issues superuser tokens without authentication when `AUTO_LOGIN` is enabled, which is the default | path |
+| `vh-cve-2026-8481` | Opt-in virtual patch (CVE-2026-8481, IBM Langflow OSS) | off | A `POST` to `/api/v1/validate/code` in any letter case, which runs user-supplied Python through `exec()` without a sandbox; an authenticated user can exploit it, so the rule also covers a stolen or self-registered account | method and path |
 
 ## Opt-in rules
 

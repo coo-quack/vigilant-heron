@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fixed: the opt-in virtual patches `vh-cve-2026-9103` (`/api/v1/login/auto_login`)
+  and `vh-cve-2026-8481` (`/api/v1/validate/code`) compared the path case-sensitively,
+  so a request such as `/API/V1/LOGIN/AUTO_LOGIN` got past them. Both rules now match
+  the path in any letter case. Which requests they block is otherwise unchanged.
 - Security: more credentials are kept out of the decision backend. Headers named
   with `signature` (for example `x-hub-signature-256`, `svix-signature` and
   `x-slack-signature`), with `ticket` or `authentication` as a word, or ending in
