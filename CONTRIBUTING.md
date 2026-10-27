@@ -82,9 +82,9 @@ artifacts of the run. The settings are in `.cargo/mutants.toml`.
 
 Every PR to `develop` also runs the `mutants-diff` job, which mutates only the
 lines the PR changes (`cargo mutants --in-diff`). A PR from `develop` to `main`
-skips it, since the job already checked each change in its own PR. It fails when a test misses one of those
-mutants, and the job summary lists them. A PR that changes no Rust code passes at
-once. To run the same check before you push:
+skips it, since the job already checked each change in its own PR. It fails when a
+test misses one of those mutants, and the job summary lists them. A PR that changes
+no Rust code passes at once. To run the same check before you push:
 
 ```bash
 git diff origin/develop...HEAD > pr.diff
