@@ -115,21 +115,38 @@ pub(crate) fn start(config_path: &Path) -> anyhow::Result<ExitCode> {
     let log = RemoveOnDrop(log_path.clone());
     let startup_log = pidfile::create_exclusive(&log_path)
         .with_context(|| format!("creating {}", log_path.display()))?;
-    let mut child =
-        Command::new(std::env::current_exe().context("finding the vigilant-heron binary")?)
-            .arg("-c")
-            .arg(config_path)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(startup_log))
-            .process_group(0)
-            .spawn()
-            .context("starting the router")?;
+    let mut command =
+        Command::new(std::env::current_exe().context("finding the vigilant-heron binary")?);
+    command
+        .arg("-c")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(startup_log))
+        .process_group(0);
+    let pid = spawn_and_wait(command, &pid_file, &log.0, START_TIMEOUT)?;
+    drop(log);
+    warn_about_lost_output(&config);
+    say(&format!("started (pid {pid})"));
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Spawns `command` and waits up to `limit` for the child to write its pid to `pid_file`,
+/// and returns the pid. When the child exits first, or does not write the pid file in
+/// time, the error includes the text of `startup_log`, and a child that is still running
+/// is stopped with SIGTERM.
+fn spawn_and_wait(
+    mut command: Command,
+    pid_file: &Path,
+    startup_log: &Path,
+    limit: Duration,
+) -> anyhow::Result<u32> {
+    let mut child = command.spawn().context("starting the router")?;
     let pid = child.id();
     // Once `try_wait` has reaped the child, its pid may belong to another process, so it is not signalled.
     let mut reaped = false;
-    let started = wait_until(START_TIMEOUT, POLL, || {
-        if pid_file_holds(&pid_file, pid) {
+    let started = wait_until(limit, POLL, || {
+        if pid_file_holds(pid_file, pid) {
             return true;
         }
         match child.try_wait() {
@@ -140,30 +157,27 @@ pub(crate) fn start(config_path: &Path) -> anyhow::Result<ExitCode> {
             _ => false,
         }
     });
-    let startup_messages = std::fs::read_to_string(&log.0).unwrap_or_default();
-    if !pid_file_holds(&pid_file, pid) {
-        if !reaped {
-            let _ = kill_process(pid_of(pid)?, Signal::TERM);
-        }
-        let detail = startup_messages.trim();
-        if started {
-            bail!("the router exited while starting: {detail}");
-        }
-        bail!(
-            "the router did not write {} within {} seconds{}",
-            pid_file.display(),
-            START_TIMEOUT.as_secs(),
-            if detail.is_empty() {
-                String::new()
-            } else {
-                format!(": {detail}")
-            }
-        );
+    if pid_file_holds(pid_file, pid) {
+        return Ok(pid);
     }
-    drop(log);
-    warn_about_lost_output(&config);
-    say(&format!("started (pid {pid})"));
-    Ok(ExitCode::SUCCESS)
+    if !reaped {
+        let _ = kill_process(pid_of(pid)?, Signal::TERM);
+    }
+    let startup_messages = std::fs::read_to_string(startup_log).unwrap_or_default();
+    let detail = startup_messages.trim();
+    if started {
+        bail!("the router exited while starting: {detail}");
+    }
+    bail!(
+        "the router did not write {} within {} seconds{}",
+        pid_file.display(),
+        limit.as_secs(),
+        if detail.is_empty() {
+            String::new()
+        } else {
+            format!(": {detail}")
+        }
+    );
 }
 
 /// A background process loses what it writes to a standard stream, so say so when the
@@ -315,6 +329,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         result?;
         assert_eq!(kept, "keep", "the victim was written through the symlink");
+        Ok(())
+    }
+
+    #[test]
+    fn a_child_that_does_not_write_its_pid_file_in_time_is_stopped() -> anyhow::Result<()> {
+        let dir = std::env::temp_dir().join(format!("vh-lifecycle-slow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let marker = dir.join("child.pid");
+        let log = dir.join("start.log");
+        std::fs::write(&log, "still loading\n")?;
+        // The child records its pid and then stays up without ever writing the pid file.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo $$ > \"$1\"; exec sleep 30")
+            .arg("sh")
+            .arg(&marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let result = spawn_and_wait(
+            command,
+            &dir.join("router.pid"),
+            &log,
+            Duration::from_millis(500),
+        );
+        let raw: i32 = std::fs::read_to_string(&marker)?.trim().parse()?;
+        let child = Pid::from_raw(raw).ok_or_else(|| anyhow!("invalid pid {raw}"))?;
+        // The child was spawned by this test process, so it is reaped here once it ends.
+        let mut status = None;
+        let ended = wait_until(Duration::from_secs(10), POLL, || {
+            status = rustix::process::waitpid(Some(child), rustix::process::WaitOptions::NOHANG)
+                .ok()
+                .flatten();
+            status.is_some()
+        });
+        if !ended {
+            let _ = kill_process(child, Signal::KILL);
+            let _ = rustix::process::waitpid(Some(child), rustix::process::WaitOptions::empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let message = result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(message.contains("did not write"), "{message}");
+        assert!(message.contains("still loading"), "{message}");
+        assert!(ended, "the child was left running after the start timeout");
+        assert_eq!(
+            status.and_then(|(_, status)| status.terminating_signal()),
+            Some(Signal::TERM.as_raw())
+        );
         Ok(())
     }
 
