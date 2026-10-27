@@ -1280,4 +1280,309 @@ mod tests {
         assert_eq!(vectored, Some(io::ErrorKind::BrokenPipe));
         Ok(())
     }
+
+    /// A socket stand-in that records what reaches it. It accepts at most `per_write`
+    /// bytes per write, reports `vectored` from `is_write_vectored`, and can refuse flushes.
+    /// Reads report end of file, and an error once they have been called too often.
+    struct Recorder {
+        per_write: usize,
+        vectored: bool,
+        fail_flush: bool,
+        written: Vec<u8>,
+        reads: usize,
+        flushes: usize,
+        shutdowns: usize,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                per_write: usize::MAX,
+                vectored: false,
+                fail_flush: false,
+                written: Vec::new(),
+                reads: 0,
+                flushes: 0,
+                shutdowns: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for Recorder {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.reads += 1;
+            if this.reads > 100 {
+                return Poll::Ready(Err(io::Error::other("read again after end of file")));
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Recorder {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let take = buf.len().min(this.per_write);
+            this.written
+                .extend_from_slice(buf.get(..take).unwrap_or_default());
+            Poll::Ready(Ok(take))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            self.vectored
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.flushes += 1;
+            if this.fail_flush {
+                Poll::Ready(Err(io::Error::other("flush refused")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            let this = self.get_mut();
+            this.shutdowns += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn blank_lines_before_the_request_line_do_not_end_the_header() {
+        let mut scanner = HeadScanner::new(limits(100, 100));
+        assert_eq!(scanner.feed(b"\r\n\r\n"), Ok(false));
+        assert_eq!(scanner.feed(b"GET / HTTP/1.1\r\n"), Ok(false));
+        assert_eq!(scanner.feed(b"\r\n"), Ok(true));
+    }
+
+    #[tokio::test]
+    async fn an_answer_the_socket_takes_in_parts_is_written_in_full() -> Result<(), BoxError> {
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut recorder = Recorder::new();
+        recorder.per_write = 3;
+        let mut io = ClientIo::new(
+            recorder,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.begin_linger(RESPONSE_408, None, false);
+        io.shutdown().await?;
+        assert_eq!(io.inner.written, RESPONSE_408);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lingering_close_flushes_the_answer_before_it_shuts_the_write_side()
+    -> Result<(), BoxError> {
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(
+            Recorder::new(),
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.begin_linger(RESPONSE_408, None, true);
+        io.shutdown().await?;
+        assert_eq!(io.inner.written, RESPONSE_408);
+        assert!(io.inner.flushes > 0, "the answer was not flushed");
+        assert_eq!(io.inner.shutdowns, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_lingering_close_ends_at_once_when_the_client_reaches_end_of_file()
+    -> Result<(), BoxError> {
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+        );
+        let mut io = ClientIo::new(
+            Recorder::new(),
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.begin_linger(&[], None, true);
+        io.shutdown().await?;
+        assert!(
+            io.inner.reads <= 2,
+            "end of file must end the lingering close, but it read {} times",
+            io.inner.reads
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_header_timeout_with_lingering_on_keeps_discarding_what_the_client_sends()
+    -> Result<(), BoxError> {
+        let (mut client, server) = socket_pair().await?;
+        let timers = ClientTimers {
+            header: Duration::from_millis(100),
+            ..linger_timers(
+                LingeringClose::On,
+                Duration::from_secs(10),
+                Duration::from_secs(1),
+            )
+        };
+        let mut io = ClientIo::new(
+            server,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        let sender = tokio::spawn(async move {
+            client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n").await?;
+            // The header never ends. The client keeps sending for about 600 ms after the header timeout starts.
+            for _ in 0..20 {
+                client.write_all(b"x").await?;
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+            Ok::<(), io::Error>(())
+        });
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 256];
+        let error = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Err(error) = io.read(&mut buf).await {
+                    break error;
+                }
+            }
+        })
+        .await?;
+        let elapsed = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "the connection closed at the header timeout while the client was still sending: {elapsed:?}"
+        );
+        sender.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bytes_read_while_a_request_is_busy_are_not_scanned_as_a_header() -> Result<(), BoxError>
+    {
+        let (mut client, server) = socket_pair().await?;
+        let phase = Arc::new(PhaseCell::new());
+        phase.set(Phase::Busy);
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(server, phase, timers, Arc::new(Mutex::new(None)));
+        // Without a line break, these bytes would break the request line limit if they were scanned as a header.
+        client.write_all(&[b'x'; 300]).await?;
+        let mut buf = [0u8; 512];
+        let mut total = 0;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while total < 300 {
+                total += io.read(&mut buf).await?;
+            }
+            Ok::<(), io::Error>(())
+        })
+        .await??;
+        assert_eq!(total, 300);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::vectored(true)]
+    #[case::not_vectored(false)]
+    fn a_client_socket_reports_whether_its_inner_socket_writes_vectored(#[case] vectored: bool) {
+        let mut recorder = Recorder::new();
+        recorder.vectored = vectored;
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let io = ClientIo::new(
+            recorder,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        assert_eq!(io.is_write_vectored(), vectored);
+    }
+
+    #[rstest]
+    #[case::vectored(true)]
+    #[case::not_vectored(false)]
+    fn an_upstream_socket_reports_whether_its_inner_socket_writes_vectored(#[case] vectored: bool) {
+        let mut recorder = Recorder::new();
+        recorder.vectored = vectored;
+        let io = UpstreamIo::new(recorder, Duration::from_secs(5));
+        assert_eq!(io.is_write_vectored(), vectored);
+    }
+
+    #[tokio::test]
+    async fn a_client_flush_reaches_the_client_socket() -> Result<(), BoxError> {
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut io = ClientIo::new(
+            Recorder::new(),
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.flush().await?;
+        assert_eq!(io.inner.flushes, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_client_flush_does_not_touch_the_socket_while_or_after_lingering()
+    -> Result<(), BoxError> {
+        let timers = linger_timers(
+            LingeringClose::On,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        );
+        let mut recorder = Recorder::new();
+        recorder.fail_flush = true;
+        let mut io = ClientIo::new(
+            recorder,
+            Arc::new(PhaseCell::new()),
+            timers,
+            Arc::new(Mutex::new(None)),
+        );
+        io.begin_linger(&[], None, true);
+        io.flush().await?;
+        io.shutdown().await?;
+        io.flush().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_upstream_flush_and_shutdown_reach_the_upstream_socket() -> Result<(), BoxError> {
+        let mut io = UpstreamIo::new(Recorder::new(), Duration::from_secs(5));
+        io.flush().await?;
+        io.shutdown().await?;
+        assert_eq!((io.inner.flushes, io.inner.shutdowns), (1, 1));
+        Ok(())
+    }
 }

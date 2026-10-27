@@ -2035,14 +2035,14 @@ fn parse_site(
     let proxy_headers = site_headers.unwrap_or_else(|| top.headers.to_vec());
     let mut locations: Vec<LocationConfig> = Vec::new();
     for pending in pending_locations {
-        let duplicate = locations.iter().any(|earlier| {
-            earlier.matcher == pending.matcher
-                && !matches!(pending.matcher, limits::Matcher::Regex(_))
-        });
-        if duplicate {
+        if let Some(unique) = pending.matcher.unique_path()
+            && locations
+                .iter()
+                .any(|earlier| earlier.matcher.unique_path() == Some(unique))
+        {
             return Err(invalid(
                 pending.directive,
-                "duplicate \"location\" with the same modifier and path",
+                format!("duplicate \"location\" \"{}\"", unique.1),
             ));
         }
         locations.push(LocationConfig {

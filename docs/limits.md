@@ -117,8 +117,10 @@ limited by `location = /login`, and a request cannot escape a location's limits 
 choosing another reading. The block response comes from the location that the
 decoded path selects. A `~` regex matches the decoded path with
 case kept, and `~*` ignores case. Regexes use the `regex` crate, which has no
-backreferences or look-around, unlike nginx's PCRE. A repeated plain location is
-an error, as in nginx.
+backreferences or look-around, unlike nginx's PCRE. As in nginx, two prefix
+locations with the same path are an error, also when only one of them has `^~`, and
+so are two `=` locations with the same path. An `=` location and a prefix location
+may share a path, and regexes may repeat.
 
 Only the limit directives, `block_status`, `block_page`, `proxy_websocket` and
 `proxy_set_header` may appear inside a `location`. Any other directive is an error
