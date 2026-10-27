@@ -2668,6 +2668,21 @@ mod tests {
     }
 
     #[test]
+    fn access_log_accepts_stdout_and_stderr_as_destinations() -> Result<(), ConfigError> {
+        let out = parse(&format!("access_log stdout;\n{BASE}"))?;
+        assert_eq!(
+            out.access_logs.first().map(|l| l.destination.clone()),
+            Some(Destination::Stdout)
+        );
+        let err = parse(&format!("access_log stderr;\n{BASE}"))?;
+        assert_eq!(
+            err.access_logs.first().map(|l| l.destination.clone()),
+            Some(Destination::Stderr)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn top_level_access_log_off_leaves_no_default_writer() -> Result<(), ConfigError> {
         let config = parse(&format!("access_log off;\n{BASE}"))?;
         assert_eq!(config.access_logs.len(), 0);
