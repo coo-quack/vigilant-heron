@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 (2026-10-28)
 
 - Changed: a prefix `location` and a `^~` location with the same path in one site
   are now rejected at load as a duplicate, as nginx rejects them. Before, both were
