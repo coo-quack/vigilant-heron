@@ -196,3 +196,192 @@ fn sigusr1_reopens_the_error_log_after_it_was_moved() -> TestResult {
     assert!(!read(&moved).contains("configuration reload failed"));
     Ok(())
 }
+
+#[test]
+fn a_reload_that_changes_a_restart_setting_warns_that_it_needs_a_restart() -> TestResult {
+    let dir = test_dir("restart-warning")?;
+    let log = dir.join("error.log");
+    let with_limit = |limit: u32| {
+        format!(
+            "max_connections {limit};\n{}",
+            config(&format!("{} info", log.display()))
+        )
+    };
+    let server = Server::start(&dir, &with_limit(10))?;
+    wait_for(&log, "vigilant-heron is listening")?;
+
+    server.write_config(&with_limit(20))?;
+    server.reload()?;
+    wait_for(
+        &log,
+        "max_connections changed; a restart is needed for it to take effect",
+    )?;
+    Ok(())
+}
+
+/// A configuration for the restart warnings: `listen` and `extra` at the top level, and the error log at `log`.
+fn restart_config(log: &Path, listen: &str, extra: &str) -> String {
+    format!(
+        "listen {listen};\n{extra}\ndecision {{\n    backend http;\n    url http://127.0.0.1:9/decide;\n}}\nerror_log {} info;\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n",
+        log.display()
+    )
+}
+
+/// Starts with `first`, reloads with `second`, and waits for the warning `message` in the error log.
+fn reload_warns(
+    name: &str,
+    first: &dyn Fn(&Path) -> String,
+    second: &dyn Fn(&Path) -> String,
+    message: &str,
+) -> TestResult {
+    let dir = test_dir(name)?;
+    let log = dir.join("error.log");
+    let server = Server::start(&dir, &first(&log))?;
+    wait_for(&log, "vigilant-heron is listening")?;
+
+    server.write_config(&second(&log))?;
+    server.reload()?;
+    wait_for(&log, message)?;
+    Ok(())
+}
+
+#[test]
+fn a_reload_that_changes_the_listen_address_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-listen",
+        &|log| restart_config(log, "127.0.0.1:0", ""),
+        &|log| restart_config(log, "127.0.0.2:0", ""),
+        "listen changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_the_pid_file_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-pid",
+        &|log| {
+            restart_config(
+                log,
+                "127.0.0.1:0",
+                &format!("pid {};", log.with_file_name("first.pid").display()),
+            )
+        },
+        &|log| {
+            restart_config(
+                log,
+                "127.0.0.1:0",
+                &format!("pid {};", log.with_file_name("second.pid").display()),
+            )
+        },
+        "pid changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_worker_threads_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-workers",
+        &|log| restart_config(log, "127.0.0.1:0", "worker_threads 1;"),
+        &|log| restart_config(log, "127.0.0.1:0", "worker_threads 2;"),
+        "worker_threads changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_worker_shutdown_timeout_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-shutdown",
+        &|log| restart_config(log, "127.0.0.1:0", "worker_shutdown_timeout 5s;"),
+        &|log| restart_config(log, "127.0.0.1:0", "worker_shutdown_timeout 6s;"),
+        "worker_shutdown_timeout changed; a restart is needed for it to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_a_connection_timer_warns_that_it_needs_a_restart() -> TestResult {
+    reload_warns(
+        "restart-timers",
+        &|log| restart_config(log, "127.0.0.1:0", "client_header_timeout 2s;"),
+        &|log| restart_config(log, "127.0.0.1:0", "client_header_timeout 3s;"),
+        "connection timers and header limits changed; a restart is needed for them to take effect",
+    )
+}
+
+#[test]
+fn a_reload_that_changes_no_restart_setting_warns_about_none() -> TestResult {
+    let dir = test_dir("restart-none")?;
+    let log = dir.join("error.log");
+    let text = restart_config(
+        &log,
+        "127.0.0.1:0",
+        &format!(
+            "pid {};\nworker_threads 1;\nworker_shutdown_timeout 5s;\nmax_connections 10;\nclient_header_timeout 2s;",
+            dir.join("restart-none.pid").display()
+        ),
+    );
+    let server = Server::start(&dir, &text)?;
+    wait_for(&log, "vigilant-heron is listening")?;
+
+    server.write_config(&text)?;
+    server.reload()?;
+    wait_for(&log, "configuration reloaded")?;
+    assert!(!read(&log).contains("restart is needed"), "{}", read(&log));
+    Ok(())
+}
+
+#[test]
+fn an_error_log_destination_of_stdout_writes_to_standard_output() -> TestResult {
+    use std::io::Read as _;
+    use std::sync::{Arc, Mutex};
+
+    let dir = test_dir("stdout")?;
+    let path = dir.join("vigilant-heron.conf");
+    std::fs::write(&path, config("stdout info"))?;
+    let child = Command::new(env!("CARGO_BIN_EXE_vigilant-heron"))
+        .arg("--config")
+        .arg(&path)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let mut server = Server {
+        child,
+        config: path,
+    };
+    let Some(mut stdout) = server.child.stdout.take() else {
+        return Err("stdout is not piped".into());
+    };
+    let output = Arc::new(Mutex::new(String::new()));
+    let sink = Arc::clone(&output);
+    let reader = std::thread::spawn(move || {
+        let mut chunk = [0_u8; 1024];
+        while let Ok(read) = stdout.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(chunk.get(..read).unwrap_or_default());
+            if let Ok(mut buffer) = sink.lock() {
+                buffer.push_str(&text);
+            }
+        }
+    });
+    // The startup line shows that the server is up. Only then is it stopped, so
+    // that the signal handlers are installed and the stop line is written too.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !read_buffer(&output).contains("vigilant-heron is listening") {
+        if Instant::now() > deadline {
+            return Err("the startup line never reached stdout".into());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    server.signal("-TERM")?;
+    server.child.wait()?;
+    reader.join().map_err(|_| "stdout reader panicked")?;
+    assert!(read_buffer(&output).contains("vigilant-heron is listening"));
+    Ok(())
+}
+
+fn read_buffer(buffer: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
+    buffer.lock().map(|text| text.clone()).unwrap_or_default()
+}

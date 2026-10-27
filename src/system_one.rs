@@ -8,11 +8,12 @@
 //! `state.untrusted_http_request` and nowhere else in the request.
 
 use std::fmt;
+use std::sync::LazyLock;
 
 use http::Uri;
 use serde_json::{Map, Value, json};
 
-use crate::decision::{DecisionBackend, DecisionClient, Limits, Probability, Verdict, post_json};
+use crate::decision::{DecisionClient, Limits, Probability, Verdict, post_json};
 use crate::error::DecisionError;
 use crate::sanitize::DecisionEvent;
 
@@ -159,9 +160,12 @@ pub(crate) fn build_request(
     Ok(json!({
         "model": model,
         "state": state,
-        "questions": questions(),
+        "questions": &*QUESTIONS,
     }))
 }
+
+/// The questions sent with every request. They are fixed, so they are built once.
+static QUESTIONS: LazyLock<Value> = LazyLock::new(questions);
 
 fn questions() -> Value {
     let mut map = Map::new();
@@ -271,8 +275,9 @@ pub(crate) struct SystemOneBackend {
     client: DecisionClient,
     url: Uri,
     model: String,
-    /// Bearer token sent with each request. `None` sends no `Authorization` header.
-    token: Option<ApiToken>,
+    /// The `Authorization` header value sent with each request, `Bearer` plus the token.
+    /// `None` sends no `Authorization` header.
+    authorization: Option<String>,
     limits: Limits,
 }
 
@@ -289,19 +294,20 @@ impl SystemOneBackend {
             client,
             url,
             model,
-            token,
+            authorization: token.map(|token| format!("Bearer {}", token.expose())),
             limits,
         }
     }
 }
 
-impl DecisionBackend for SystemOneBackend {
-    async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
+impl SystemOneBackend {
+    /// Asks the System One endpoint for a verdict on `event`.
+    pub(crate) async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         let payload = serde_json::to_vec(&build_request(event, &self.model)?)?;
         let body = post_json(
             &self.client,
             &self.url,
-            self.token.as_ref().map(ApiToken::expose),
+            self.authorization.as_deref(),
             payload,
             &self.limits,
         )

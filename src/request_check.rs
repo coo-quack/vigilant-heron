@@ -92,8 +92,23 @@ pub fn check_request(
     client: IpAddr,
 ) -> Result<RequestCheck, CheckError> {
     let config = Config::load(config_path)?;
+    check_request_with(&config, raw, client)
+}
+
+/// Checks the request in `raw` against an already loaded `config`, for a client at
+/// `client`. [`check_request`] loads the configuration and calls this; a caller that
+/// checks many requests loads the configuration once.
+///
+/// # Errors
+///
+/// Returns [`CheckError::Request`] when `raw` is not a raw HTTP/1.1 request.
+pub fn check_request_with(
+    config: &Config,
+    raw: &[u8],
+    client: IpAddr,
+) -> Result<RequestCheck, CheckError> {
     let request = parse_request(raw)?;
-    Ok(report(&config, &request, client))
+    Ok(report(config, &request, client))
 }
 
 /// A request read from a file: the request line, the headers and the body.
@@ -227,6 +242,10 @@ fn status_of(block: &BlockResponse) -> u16 {
 }
 
 /// Builds the check. The order of the checks follows `server::pipeline`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the checks read top to bottom in the order of server::pipeline; splitting them would scatter that order"
+)]
 fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCheck {
     let mut lines = Vec::new();
     let router = Router::new(&config.sites);
@@ -301,10 +320,11 @@ fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCh
     // The location of the decoded path sets the block response, as in the server.
     let block = limits::select_location(&site.locations, &decoded)
         .map_or(&site.block, |location| &location.block);
+    let lowered: Vec<String> = views.iter().map(|view| view.to_lowercase()).collect();
     let target = Target {
         config,
         site,
-        lowered: views.iter().map(|view| view.to_lowercase()).collect(),
+        lowered,
         block,
         upstream: site.upstream.to_string(),
     };
@@ -329,15 +349,16 @@ fn report(config: &Config, request: &SampleRequest, client: IpAddr) -> RequestCh
     // The inspected prefix of the body, as the server sniffs it.
     let inspected = config.decision.inspect_body_bytes.min(request.body.len());
     let prefix = request.body.get(..inspected).unwrap_or_default();
-    let input = RuleInput::new(
+    let input = RuleInput::with_views(
         &request.method,
         path,
+        &views,
         request.uri.query(),
         &request.headers,
         prefix,
         client,
     );
-    let screening = prefilter::screen(site, &input, request.body.is_empty());
+    let screening = prefilter::screen(site, &input, &target.lowered, request.body.is_empty());
     let verdict = screen_lines(&target, &input, &screening, &mut lines);
     finish(lines, site_label, verdict)
 }

@@ -1,13 +1,33 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 (2026-10-27)
 
+- Added: `check_request_with`, the library form of `check_request` that takes an
+  already loaded `Config`, so a caller that checks many requests loads the
+  configuration once.
+- Added: the `$query_shape` log variable and a `query_shape` field in the built-in
+  `json` format. It records the names of the query parameters and the kind of each
+  value (`p=<num>&s=<text>`), never the values, so a log shows which kinds of
+  requests a site receives. See [Logging](/logging#query-shape).
+- Added: `vigilant-heron suggest-skip-rules <access-log>` reads a `json` access log
+  and suggests skip rules for request shapes that the model judged harmless many
+  times, from many clients, over several days, and never blocked. It only prints the
+  rules for review. See
+  [Learn skip rules from the access log](/cli#learn-skip-rules-from-the-access-log).
 - Added: each GitHub Release has Linux binaries for x86_64 and aarch64 (glibc 2.39
   or newer) and a `SHA256SUMS` file. See
   [Download a release binary](/install#download-a-release-binary).
 - Fixed: `docker build -t vigilant-heron .` without `--target` built the e2e stub
   decision backend instead of the router. The router is now the Dockerfile's last
   stage.
+- Fixed: a request path with a NUL byte could select a different `location` for
+  the block response, the headers and the WebSocket tunnel than for the limits,
+  because the decoded path kept the NUL byte and the other readings did not. NUL
+  bytes are now removed from every reading, so `/%00admin` selects the same
+  location everywhere.
+- Fixed: the `suggest-skip-rules` report now says that a learned rule forwards
+  matching requests without the model, so the model no longer judges their
+  headers or body. Block rules, built-in and your own, still run first.
 
 ## v0.1.0 (2026-10-26)
 

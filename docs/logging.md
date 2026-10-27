@@ -26,9 +26,9 @@ access_log off;                                  # disables access logs; alone o
 
 `json` writes one JSON object per line, with every value as a string. It has
 these keys in this order: `time`, `request_id`, `client_ip`, `site`, `host`,
-`method`, `path`, `status`, `action`, `reason`, `rule_id`, `would_have`, `attack`,
-`ai_instruction`, `category`, `decision_error`, `retry_after`, `input_tokens` and
-`latency_ms`.
+`method`, `path`, `query_shape`, `status`, `action`, `reason`, `rule_id`,
+`would_have`, `attack`, `ai_instruction`, `category`, `decision_error`,
+`retry_after`, `input_tokens` and `latency_ms`.
 
 `main` writes a text line that starts with the time, the client address, the site
 and the request line, followed by `status`, `action`, `reason`, `would_have`,
@@ -73,6 +73,7 @@ written as `$name` or `${name}`.
 | `$host` | Normalized host of the request |
 | `$method` | Request method |
 | `$path` | Request path |
+| `$query_shape` | Names of the query parameters and the kind of each value, never the value itself: `p=<num>&s=<text>`. See below |
 | `$status` | Status sent to the client |
 | `$action` | `allow`, `block`, `redirect` or `reject`, the last for a request refused by a limit |
 | `$reason` | Why the decision was made, see below |
@@ -91,18 +92,41 @@ written as `$name` or `${name}`.
 | `$http_<name>` | A request header, with `_` for `-` |
 
 The `$reason` values are `model`, `below_threshold`, `rule`, `skip`, `skip_rule`,
-`access_denied`, `invalid_host`, `fail_closed_path`, `rate_limited_allowed`,
-`rate_limited_blocked`, `decision_error_allowed`, `decision_error_blocked`, and the
+`access_denied`, `invalid_host`, `unknown_host`, `fail_closed_path`,
+`rate_limited_allowed`, `rate_limited_blocked`, `client_busy_allowed`,
+`client_busy_blocked`, `decision_error_allowed`, `decision_error_blocked`, and the
 limit and timer reasons such as `limit_req`, `limit_conn`, `header_timeout`,
-`body_timeout`, `body_too_large`, `unreadable_body` and `uri_too_long`.
+`header_too_large`, `body_timeout`, `body_too_large`, `unreadable_body` and
+`uri_too_long`.
 
-The `$decision_error` values are `rate_limited`, `backend_busy`, `timeout`,
-`http_status` and `parse`.
+The `$decision_error` values are `rate_limited`, `backend_busy`, `client_busy`,
+`timeout`, `connection`, `http_status`, `body`, `parse`, `request`, `invalid_score`,
+`rejected` and `invalid_response`. [How it works](/how-it-works#failure-behavior)
+says what each one means.
 
 `$http_<name>` cannot name a credential. `cookie`, `authorization`,
 `proxy-authorization`, `x-api-key`, `x-auth-token` and every name in
 `redact_header` are refused when the configuration loads, so a log line never
 contains them.
+
+### `$query_shape`
+
+`$query_shape` records the names of the query parameters and the kind of each
+value, never the value itself. A query `?p=42&s=secret+words` is logged as
+`p=<num>&s=<text>`. Query strings often carry tokens and email addresses, so the
+values are left out. The log still shows which kinds of requests a site receives.
+
+- `<num>`: 1 to 20 digits.
+- `<word>`: 1 to 64 letters, digits, `_` or `-`.
+- `<text>`: any other value.
+- `<empty>`: a parameter with `=` and no value.
+- `<bare>`: a parameter without `=`. Its text is not logged, since it may be a token.
+- `<name>`: a parameter name that is not a plain identifier of up to 32 characters
+  (letters, digits, `_`, `.`, `-`, `[` and `]`, starting with a letter or `_`).
+
+At most 16 parameters are shown, and a further parameter adds `<more>`. Parameters
+are separated by `&` as in the request, and `;` is also accepted as a separator.
+The variable is empty when the request has no query.
 
 ## Error log
 

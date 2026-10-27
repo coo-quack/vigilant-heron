@@ -846,7 +846,11 @@ fn screen_request(
     }
     let client = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
     let input = RuleInput::new(&method, path, query, &map, body, client);
-    prefilter::screen(site, &input, body.is_empty())
+    let lowered: Vec<String> = prefilter::path_views(path)
+        .iter()
+        .map(|view| view.to_lowercase())
+        .collect();
+    prefilter::screen(site, &input, &lowered, body.is_empty())
 }
 
 const USER_RULES: &str = "\
@@ -1392,4 +1396,25 @@ proptest! {
             prop_assert!(hit.is_none_or(|rule| !shipped_off.contains(&rule.id)));
         }
     }
+}
+
+#[test]
+fn a_syntax_error_in_the_built_in_file_is_reported_at_its_line_and_message() {
+    let error = ConfigError::Syntax {
+        file: "builtin.conf".to_owned(),
+        line: 7,
+        message: "bad token".to_owned(),
+    };
+    assert_eq!(position(error), (7, "bad token".to_owned()));
+}
+
+#[test]
+fn a_read_error_in_the_built_in_file_is_reported_on_line_one() {
+    let error = ConfigError::Read {
+        path: std::path::PathBuf::from("builtin.conf"),
+        source: std::io::Error::other("boom"),
+    };
+    let (line, message) = position(error);
+    assert_eq!(line, 1);
+    assert!(message.contains("boom"), "{message}");
 }

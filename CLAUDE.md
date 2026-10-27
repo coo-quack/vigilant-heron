@@ -20,9 +20,12 @@ Shadow mode records what it would have done without blocking.
 - `cargo fmt --all` — format
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — lint
 - `cargo test --workspace --locked` — unit and integration tests
+- `cargo llvm-cov --workspace --locked --fail-under-lines 90` — the tests with line coverage; CI fails below 90%
 - `bash scripts/e2e.sh` — e2e suite against the Compose stack in `e2e/`
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
+- `pnpm run dup` — duplicated code in src/ (jscpd)
+- `cargo bench --locked --bench hot_path` — benchmarks (the `bench` job runs them once with `-- --test`)
 
 ## Project Structure
 
@@ -43,10 +46,12 @@ src/
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
   limits.rs      # limit_req / limit_conn zones, leaky bucket, connection counts, location selection; runs first
   rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
+  rules/tests.rs # Unit tests of the rule parser, built-in signatures, normalization and matching
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   sanitize.rs    # Backend event: header drop, body redaction, truncation
-  decision.rs    # DecisionBackend trait, shared HTTPS transport and limits, HTTP backend, backend enum
+  decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
   proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers, proxy_set_header
@@ -56,10 +61,13 @@ src/
   server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
   error.rs       # Error types
   test_support.rs # Builds sites and configurations for the unit tests
+benches/
+  hot_path.rs    # Criterion benchmarks of the hot path through the public API (check_request, suggest_skip_rules, config loading)
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint
   jev.rs         # In-process tests of the Jev backend against a fake endpoint
+  strands.rs     # In-process tests of the Strands Decider backend against a stub of its System One endpoint
   failures.rs    # Failure settings, rule-first guarantee, queued requests with one slot
   limits.rs      # Timers, header limits, body limit and upstream timeouts, with short timers
   logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off
@@ -75,6 +83,7 @@ tests/
   websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
   reload.rs      # serve_reloadable: valid, broken, zone state kept or reset, in-flight requests finish
   request_check.rs # test-request agrees with the running router on outcome, reason and rule id
+  skip_suggest.rs # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   e2e.rs         # Ignored by default; run by scripts/e2e.sh
 e2e/
   stub-decider/  # Deterministic decision backend used by the e2e stack
@@ -87,6 +96,7 @@ scripts/
   e2e.sh         # The whole e2e suite, run by the CI job e2e: binary phase, then the Compose stack
   e2e-cli.sh     # Binary phase: the release binary run as docs/getting-started.md shows
   e2e-image.sh   # Image phase: the Compose-built image with the e2e configuration
+  check-release-binaries.sh # glibc floor and version of the exported release binaries (release.yml and the release-build job)
 eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
@@ -104,11 +114,13 @@ Top-level and documentation files:
 
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
 deny.toml        # cargo-deny policy: advisories, licenses, sources
+.jscpd.json      # jscpd settings for the duplication check (pnpm run dup)
+.cargo/mutants.toml # cargo-mutants settings (exclusions, timeout multiplier)
 clippy.toml      # Clippy settings (allow the lints in tests)
 rust-toolchain.toml # Toolchain pin
 README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents
@@ -140,6 +152,7 @@ README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents
   limited request never reaches the rules or the backend. In shadow mode they are
   dry runs.
 - Comments and documentation are in English.
-- CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`) are
-  registered as required checks in coo-quack/iac; do not rename them.
+- CI job names (`audit`, `lint`, `fmt`, `test`, `e2e`, `deadcode`,
+  `duplication`, `bench`, `release-build`) are registered as required checks in
+  coo-quack/iac; do not rename them.
 - Test expectations are never edited to match what the code happens to do.

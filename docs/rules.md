@@ -122,7 +122,8 @@ one condition.
   shadow mode the request is forwarded and recorded in `would_have`. The reason is
   `rule`.
 - `action skip` forwards the request without calling the backend. The reason is
-  `skip_rule`.
+  `skip_rule`. To find skip-rule candidates in your access log, see
+  [Learn skip rules from the access log](/cli#learn-skip-rules-from-the-access-log).
 
 Block rules are always checked before skip rules. A skip rule never lets through a
 request that a block rule matches.

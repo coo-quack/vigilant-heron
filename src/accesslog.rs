@@ -41,6 +41,7 @@ pub(crate) enum Field {
     Host,
     Method,
     Path,
+    QueryShape,
     Status,
     Action,
     Reason,
@@ -72,6 +73,7 @@ impl Field {
             "host" => Self::Host,
             "method" => Self::Method,
             "path" => Self::Path,
+            "query_shape" => Self::QueryShape,
             "status" => Self::Status,
             "action" => Self::Action,
             "reason" => Self::Reason,
@@ -195,7 +197,7 @@ impl LogFormat {
 /// The built-in JSON template. Every value is a JSON string; a missing value is `""`.
 const JSON_TEMPLATE: &str = concat!(
     r#"{"time":"$time_iso8601","request_id":"$request_id","client_ip":"$client_ip","#,
-    r#""site":"$site","host":"$host","method":"$method","path":"$path","status":"$status","#,
+    r#""site":"$site","host":"$host","method":"$method","path":"$path","query_shape":"$query_shape","status":"$status","#,
     r#""action":"$action","reason":"$reason","rule_id":"$rule_id","would_have":"$would_have","attack":"$attack","#,
     r#""ai_instruction":"$ai_instruction","category":"$category","#,
     r#""decision_error":"$decision_error","retry_after":"$retry_after","#,
@@ -284,6 +286,8 @@ pub(crate) struct AccessRecord<'a> {
     pub(crate) method: &'a str,
     /// Raw request path without the query.
     pub(crate) path: &'a str,
+    /// Raw query string, without the "?", when the request had one.
+    pub(crate) query: Option<&'a str>,
     /// Status of the response.
     pub(crate) status: u16,
     /// `allow`, `block`, `redirect`, or `reject` for requests answered before a decision.
@@ -334,6 +338,7 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::Host => text(record.host),
         Field::Method => text(record.method),
         Field::Path => text(record.path),
+        Field::QueryShape => record.query.and_then(crate::sanitize::query_shape),
         Field::Status => Some(record.status.to_string()),
         Field::Action => text(record.action),
         Field::Reason => text(record.reason),
@@ -510,6 +515,7 @@ mod tests {
             host: "example.com",
             method: "GET",
             path: "/articles",
+            query: None,
             status: 200,
             action: "allow",
             reason: "model",
@@ -605,6 +611,46 @@ mod tests {
     fn leap_days_are_placed_correctly() {
         assert_eq!(civil(951_782_400), (2000, 2, 29, 0, 0, 0));
         assert_eq!(civil(0), (1970, 1, 1, 0, 0, 0));
+    }
+
+    fn days_in_month(year: i64, month: u32) -> u32 {
+        match month {
+            2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        }
+    }
+
+    #[test]
+    fn civil_matches_the_gregorian_calendar_for_every_day_from_1600_to_2400() {
+        // 1600-01-01T00:00:00Z, then every following day with a fixed time of day.
+        let mut seconds: i64 = -11_676_096_000;
+        let (mut year, mut month, mut day) = (1600_i64, 1_u32, 1_u32);
+        while year <= 2400 {
+            assert_eq!(
+                civil(seconds + 13 * 3600 + 37 * 60 + 42),
+                (year, month, day, 13, 37, 42),
+                "unix seconds {seconds}"
+            );
+            seconds += 86_400;
+            day += 1;
+            if day > days_in_month(year, month) {
+                day = 1;
+                month += 1;
+                if month > 12 {
+                    month = 1;
+                    year += 1;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn times_before_the_epoch_are_placed_before_it() {
+        let before = UNIX_EPOCH - Duration::from_secs(1);
+        assert_eq!(iso8601(before), "1969-12-31T23:59:59+00:00");
+        assert_eq!(time_local(before), "31/Dec/1969:23:59:59 +0000");
     }
 
     #[test]

@@ -225,6 +225,49 @@ mod tests {
         );
     }
 
+    /// Loads a configuration whose site uses a `block_page` file of `size` bytes.
+    fn load_with_page_of(name: &str, size: usize) -> Result<Config, ConfigError> {
+        let dir = std::env::temp_dir().join(format!("vh-block-page-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|source| ConfigError::Read {
+            path: dir.clone(),
+            source,
+        })?;
+        let page = dir.join("page.html");
+        std::fs::write(&page, vec![b'a'; size]).map_err(|source| ConfigError::Read {
+            path: page.clone(),
+            source,
+        })?;
+        let main = dir.join("main.conf");
+        let text = "listen 127.0.0.1:0;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n    block_page page.html;\n}\n";
+        std::fs::write(&main, text).map_err(|source| ConfigError::Read {
+            path: main.clone(),
+            source,
+        })?;
+        Config::load(&main)
+    }
+
+    #[test]
+    fn a_block_page_of_exactly_64_kib_is_accepted() -> Result<(), ConfigError> {
+        let config = load_with_page_of("exact-limit", MAX_PAGE_BYTES)?;
+        let site = config.sites.first().ok_or_else(invalid_fixture)?;
+        assert_eq!(
+            site.block.page.as_ref().map(bytes::Bytes::len),
+            Some(MAX_PAGE_BYTES)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_block_page_of_a_few_kib_is_accepted() -> Result<(), ConfigError> {
+        let config = load_with_page_of("few-kib", 4 * 1024)?;
+        let site = config.sites.first().ok_or_else(invalid_fixture)?;
+        assert_eq!(
+            site.block.page.as_ref().map(bytes::Bytes::len),
+            Some(4 * 1024)
+        );
+        Ok(())
+    }
+
     #[test]
     fn a_missing_block_page_names_the_path() {
         let result = site_with("block_page /nonexistent/vigilant-heron/page.html;");

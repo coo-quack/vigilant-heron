@@ -123,9 +123,8 @@ enum Output {
         socket: UdpSocket,
         tag: String,
     },
-    Unavailable {
-        destination: Destination,
-    },
+    /// A syslog destination whose server could not be reached when it was opened.
+    Unavailable,
 }
 
 impl Output {
@@ -142,9 +141,7 @@ impl Output {
                     socket,
                     tag: tag.clone(),
                 },
-                None => Self::Unavailable {
-                    destination: destination.clone(),
-                },
+                None => Self::Unavailable,
             },
         }
     }
@@ -187,12 +184,11 @@ impl Output {
                     tracing::error!(destination = label, %error, "cannot send access log line to syslog");
                 }
             }
-            Self::Unavailable { destination } => {
+            Self::Unavailable => {
                 tracing::error!(
                     destination = label,
                     "syslog server unavailable; line dropped"
                 );
-                let _ = destination;
             }
         }
     }
@@ -520,5 +516,63 @@ mod tests {
         assert!(std::fs::read_to_string(&moved)?.contains("before"));
         assert!(!std::fs::read_to_string(&moved)?.contains("after"));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stream_line_is_written_with_its_line_break() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (writer_end, mut reader_end) = tokio::io::duplex(64);
+        write_stream(writer_end, "access line").await;
+        let mut written = String::new();
+        let read = reader_end.read_to_string(&mut written).await;
+        assert!(read.is_ok());
+        assert_eq!(written, "access line\n");
+    }
+
+    #[tokio::test]
+    async fn a_syslog_destination_sends_each_line_to_the_server()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let server = UdpSocket::bind("127.0.0.1:0").await?;
+        let address = server.local_addr()?;
+        let writer = spawn_writer(Destination::Syslog {
+            server: address.to_string(),
+            tag: "test-tag".to_owned(),
+        });
+        assert!(writer.send("access line".to_owned()));
+        let mut buffer = [0_u8; 2048];
+        let received =
+            tokio::time::timeout(Duration::from_secs(5), server.recv(&mut buffer)).await??;
+        let message = buffer
+            .get(..received)
+            .ok_or("datagram longer than the buffer")?;
+        let message = std::str::from_utf8(message)?;
+        assert!(
+            message.starts_with('<') && message.ends_with("test-tag: access line"),
+            "{message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_error_log_file_that_cannot_be_opened_is_named_by_its_path() {
+        let (_layer, level) = reload::Layer::new(LevelFilter::ERROR);
+        let handle = ErrorLogHandle {
+            sink: Arc::new(Mutex::new(ErrorSink::Stderr)),
+            level,
+            staged: Arc::new(Mutex::new(None)),
+        };
+        let config = ErrorLogConfig {
+            destination: Destination::File(PathBuf::from("/nonexistent-vh-dir/error.log")),
+            level: LogLevel::Error,
+        };
+        let message = match handle.stage(&config) {
+            Err(error) => error.to_string(),
+            Ok(()) => String::new(),
+        };
+        assert!(
+            message.starts_with("cannot open error log /nonexistent-vh-dir/error.log: "),
+            "{message}"
+        );
     }
 }

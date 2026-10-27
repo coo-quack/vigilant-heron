@@ -8,9 +8,11 @@
   "scripts": {
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
-    "docs:preview": "vitepress preview docs"
+    "docs:preview": "vitepress preview docs",
+    "dup": "jscpd"
   },
   "devDependencies": {
+    "jscpd": "5.4.2",
     "vitepress": "2.0.0-alpha.19"
   },
   "packageManager": "pnpm@12.15.0"

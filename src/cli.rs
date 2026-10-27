@@ -12,6 +12,8 @@ use anyhow::{Context, anyhow, bail};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
 
+use vigilant_heron::SuggestOptions;
+
 use crate::pidfile;
 
 /// What `-s` asks the running router to do, as nginx's `-s` does.
@@ -51,7 +53,9 @@ impl SignalCommand {
 }
 
 /// The one action a command line asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Not `Eq`: the suggestion thresholds are scores, which are floating-point numbers.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Command {
     /// No action option: run the router.
     Serve,
@@ -75,6 +79,14 @@ pub(crate) enum Command {
         /// The client address the access list sees.
         client: IpAddr,
     },
+    /// `suggest-skip-rules <file>`: suggest skip rules from a `json` access log and print them.
+    /// Nothing is applied, and the configuration is not read.
+    SuggestSkipRules {
+        /// The access log, or `-` for standard input.
+        file: PathBuf,
+        /// The site filter and the learning thresholds.
+        options: SuggestOptions,
+    },
     /// `-h`, `--help`.
     Help,
     /// `-v`, `--version`.
@@ -82,7 +94,7 @@ pub(crate) enum Command {
 }
 
 /// What the command line asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Options {
     /// The `-c` or `--config` path, when one is given.
     pub(crate) config: Option<PathBuf>,
@@ -95,6 +107,8 @@ pub(crate) const USAGE: &str = "\
 Usage: vigilant-heron [-h] [-v] [-t] [-T] [-c <path>] [-s <signal>]
        vigilant-heron start|stop|restart [-c <path>]
        vigilant-heron test-request <file> [-c <path>] [--client <address>]
+       vigilant-heron suggest-skip-rules <file> [--site <name>] [--min-judged <n>] [--min-clients <n>]
+                             [--min-days <n>] [--max-attack <x>] [--max-ai-instruction <x>]
 
 Options:
   -h, --help            show this help and exit
@@ -113,76 +127,158 @@ Options:
                         in <file> (- reads stdin), without calling the decision backend
   --client <address>    client address for the access list with test-request
                         (default 127.0.0.1; real_ip settings are not applied)
+  suggest-skip-rules <file>
+                        suggest skip rules from a json access log (- reads stdin);
+                        prints them for review and never reads the configuration
+  --site <name>         suggest-skip-rules: keep only the groups of this site
+  --min-judged <n>      suggest-skip-rules: judged requests a shape needs (default 50)
+  --min-clients <n>     suggest-skip-rules: distinct clients needed (default 10)
+  --min-days <n>        suggest-skip-rules: distinct UTC days needed (default 3)
+  --max-attack <x>      suggest-skip-rules: highest attack score allowed, 0 to 1 (default 0.3)
+  --max-ai-instruction <x>
+                        suggest-skip-rules: highest ai_instruction score allowed,
+                        0 to 1 (default 0.3)
 ";
+
+/// The options of `suggest-skip-rules`, with their names as the command line writes them.
+const SUGGEST_FLAGS: [&str; 6] = [
+    "--site",
+    "--min-judged",
+    "--min-clients",
+    "--min-days",
+    "--max-attack",
+    "--max-ai-instruction",
+];
+
+/// The words and options of a command line, read before the action is chosen.
+#[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag is one command-line word, and the action is chosen from them together"
+)]
+struct Words<'a> {
+    help: bool,
+    version: bool,
+    test: bool,
+    dump: bool,
+    request_check: bool,
+    suggest: bool,
+    signal: Option<SignalCommand>,
+    lifecycle: Option<&'a str>,
+    config: Option<PathBuf>,
+    client: Option<IpAddr>,
+    /// Bare arguments: the request file of test-request or suggest-skip-rules. Any other use is an error.
+    operands: Vec<&'a str>,
+    /// The `suggest-skip-rules` options, as written, with the value of each.
+    suggest_values: Vec<(&'a str, String)>,
+}
 
 /// Reads the command line. The first error is returned as text for the usage message.
 pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
-    let mut help = false;
-    let mut version = false;
-    let mut test = false;
-    let mut dump = false;
-    let mut signal: Option<SignalCommand> = None;
-    let mut lifecycle: Option<&str> = None;
-    let mut request_check = false;
-    let mut config = None;
-    let mut client: Option<IpAddr> = None;
-    // Bare arguments: the request file of test-request. Any other use is an error.
-    let mut operands: Vec<&str> = Vec::new();
+    choose_command(read_words(args)?)
+}
+
+/// Reads every word and option of the command line, without choosing the action.
+fn read_words(args: &[String]) -> Result<Words<'_>, String> {
+    let mut words = Words::default();
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "start" | "stop" | "restart" => {
-                if lifecycle.is_some() {
+                if words.lifecycle.is_some() {
                     return Err("give only one of start, stop and restart".to_owned());
                 }
-                lifecycle = Some(arg.as_str());
+                words.lifecycle = Some(arg.as_str());
             }
             "test-request" => {
-                if request_check {
+                if words.request_check {
                     return Err("test-request is given more than once".to_owned());
                 }
-                request_check = true;
+                words.request_check = true;
             }
-            "-h" | "--help" => help = true,
-            "-v" | "--version" => version = true,
-            "-t" => test = true,
+            "suggest-skip-rules" => {
+                if words.suggest {
+                    return Err("suggest-skip-rules is given more than once".to_owned());
+                }
+                words.suggest = true;
+            }
+            "-h" | "--help" => words.help = true,
+            "-v" | "--version" => words.version = true,
+            "-t" => words.test = true,
             "-T" => {
-                test = true;
-                dump = true;
+                words.test = true;
+                words.dump = true;
             }
-            "-c" | "--config" => config = Some(path_value(arg, rest.next())?),
-            "--client" => client = Some(address_value(arg, rest.next())?),
+            "-c" | "--config" => words.config = Some(path_value(arg, rest.next())?),
+            "--client" => words.client = Some(address_value(arg, rest.next())?),
             "-s" => {
-                if signal.is_some() {
+                if words.signal.is_some() {
                     return Err("-s is given more than once".to_owned());
                 }
                 let word = rest.next().ok_or("-s needs a signal")?;
                 let parsed = SignalCommand::parse(word).ok_or_else(|| {
                     format!("invalid signal \"{word}\": use reload, reopen, stop or quit")
                 })?;
-                signal = Some(parsed);
+                words.signal = Some(parsed);
             }
-            "-" => operands.push("-"),
+            flag if SUGGEST_FLAGS.contains(&flag) => {
+                let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                words.suggest_values.push((flag, value.clone()));
+            }
+            "-" => words.operands.push("-"),
             other => match (
                 other.strip_prefix("--config="),
                 other.strip_prefix("--client="),
+                suggest_flag_value(other),
             ) {
-                (Some(value), _) => config = Some(path_value("--config", Some(&value.to_owned()))?),
-                (_, Some(value)) => {
-                    client = Some(address_value("--client", Some(&value.to_owned()))?);
+                (Some(value), _, _) => {
+                    words.config = Some(path_value("--config", Some(&value.to_owned()))?);
                 }
+                (_, Some(value), _) => {
+                    words.client = Some(address_value("--client", Some(&value.to_owned()))?);
+                }
+                (_, _, Some((flag, value))) => words.suggest_values.push((flag, value.to_owned())),
                 _ if other.starts_with('-') => return Err(format!("unknown option \"{other}\"")),
-                _ => operands.push(other),
+                _ => words.operands.push(other),
             },
         }
     }
+    Ok(words)
+}
+
+/// Checks how the words combine, then chooses the one action.
+fn choose_command(words: Words<'_>) -> Result<Options, String> {
+    let Words {
+        help,
+        version,
+        test,
+        dump,
+        request_check,
+        suggest,
+        signal,
+        lifecycle,
+        config,
+        client,
+        operands,
+        suggest_values,
+    } = words;
     if !help && !version && !request_check {
-        if let Some(operand) = operands.first() {
+        if !suggest && let Some(operand) = operands.first() {
             return Err(format!("unknown option \"{operand}\""));
         }
         if client.is_some() {
             return Err("--client can only be used with test-request".to_owned());
         }
+    }
+    if !help
+        && !version
+        && !suggest
+        && let Some((flag, _)) = suggest_values.first()
+    {
+        return Err(format!("{flag} can only be used with suggest-skip-rules"));
+    }
+    if request_check && suggest {
+        return Err("suggest-skip-rules cannot be combined with test-request".to_owned());
     }
     let command = if help {
         Command::Help
@@ -190,6 +286,15 @@ pub(crate) fn parse_args(args: &[String]) -> Result<Options, String> {
         Command::Version
     } else if request_check {
         test_request_command(&operands, client, lifecycle, test, signal.is_some())?
+    } else if suggest {
+        suggest_command(
+            &operands,
+            config.is_some(),
+            lifecycle,
+            test,
+            signal.is_some(),
+            &suggest_values,
+        )?
     } else if let Some(word) = lifecycle {
         if test {
             return Err(format!("{word} cannot be combined with -t or -T"));
@@ -242,6 +347,96 @@ fn test_request_command(
         file,
         client: client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
     })
+}
+
+/// The command of `suggest-skip-rules <file>`. The file is the one bare operand. The word
+/// reads only the access log, so `-c` and the other actions are errors.
+fn suggest_command(
+    operands: &[&str],
+    config_given: bool,
+    lifecycle: Option<&str>,
+    test: bool,
+    signal: bool,
+    values: &[(&str, String)],
+) -> Result<Command, String> {
+    if config_given {
+        return Err("suggest-skip-rules reads only the access log; -c is not used".to_owned());
+    }
+    if let Some(word) = lifecycle {
+        return Err(format!("suggest-skip-rules cannot be combined with {word}"));
+    }
+    if test {
+        return Err("suggest-skip-rules cannot be combined with -t or -T".to_owned());
+    }
+    if signal {
+        return Err("suggest-skip-rules cannot be combined with -s".to_owned());
+    }
+    let file = match operands {
+        [only] => PathBuf::from(only),
+        [] => {
+            return Err("suggest-skip-rules needs an access log file (or - for stdin)".to_owned());
+        }
+        _ => return Err("give only one access log file".to_owned()),
+    };
+    Ok(Command::SuggestSkipRules {
+        file,
+        options: suggest_options(values)?,
+    })
+}
+
+/// The site filter and thresholds from the `suggest-skip-rules` options. Each option may
+/// be given once. The defaults are the thresholds of the documentation.
+fn suggest_options(values: &[(&str, String)]) -> Result<SuggestOptions, String> {
+    let mut options = SuggestOptions::default();
+    let mut seen: Vec<&str> = Vec::new();
+    for (flag, value) in values {
+        if seen.contains(flag) {
+            return Err(format!("{flag} is given more than once"));
+        }
+        seen.push(flag);
+        match *flag {
+            "--site" => {
+                if value.is_empty() {
+                    return Err("--site needs a site name".to_owned());
+                }
+                options.site = Some(value.clone());
+            }
+            "--min-judged" => options.min_judged = count_value(flag, value)?,
+            "--min-clients" => options.min_clients = count_value(flag, value)?,
+            "--min-days" => options.min_days = count_value(flag, value)?,
+            "--max-attack" => options.max_attack = score_value(flag, value)?,
+            "--max-ai-instruction" => options.max_ai_instruction = score_value(flag, value)?,
+            other => return Err(format!("unknown option \"{other}\"")),
+        }
+    }
+    Ok(options)
+}
+
+/// Reads a count, which must be a whole number of at least 1.
+fn count_value(option: &str, value: &str) -> Result<usize, String> {
+    match value.parse::<usize>() {
+        Ok(count) if count > 0 => Ok(count),
+        _ => Err(format!(
+            "{option} must be a whole number of at least 1, not \"{value}\""
+        )),
+    }
+}
+
+/// Reads a score, which must be a number from 0 to 1.
+fn score_value(option: &str, value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(score) if (0.0..=1.0).contains(&score) => Ok(score),
+        _ => Err(format!(
+            "{option} must be a number from 0 to 1, not \"{value}\""
+        )),
+    }
+}
+
+/// Splits `--name=value` for a `suggest-skip-rules` option. The name is one of [`SUGGEST_FLAGS`].
+fn suggest_flag_value(arg: &str) -> Option<(&'static str, &str)> {
+    let (name, value) = arg.split_once('=')?;
+    let flag = SUGGEST_FLAGS.into_iter().find(|flag| *flag == name)?;
+    Some((flag, value))
 }
 
 /// Reads the value of an option that takes a path.
@@ -358,9 +553,24 @@ mod tests {
     #[case::test_request_with_client(&["test-request", "req.txt", "--client", "203.0.113.7"], Options { config: None, command: test_request("req.txt", "203.0.113.7".parse().unwrap_or(LOCALHOST)) })]
     #[case::test_request_with_client_equals(&["test-request", "--client=2001:db8::1", "req.txt"], Options { config: None, command: test_request("req.txt", "2001:db8::1".parse().unwrap_or(LOCALHOST)) })]
     #[case::test_request_from_stdin(&["test-request", "-"], Options { config: None, command: test_request("-", LOCALHOST) })]
+    #[case::suggest_with_file(&["suggest-skip-rules", "log.json"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions::default() } })]
+    #[case::suggest_from_stdin(&["suggest-skip-rules", "-"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("-"), options: SuggestOptions::default() } })]
+    #[case::suggest_file_before_word(&["log.json", "suggest-skip-rules"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions::default() } })]
+    #[case::suggest_with_site(&["suggest-skip-rules", "log.json", "--site", "example.test"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions { site: Some("example.test".to_owned()), ..SuggestOptions::default() } } })]
+    #[case::suggest_with_thresholds(&["suggest-skip-rules", "log.json", "--min-judged", "60", "--min-clients=12", "--min-days", "4", "--max-attack", "0.2", "--max-ai-instruction=0.25"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions { min_judged: 60, min_clients: 12, min_days: 4, max_attack: 0.2, max_ai_instruction: 0.25, ..SuggestOptions::default() } } })]
+    #[case::suggest_score_one(&["suggest-skip-rules", "log.json", "--max-attack", "1"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions { max_attack: 1.0, ..SuggestOptions::default() } } })]
+    #[case::suggest_help_wins(&["suggest-skip-rules", "-h"], Options { config: None, command: Command::Help })]
     #[case::help_wins_over_test_request(&["test-request", "-h"], Options { config: None, command: Command::Help })]
     fn a_valid_command_line_parses(#[case] input: &[&str], #[case] expected: Options) {
         assert_eq!(parse_args(&args(input)), Ok(expected));
+    }
+
+    #[rstest]
+    #[case::long_option(&["--bogus"], "unknown option \"--bogus\"")]
+    #[case::short_option(&["-x"], "unknown option \"-x\"")]
+    #[case::option_after_a_command(&["start", "--bogus"], "unknown option \"--bogus\"")]
+    fn a_dashed_word_that_is_no_option_is_refused(#[case] input: &[&str], #[case] message: &str) {
+        assert_eq!(parse_args(&args(input)), Err(message.to_owned()));
     }
 
     fn test_request(file: &str, client: IpAddr) -> Command {
@@ -395,6 +605,24 @@ mod tests {
     #[case::client_with_start(&["start", "--client=127.0.0.1"], "--client can only be used with test-request")]
     #[case::client_without_address(&["test-request", "req.txt", "--client"], "--client needs an address")]
     #[case::client_not_an_address(&["test-request", "req.txt", "--client", "example.com"], "invalid address \"example.com\" for --client")]
+    #[case::suggest_with_config(&["suggest-skip-rules", "log.json", "-c", "/a.conf"], "suggest-skip-rules reads only the access log; -c is not used")]
+    #[case::suggest_with_config_equals(&["--config=/a.conf", "suggest-skip-rules", "log.json"], "suggest-skip-rules reads only the access log; -c is not used")]
+    #[case::suggest_with_test(&["suggest-skip-rules", "log.json", "-t"], "suggest-skip-rules cannot be combined with -t or -T")]
+    #[case::suggest_with_signal(&["suggest-skip-rules", "log.json", "-s", "reload"], "suggest-skip-rules cannot be combined with -s")]
+    #[case::suggest_with_start(&["start", "suggest-skip-rules", "log.json"], "suggest-skip-rules cannot be combined with start")]
+    #[case::suggest_with_test_request(&["suggest-skip-rules", "log.json", "test-request", "req.txt"], "suggest-skip-rules cannot be combined with test-request")]
+    #[case::suggest_without_file(&["suggest-skip-rules"], "suggest-skip-rules needs an access log file (or - for stdin)")]
+    #[case::suggest_two_files(&["suggest-skip-rules", "a.json", "b.json"], "give only one access log file")]
+    #[case::suggest_word_twice(&["suggest-skip-rules", "suggest-skip-rules", "a.json"], "suggest-skip-rules is given more than once")]
+    #[case::suggest_site_without_name(&["suggest-skip-rules", "a.json", "--site"], "--site needs a value")]
+    #[case::suggest_site_empty(&["suggest-skip-rules", "a.json", "--site="], "--site needs a site name")]
+    #[case::suggest_site_twice(&["suggest-skip-rules", "a.json", "--site", "x", "--site=y"], "--site is given more than once")]
+    #[case::suggest_zero_count(&["suggest-skip-rules", "a.json", "--min-judged", "0"], "--min-judged must be a whole number of at least 1, not \"0\"")]
+    #[case::suggest_count_not_a_number(&["suggest-skip-rules", "a.json", "--min-days=three"], "--min-days must be a whole number of at least 1, not \"three\"")]
+    #[case::suggest_score_above_one(&["suggest-skip-rules", "a.json", "--max-attack", "1.5"], "--max-attack must be a number from 0 to 1, not \"1.5\"")]
+    #[case::suggest_score_nan(&["suggest-skip-rules", "a.json", "--max-ai-instruction", "NaN"], "--max-ai-instruction must be a number from 0 to 1, not \"NaN\"")]
+    #[case::suggest_option_without_word(&["--min-judged", "60"], "--min-judged can only be used with suggest-skip-rules")]
+    #[case::site_with_test_request(&["test-request", "req.txt", "--site", "example.test"], "--site can only be used with suggest-skip-rules")]
     fn test_request_rejects_combinations_and_bad_operands(
         #[case] input: &[&str],
         #[case] message: &str,

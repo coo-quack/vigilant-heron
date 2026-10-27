@@ -1,7 +1,6 @@
 //! The decision backends: the transport shared by all of them, the JSON HTTP
 //! protocol, the System One protocol in [`crate::system_one`], and the backend enum.
 
-use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,15 +67,6 @@ struct RawVerdict {
     ai_instruction: f64,
     #[serde(default)]
     category: Option<String>,
-}
-
-/// Something that can score a sanitized event.
-pub(crate) trait DecisionBackend: Send + Sync + 'static {
-    /// Asks the backend for a verdict on `event`.
-    fn decide(
-        &self,
-        event: &DecisionEvent,
-    ) -> impl Future<Output = Result<Verdict, DecisionError>> + Send;
 }
 
 /// Builds the HTTP client. TLS uses the operating system's root certificates.
@@ -187,21 +177,22 @@ impl Drop for ClientSlot {
 
 /// Posts a JSON payload and returns the response body, bounded in size and time.
 ///
-/// `bearer` is sent as an `Authorization: Bearer` header when given. The wait for
-/// a slot is bounded by `queue_timeout` only: if no slot is obtained in that
-/// window the result is always [`DecisionError::Busy`]. The exchange then gets
-/// the rest of `timeout`, and running out there is [`DecisionError::Timeout`].
+/// `authorization` is sent as the `Authorization` header value, as given, when
+/// present. The wait for a slot is bounded by `queue_timeout` only: if no slot is
+/// obtained in that window the result is always [`DecisionError::Busy`]. The
+/// exchange then gets the rest of `timeout`, and running out there is
+/// [`DecisionError::Timeout`].
 pub(crate) async fn post_json(
     client: &DecisionClient,
     url: &Uri,
-    bearer: Option<&str>,
+    authorization: Option<&str>,
     payload: Vec<u8>,
     limits: &Limits,
 ) -> Result<Bytes, DecisionError> {
     let started = tokio::time::Instant::now();
     let _slot = acquire_slot(limits).await?;
     let remaining = limits.timeout.saturating_sub(started.elapsed());
-    match tokio::time::timeout(remaining, exchange(client, url, bearer, payload)).await {
+    match tokio::time::timeout(remaining, exchange(client, url, authorization, payload)).await {
         Ok(result) => result,
         Err(_elapsed) => Err(DecisionError::Timeout),
     }
@@ -220,15 +211,15 @@ async fn acquire_slot(limits: &Limits) -> Result<SemaphorePermit<'_>, DecisionEr
 async fn exchange(
     client: &DecisionClient,
     url: &Uri,
-    bearer: Option<&str>,
+    authorization: Option<&str>,
     payload: Vec<u8>,
 ) -> Result<Bytes, DecisionError> {
     let mut builder = Request::builder()
         .method(Method::POST)
         .uri(url.clone())
         .header(CONTENT_TYPE, "application/json");
-    if let Some(token) = bearer {
-        builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+    if let Some(value) = authorization {
+        builder = builder.header(AUTHORIZATION, value);
     }
     let request = builder.body(Full::new(Bytes::from(payload)))?;
     let response = client
@@ -273,8 +264,9 @@ impl HttpDecisionBackend {
     }
 }
 
-impl DecisionBackend for HttpDecisionBackend {
-    async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
+impl HttpDecisionBackend {
+    /// Asks the backend for a verdict on `event`.
+    pub(crate) async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         let payload = serde_json::to_vec(event)?;
         let body = post_json(&self.client, &self.url, None, payload, &self.limits).await?;
         let raw: RawVerdict = serde_json::from_slice(&body)?;
@@ -295,8 +287,9 @@ pub(crate) enum Backend {
     SystemOne(SystemOneBackend),
 }
 
-impl DecisionBackend for Backend {
-    async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
+impl Backend {
+    /// Asks the configured backend for a verdict on `event`.
+    pub(crate) async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
         match self {
             Self::Http(backend) => backend.decide(event).await,
             Self::SystemOne(backend) => backend.decide(event).await,
@@ -335,6 +328,30 @@ mod client_slot_tests {
         );
         drop(first);
         assert!(table.take(client).is_some());
+    }
+
+    #[test]
+    fn the_table_reports_the_limit_it_was_created_with() {
+        assert_eq!(ClientSlots::new(3).limit(), 3);
+    }
+
+    #[test]
+    fn dropping_one_of_two_calls_leaves_the_other_counted() {
+        let table = ClientSlots::new(2);
+        let client = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 3));
+        let first = table.take(client);
+        let second = table.take(client);
+        drop(first);
+        let third = table.take(client);
+        assert!(
+            third.is_some(),
+            "the slot of the dropped call is free again"
+        );
+        assert!(
+            table.take(client).is_none(),
+            "the share is still two calls, and the remaining one is counted"
+        );
+        assert!(second.is_some());
     }
 }
 
@@ -435,5 +452,32 @@ mod tests {
     #[case::negative_infinity(f64::NEG_INFINITY)]
     fn probability_rejects_nan_and_values_outside_the_unit_interval(#[case] value: f64) {
         assert!(Probability::new(value).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_decision_response_of_two_kibibytes_is_read_in_full()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const BODY_LEN: usize = 2 * 1024;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url: Uri = format!("http://{}/decide", listener.local_addr()?).parse()?;
+        let server = tokio::spawn(async move {
+            if let Ok((stream, _peer)) = listener.accept().await {
+                let service =
+                    hyper::service::service_fn(|_request: Request<hyper::body::Incoming>| async {
+                        Ok::<_, std::convert::Infallible>(http::Response::new(Full::new(
+                            Bytes::from(vec![b'x'; BODY_LEN]),
+                        )))
+                    });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        let client = decision_client()?;
+        let slots = Arc::new(Semaphore::new(1));
+        let body = post_json(&client, &url, None, b"{}".to_vec(), &limits(1000, slots)).await?;
+        assert_eq!(body.len(), BODY_LEN);
+        server.abort();
+        Ok(())
     }
 }

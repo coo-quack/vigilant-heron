@@ -472,4 +472,14 @@ mod tests {
         assert_eq!(Router::new(&sites).lookup(None), None);
         Ok(())
     }
+
+    #[test]
+    fn host_patterns_are_equal_when_they_are_written_the_same_way() {
+        let exact = HostPattern::parse("Example.com").ok();
+        let same = HostPattern::parse("example.com").ok();
+        let leading_dot = HostPattern::parse(".example.com").ok();
+        assert!(exact.is_some());
+        assert_eq!(exact, same);
+        assert_ne!(exact, leading_dot);
+    }
 }

@@ -235,27 +235,27 @@ impl LimitOverrides {
             }
             "limit_req_status" => {
                 once(seen, directive)?;
-                self.req_status = Some(parse_status(directive, "limit_req_status")?);
+                self.req_status = Some(parse_status(directive)?);
             }
             "limit_conn_status" => {
                 once(seen, directive)?;
-                self.conn_status = Some(parse_status(directive, "limit_conn_status")?);
+                self.conn_status = Some(parse_status(directive)?);
             }
             "limit_req_dry_run" => {
                 once(seen, directive)?;
-                self.req_dry_run = Some(parse_on_off(directive, "limit_req_dry_run")?);
+                self.req_dry_run = Some(parse_on_off(directive)?);
             }
             "limit_conn_dry_run" => {
                 once(seen, directive)?;
-                self.conn_dry_run = Some(parse_on_off(directive, "limit_conn_dry_run")?);
+                self.conn_dry_run = Some(parse_on_off(directive)?);
             }
             "limit_req_log_level" => {
                 once(seen, directive)?;
-                self.req_log = Some(parse_log_level(directive, "limit_req_log_level")?);
+                self.req_log = Some(parse_log_level(directive)?);
             }
             "limit_conn_log_level" => {
                 once(seen, directive)?;
-                self.conn_log = Some(parse_log_level(directive, "limit_conn_log_level")?);
+                self.conn_log = Some(parse_log_level(directive)?);
             }
             other => {
                 return Err(invalid(
@@ -286,7 +286,7 @@ impl LimitOverrides {
     }
 }
 
-fn parse_status(directive: &Directive, name: &str) -> Result<StatusCode, ConfigError> {
+fn parse_status(directive: &Directive) -> Result<StatusCode, ConfigError> {
     let text = one_arg(directive)?;
     let code = text.parse::<u16>().ok().and_then(|code| {
         StatusCode::from_u16(code)
@@ -296,28 +296,34 @@ fn parse_status(directive: &Directive, name: &str) -> Result<StatusCode, ConfigE
     code.ok_or_else(|| {
         invalid(
             directive,
-            format!("\"{name}\" must be a 4xx or 5xx code, got {text}"),
+            format!(
+                "\"{}\" must be a 4xx or 5xx code, got {text}",
+                directive.name
+            ),
         )
     })
 }
 
-fn parse_on_off(directive: &Directive, name: &str) -> Result<bool, ConfigError> {
+fn parse_on_off(directive: &Directive) -> Result<bool, ConfigError> {
     match one_arg(directive)? {
         "on" => Ok(true),
         "off" => Ok(false),
         other => Err(invalid(
             directive,
-            format!("\"{name}\" must be on or off, got {other}"),
+            format!("\"{}\" must be on or off, got {other}", directive.name),
         )),
     }
 }
 
-fn parse_log_level(directive: &Directive, name: &str) -> Result<LimitLog, ConfigError> {
+fn parse_log_level(directive: &Directive) -> Result<LimitLog, ConfigError> {
     let text = one_arg(directive)?;
     LimitLog::parse(text).ok_or_else(|| {
         invalid(
             directive,
-            format!("\"{name}\" must be info, notice, warn or error, got {text}"),
+            format!(
+                "\"{}\" must be info, notice, warn or error, got {text}",
+                directive.name
+            ),
         )
     })
 }
@@ -2066,6 +2072,336 @@ mod tests {
         drop(first);
         let third = zone.acquire("k", 1, false, now).ok();
         assert_eq!(third.map(|a| a.status), Some(ConnStatus::Passed));
+    }
+
+    /// Everything the process-wide error log test subscriber has written.
+    static CAPTURED: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    /// Serializes the tests that read `CAPTURED`, so each reads only its own lines.
+    static CAPTURE_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[derive(Clone, Copy)]
+    struct CaptureWriter;
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `f` with the error log's formatting on and returns the lines it wrote
+    /// that contain `marker`. Each test uses a marker unique to itself, since other
+    /// tests may log at the same time.
+    fn log_lines_for(marker: &str, f: impl FnOnce()) -> Vec<String> {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_ansi(false)
+                .without_time()
+                .with_writer(|| CaptureWriter)
+                .finish();
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
+        let _turn = CAPTURE_TURN
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = CAPTURED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        f();
+        let bytes = CAPTURED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(bytes.get(before..).unwrap_or_default())
+            .lines()
+            .filter(|line| line.contains(marker))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn named_store(name: &str, capacity: usize, interval_ns: u64) -> Arc<ZoneStore> {
+        Arc::new(ZoneStore::new(LimitZone {
+            name: name.to_owned(),
+            key: vec![KeyPart::Var(KeyVar::ClientIp)],
+            capacity,
+            kind: ZoneKind::Req { interval_ns },
+        }))
+    }
+
+    fn named_conn_store(name: &str, capacity: usize) -> Arc<ZoneStore> {
+        Arc::new(ZoneStore::new(LimitZone {
+            name: name.to_owned(),
+            key: vec![KeyPart::Var(KeyVar::ClientIp)],
+            capacity,
+            kind: ZoneKind::Conn,
+        }))
+    }
+
+    /// Runs `screen` for one request on a fresh current-thread runtime.
+    fn screen_now(
+        zones: &[Arc<ZoneStore>],
+        set: &LimitSet,
+        vars: &KeyVars<'_>,
+        permits: &mut Vec<ConnPermit>,
+    ) -> Option<Screened> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        Some(runtime.block_on(screen(zones, &[set], false, vars, permits)))
+    }
+
+    #[rstest]
+    #[case(LimitLog::Info, "INFO")]
+    #[case(LimitLog::Notice, "INFO")]
+    #[case(LimitLog::Warn, "WARN")]
+    #[case(LimitLog::Error, "ERROR")]
+    fn a_limit_event_is_written_at_the_configured_severity(
+        #[case] level: LimitLog,
+        #[case] severity: &str,
+    ) {
+        let zone = format!("sev-{level:?}");
+        let lines = log_lines_for(&zone, || {
+            log_event(level, &zone, "203.0.113.7", "REJECTED");
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines.first().is_some_and(|line| line.contains(severity)),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("event=\"REJECTED\"")),
+            "{lines:?}"
+        );
+    }
+
+    #[rstest]
+    #[case(LimitLog::Info, "INFO")]
+    #[case(LimitLog::Notice, "INFO")]
+    #[case(LimitLog::Warn, "WARN")]
+    #[case(LimitLog::Error, "ERROR")]
+    fn a_zone_exhaustion_is_written_at_the_configured_severity(
+        #[case] level: LimitLog,
+        #[case] severity: &str,
+    ) {
+        let zone = format!("exh-{level:?}");
+        let lines = log_lines_for(&zone, || {
+            log_exhausted(level, &zone, "203.0.113.7");
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines.first().is_some_and(|line| line.contains(severity)),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("limit_error=\"zone_exhausted\"")),
+            "{lines:?}"
+        );
+    }
+
+    #[rstest]
+    #[case("info", "INFO")]
+    #[case("notice", "INFO")]
+    #[case("warn", "WARN")]
+    #[case("error", "ERROR")]
+    fn a_limit_log_level_word_sets_the_severity_of_limit_events(
+        #[case] word: &str,
+        #[case] severity: &str,
+    ) -> Result<(), ConfigError> {
+        let config = parse(&format!("{ONE}\n{TWO}\nlimit_req_log_level {word};"), "")?;
+        let level = config.limits.req_log;
+        let zone = format!("word-{word}");
+        let lines = log_lines_for(&zone, || {
+            log_event(level, &zone, "203.0.113.7", "REJECTED");
+        });
+        assert!(
+            lines.first().is_some_and(|line| line.contains(severity)),
+            "{lines:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_request_that_passes_the_limits_writes_nothing_to_the_error_log() {
+        let zones = vec![named_store("pass-quiet", 100, 1_000_000_000)];
+        let set = LimitSet {
+            req: vec![req(5, 5)],
+            ..LimitSet::default()
+        };
+        let headers = HeaderMap::new();
+        let vars = vars_for("203.0.113.7", &headers);
+        let mut permits = Vec::new();
+        let mut refusal = None;
+        let lines = log_lines_for("pass-quiet", || {
+            refusal = screen_now(&zones, &set, &vars, &mut permits).and_then(|s| s.refusal);
+        });
+        assert_eq!(refusal, None);
+        assert!(lines.is_empty(), "{lines:?}");
+    }
+
+    #[test]
+    fn a_rejected_request_writes_one_limit_event_naming_its_zone() {
+        let zones = vec![named_store("reject-once", 100, 1_000_000_000)];
+        let set = LimitSet {
+            req: vec![req(0, 0)],
+            ..LimitSet::default()
+        };
+        let headers = HeaderMap::new();
+        let vars = vars_for("203.0.113.7", &headers);
+        let mut permits = Vec::new();
+        let mut second_refusal = None;
+        let lines = log_lines_for("reject-once", || {
+            let _ = screen_now(&zones, &set, &vars, &mut permits);
+            second_refusal = screen_now(&zones, &set, &vars, &mut permits).and_then(|s| s.refusal);
+        });
+        assert_eq!(second_refusal.map(|r| r.reason), Some("limit_req"));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines.first().is_some_and(|line| line.contains("ERROR")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("event=\"REJECTED\"")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_limit_writes_an_event_only_when_it_rejects() {
+        let zones = vec![named_conn_store("conn-once", 100)];
+        let set = LimitSet {
+            conn: vec![ConnLimit { zone: 0, max: 1 }],
+            ..LimitSet::default()
+        };
+        let headers = HeaderMap::new();
+        let vars = vars_for("203.0.113.7", &headers);
+        let mut permits = Vec::new();
+        let lines = log_lines_for("conn-once", || {
+            screen_now(&zones, &set, &vars, &mut permits);
+            screen_now(&zones, &set, &vars, &mut permits);
+        });
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("event=\"REJECTED\"")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_zone_writes_a_zone_exhausted_event_naming_its_zone() {
+        // One state, held by a delayed request, so the second client finds no state to evict.
+        let zone = named_store("exhaust-zone", 1, 1_000_000_000);
+        let now = Instant::now();
+        let first = zone.admit("a", &req(1, 0), false, now).ok();
+        let held = zone.admit("a", &req(1, 0), false, now).ok();
+        assert!(first.is_some());
+        assert!(
+            held.as_ref()
+                .is_some_and(|admission| admission.status == ReqStatus::Delayed)
+        );
+        let zones = vec![zone];
+        let set = LimitSet {
+            req: vec![req(1, 0)],
+            ..LimitSet::default()
+        };
+        let headers = HeaderMap::new();
+        let vars = vars_for("198.51.100.9", &headers);
+        let mut permits = Vec::new();
+        let mut refusal = None;
+        let lines = log_lines_for("exhaust-zone", || {
+            refusal = screen_now(&zones, &set, &vars, &mut permits).and_then(|s| s.refusal);
+        });
+        assert!(refusal.is_some());
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("limit_error=\"zone_exhausted\"")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_count_is_kept_while_another_request_of_its_key_is_in_progress() {
+        let zone = conn_store(10);
+        let now = Instant::now();
+        let first = zone.acquire("k", 2, false, now).ok();
+        let second = zone.acquire("k", 2, false, now).ok();
+        assert_eq!(second.as_ref().map(|a| a.status), Some(ConnStatus::Passed));
+        drop(first);
+        // One request is still in progress, so one more fits and then the limit holds.
+        let third = zone.acquire("k", 2, false, now).ok();
+        assert_eq!(third.as_ref().map(|a| a.status), Some(ConnStatus::Passed));
+        let fourth = zone.acquire("k", 2, false, now).ok();
+        assert_eq!(fourth.map(|a| a.status), Some(ConnStatus::Rejected));
+    }
+
+    #[test]
+    fn a_delay_equal_to_the_burst_is_accepted_and_leaves_no_request_delayed()
+    -> Result<(), ConfigError> {
+        let config = parse(&format!("{ONE}\nlimit_req zone=one burst=2 delay=2;"), "")?;
+        assert_eq!(
+            config.limits.req.first().map(|l| (l.burst, l.undelayed)),
+            Some((2, 2))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn zone_names_may_contain_dashes_and_underscores() {
+        let text = message(parse(
+            "limit_req_zone $client_ip zone=my_zone-2:10m rate=1r/s;",
+            "",
+        ));
+        assert_eq!(text, "accepted");
+    }
+
+    #[test]
+    fn an_empty_zone_name_is_rejected() {
+        let text = message(parse("limit_req_zone $client_ip zone=:10m rate=1r/s;", ""));
+        assert!(text.contains("zone name is not valid"), "{text}");
+    }
+
+    #[rstest]
+    #[case("$client_ip", "203.0.113.7")]
+    #[case("$remote_addr", "10.0.0.2")]
+    #[case("$site", "example.com")]
+    #[case("$host", "www.example.com")]
+    #[case("$method", "POST")]
+    #[case("$path", "/login")]
+    fn each_limit_key_variable_renders_its_own_request_value(
+        #[case] text: &str,
+        #[case] value: &str,
+    ) {
+        let headers = HeaderMap::new();
+        let vars = KeyVars {
+            client_ip: "203.0.113.7",
+            remote_addr: "10.0.0.2",
+            site: "example.com",
+            host: "www.example.com",
+            method: "POST",
+            path: "/login",
+            headers: &headers,
+        };
+        let parts = parse_key_for_test(text);
+        assert_eq!(render_key(&parts, &vars).as_deref(), Some(value));
     }
 
     #[test]

@@ -417,8 +417,12 @@ pub struct SiteConfig {
     pub instruction_threshold: f64,
     /// Path prefixes that are always blocked without calling the backend.
     pub deny_paths: Vec<String>,
+    /// `deny_paths` in lowercase, in the same order, for matching against lowercase views.
+    pub(crate) deny_paths_lowered: Vec<String>,
     /// Path prefixes that are always blocked when the decision fails.
     pub fail_closed_paths: Vec<String>,
+    /// `fail_closed_paths` in lowercase, in the same order, for matching against lowercase views.
+    pub(crate) fail_closed_lowered: Vec<String>,
     /// What happens when the backend rate-limits the request or no slot is free in time.
     pub on_rate_limit: FailureAction,
     /// What happens when a client already holds its `max_concurrency_per_client` share.
@@ -642,20 +646,9 @@ pub(crate) fn block(directive: &Directive) -> Result<&[Directive], ConfigError> 
     })
 }
 
-fn parse_uint(directive: &Directive, text: &str) -> Result<u64, ConfigError> {
-    text.parse::<u64>().map_err(|_| {
-        invalid(
-            directive,
-            format!(
-                "\"{}\" must be a whole number, got \"{text}\"",
-                directive.name
-            ),
-        )
-    })
-}
-
-fn parse_usize(directive: &Directive, text: &str) -> Result<usize, ConfigError> {
-    text.parse::<usize>().map_err(|_| {
+/// Parses a whole number of type `T`. The message is the same for every type.
+fn parse_number<T: FromStr>(directive: &Directive, text: &str) -> Result<T, ConfigError> {
+    text.parse::<T>().map_err(|_| {
         invalid(
             directive,
             format!(
@@ -814,7 +807,7 @@ fn parse_header_buffers(directive: &Directive) -> Result<HeaderBuffers, ConfigEr
             "\"large_client_header_buffers\" takes two arguments: a number and a size",
         ));
     };
-    let count = parse_usize(directive, count)?;
+    let count = parse_number::<usize>(directive, count)?;
     let size = parse_size(directive, size)?;
     if count == 0 || size == 0 {
         return Err(invalid(
@@ -994,7 +987,7 @@ where
             }
             "worker_threads" => {
                 once(&mut seen, directive)?;
-                let count = parse_usize(directive, one_arg(directive)?)?;
+                let count = parse_number::<usize>(directive, one_arg(directive)?)?;
                 if count == 0 {
                     return Err(invalid(directive, "\"worker_threads\" must be at least 1"));
                 }
@@ -1002,7 +995,7 @@ where
             }
             "max_connections" => {
                 once(&mut seen, directive)?;
-                let count = parse_usize(directive, one_arg(directive)?)?;
+                let count = parse_number::<usize>(directive, one_arg(directive)?)?;
                 if count == 0 {
                     return Err(invalid(directive, "\"max_connections\" must be at least 1"));
                 }
@@ -1015,7 +1008,7 @@ where
             }
             "default_status" => {
                 once(&mut seen, directive)?;
-                let status = parse_uint(directive, one_arg(directive)?)?;
+                let status = parse_number::<u64>(directive, one_arg(directive)?)?;
                 let valid = u16::try_from(status)
                     .ok()
                     .and_then(|code| StatusCode::from_u16(code).ok())
@@ -1084,7 +1077,7 @@ where
             }
             "keepalive_requests" => {
                 once(&mut seen, directive)?;
-                let count = parse_usize(directive, one_arg(directive)?)?;
+                let count = parse_number::<usize>(directive, one_arg(directive)?)?;
                 if count == 0 {
                     return Err(invalid(
                         directive,
@@ -1560,11 +1553,11 @@ where
             }
             "max_concurrency" => {
                 once(&mut seen, child)?;
-                max_concurrency = parse_usize(child, one_arg(child)?)?;
+                max_concurrency = parse_number::<usize>(child, one_arg(child)?)?;
             }
             "max_concurrency_per_client" => {
                 once(&mut seen, child)?;
-                max_concurrency_per_client = Some(parse_usize(child, one_arg(child)?)?);
+                max_concurrency_per_client = Some(parse_number::<usize>(child, one_arg(child)?)?);
             }
             "inspect_body" => {
                 once(&mut seen, child)?;
@@ -2101,7 +2094,12 @@ fn parse_site(
         action,
         block_threshold,
         instruction_threshold,
+        deny_paths_lowered: deny_paths.iter().map(|path| path.to_lowercase()).collect(),
         deny_paths,
+        fail_closed_lowered: fail_closed_paths
+            .iter()
+            .map(|path| path.to_lowercase())
+            .collect(),
         fail_closed_paths,
         on_rate_limit,
         on_client_busy,
@@ -3312,5 +3310,82 @@ mod connection_limit_tests {
             "{text}"
         );
         assert!(text.contains("test.conf:5:"), "{text}");
+    }
+
+    /// A configuration that is valid as written, for the tests of this module.
+    const PLAIN_BASE: &str = "listen 127.0.0.1:8080;\n\
+        decision {\n    backend http;\n    url http://stub-decider:9000/decide;\n}\n\
+        site example.com {\n    upstream http://upstream:80;\n}\n";
+
+    fn parse_plain(text: &str) -> Result<Config, ConfigError> {
+        Config::parse_str_with_lookup(text, "test.conf", |_| None)
+    }
+
+    #[test]
+    fn max_connections_must_be_at_least_one_and_is_taken_as_written() -> Result<(), ConfigError> {
+        assert!(
+            message(parse_plain(&format!("max_connections 0;\n{PLAIN_BASE}")))
+                .contains("\"max_connections\" must be at least 1")
+        );
+        assert_eq!(
+            parse_plain(&format!("max_connections 5;\n{PLAIN_BASE}"))?.max_connections,
+            5
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_per_client_share_equal_to_the_global_cap_is_allowed() -> Result<(), ConfigError> {
+        let config = parse_plain(
+            "listen 127.0.0.1:8080;\ndecision {\n    backend http;\n    url http://stub-decider:9000/decide;\n    max_concurrency 10;\n    max_concurrency_per_client 10;\n}\nsite example.com {\n    upstream http://upstream:80;\n}\n",
+        )?;
+        assert_eq!(config.decision.max_concurrency_per_client, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn a_syslog_tag_must_not_be_empty() {
+        let text = message(parse_plain(&format!(
+            "access_log syslog:server=192.0.2.10:514,tag=;\n{PLAIN_BASE}"
+        )));
+        assert!(text.contains("invalid syslog option \"tag=\""), "{text}");
+    }
+
+    #[test]
+    fn error_log_can_write_to_stdout_or_stderr_by_name() -> Result<(), ConfigError> {
+        let out = parse_plain(&format!("error_log stdout;\n{PLAIN_BASE}"))?;
+        assert_eq!(out.error_log.destination, Destination::Stdout);
+        let err = parse_plain(&format!("error_log stderr;\n{PLAIN_BASE}"))?;
+        assert_eq!(err.error_log.destination, Destination::Stderr);
+        Ok(())
+    }
+
+    #[test]
+    fn an_upstream_must_use_the_http_scheme_and_name_a_host() {
+        for upstream in ["ftp://upstream:80", "http:/path-only", "http:upstream"] {
+            let text = message(parse_plain(&format!(
+                "listen 127.0.0.1:8080;\ndecision {{\n    backend http;\n    url http://stub-decider:9000/decide;\n}}\nsite example.com {{\n    upstream {upstream};\n}}\n"
+            )));
+            assert!(
+                text.contains("must be an absolute http:// URI"),
+                "{upstream}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn process_settings_reads_the_worker_shutdown_timeout() -> Result<(), std::io::Error> {
+        let dir = std::env::temp_dir().join(format!("vh-process-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("router.conf");
+        std::fs::write(&path, format!("worker_shutdown_timeout 7s;\n{PLAIN_BASE}"))?;
+        let settings = process_settings(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = settings.map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(
+            settings.worker_shutdown_timeout,
+            Some(Duration::from_secs(7))
+        );
+        Ok(())
     }
 }

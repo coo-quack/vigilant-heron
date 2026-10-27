@@ -29,6 +29,7 @@ mod router;
 mod rules;
 mod sanitize;
 mod server;
+mod skip_suggest;
 mod system_one;
 #[cfg(test)]
 mod test_support;
@@ -45,8 +46,9 @@ pub use config::{
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
-pub use request_check::{CheckError, Outcome, RequestCheck, check_request};
+pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_request_with};
 pub use server::{serve, serve_reloadable};
+pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
 pub use system_one::{ApiToken, ClefModel};
 
 /// The directive names the parser accepts, read by the documentation drift check in `tests/docs.rs`.

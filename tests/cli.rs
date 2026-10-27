@@ -958,6 +958,51 @@ fn start_replaces_a_stale_pid_file() -> Result<(), std::io::Error> {
 }
 
 #[test]
+fn a_pid_file_that_cannot_be_locked_is_warned_about_and_the_router_still_serves()
+-> Result<(), std::io::Error> {
+    let fixture = Fixture::new("pid-unlockable")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    let log = fixture.dir.join("error.log");
+    // The directory of the pid file does not exist, so the lock file cannot be created.
+    let pid = fixture.dir.join("missing").join("router.pid");
+    fixture.write(&router_config(
+        port,
+        &pid,
+        upstream.port,
+        &format!("default_status 421;\nerror_log {} info;", log.display()),
+    ))?;
+    let _router = Child(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&fixture.conf)
+            .env_remove("VIGILANT_HERON_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
+    assert!(
+        wait_for(port, "unknown.test", "/", 421).is_some(),
+        "the router did not serve with an unlockable pid file"
+    );
+    // The error log is written by its own task, so the line may come a moment after the answer.
+    let deadline = Instant::now() + READY;
+    loop {
+        let logged = std::fs::read_to_string(&log).unwrap_or_default();
+        if logged.contains("cannot lock the pid file") {
+            break;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::other(format!(
+                "no warning in the error log: {logged}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Ok(())
+}
+
+#[test]
 fn start_warns_when_error_log_goes_to_stderr() -> Result<(), std::io::Error> {
     let fixture = Fixture::new("start-warns")?;
     fixture.write(&router_config(
@@ -1570,5 +1615,314 @@ fn test_request_refuses_a_malformed_request_file_with_exit_one() -> Result<(), s
     assert!(output.stdout.is_empty(), "{}", text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("line 2"), "{stderr}");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// suggest-skip-rules: learn skip-rule candidates from a json access log
+// ---------------------------------------------------------------------------
+
+/// A `json` access log in which `GET /` with shape `p=<num>` is judged 50 times by 10
+/// clients on 3 days, with low scores and no block.
+fn learnable_access_log() -> String {
+    use std::fmt::Write as _;
+    let mut log = String::new();
+    for i in 0..50 {
+        let _ = writeln!(
+            log,
+            "{{\"time\":\"2026-01-{:02}T10:00:00Z\",\"client_ip\":\"192.0.2.{}\",\"site\":\"example.com\",\"method\":\"GET\",\"path\":\"/\",\"query_shape\":\"p=<num>\",\"action\":\"allow\",\"reason\":\"model\",\"would_have\":\"\",\"attack\":\"0.05\",\"ai_instruction\":\"0.02\"}}",
+            1 + i % 3,
+            1 + i % 10
+        );
+    }
+    log
+}
+
+#[test]
+fn suggest_skip_rules_prints_the_learned_candidate_and_its_rule() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-skip-rules")?;
+    let log = write_file(&dir, "access.json", &learnable_access_log())?;
+    let output = run(&["suggest-skip-rules", log.to_str().unwrap_or_default()])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("Candidates: 1"), "{stdout}");
+    assert!(stdout.contains("rule learned-1 {"), "{stdout}");
+    assert!(stdout.contains("query ~ \"^p=[0-9]{1,20}$\";"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn suggest_skip_rules_refuses_the_config_flag() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-skip-rules-config")?;
+    let log = write_file(&dir, "access.json", &learnable_access_log())?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = run(&[
+        "suggest-skip-rules",
+        log.to_str().unwrap_or_default(),
+        "-c",
+        conf.to_str().unwrap_or_default(),
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("suggest-skip-rules reads only the access log; -c is not used"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A configuration with a body limit of 10 bytes and one enforced site, for the body checks of `test-request`.
+fn body_limit_config() -> String {
+    "listen 127.0.0.1:8080;\nclient_max_body_size 10;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n}\n".to_owned()
+}
+
+#[test]
+fn test_request_accepts_a_body_of_exactly_the_limit_when_it_declares_it()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-body-exact")?;
+    let conf = write_file(&dir, "router.conf", &body_limit_config())?;
+    let output = test_request(
+        &dir,
+        "exact.txt",
+        "POST /upload HTTP/1.1\nHost: example.com\nContent-Length: 10\n\naaaaaaaaaa",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!stdout.contains("body: larger"), "{stdout}");
+    assert!(
+        stdout.contains("would be sent to the decision backend"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_accepts_a_declared_body_that_is_under_the_limit() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-body-under")?;
+    let conf = write_file(&dir, "router.conf", &body_limit_config())?;
+    let output = test_request(
+        &dir,
+        "under.txt",
+        "POST /upload HTTP/1.1\nHost: example.com\nContent-Length: 5\n\naaaaa",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!stdout.contains("body: larger"), "{stdout}");
+    assert!(
+        stdout.contains("would be sent to the decision backend"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_accepts_an_undeclared_body_of_exactly_the_limit() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-body-exact-undeclared")?;
+    let conf = write_file(&dir, "router.conf", &body_limit_config())?;
+    let output = test_request(
+        &dir,
+        "undeclared-exact.txt",
+        "POST /upload HTTP/1.1\nHost: example.com\n\naaaaaaaaaa",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!stdout.contains("body: larger"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn test_request_refuses_a_body_one_byte_over_the_limit_with_no_declared_length()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-body-over-undeclared")?;
+    let conf = write_file(&dir, "router.conf", &body_limit_config())?;
+    let output = test_request(
+        &dir,
+        "undeclared-over.txt",
+        "POST /upload HTTP/1.1\nHost: example.com\n\naaaaaaaaaaa",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("body: larger than client_max_body_size (10 bytes)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("result: rejected with 413 (body_too_large)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_refuses_a_declared_length_over_the_limit_even_when_the_sample_body_is_short()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-body-over-declared")?;
+    let conf = write_file(&dir, "router.conf", &body_limit_config())?;
+    let output = test_request(
+        &dir,
+        "declared-over.txt",
+        "POST /upload HTTP/1.1\nHost: example.com\nContent-Length: 20\n\naaaaa",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("result: rejected with 413 (body_too_large)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_refuses_a_declared_length_one_over_the_limit() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-body-one-over")?;
+    let conf = write_file(&dir, "router.conf", &body_limit_config())?;
+    let output = test_request(
+        &dir,
+        "declared-one-over.txt",
+        "POST /upload HTTP/1.1\nHost: example.com\nContent-Length: 11\n\naaaaaaaaaaa",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("result: rejected with 413 (body_too_large)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_the_limit_zones_of_the_location_the_path_selects()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-limit-zones")?;
+    let conf = write_file(
+        &dir,
+        "router.conf",
+        "listen 127.0.0.1:8080;\nlimit_req_zone $client_ip zone=perip:1m rate=10r/s;\nlimit_conn_zone $client_ip zone=conns:1m;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n    location /login {\n        limit_req zone=perip burst=2;\n        limit_conn conns 4;\n    }\n}\n",
+    )?;
+    let login = test_request(
+        &dir,
+        "login.txt",
+        "GET /login HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&login);
+    assert_eq!(login.status.code(), Some(0), "{}", text(&login));
+    assert!(
+        stdout.contains("limits: not simulated (counts depend on earlier requests); limit_req zones: perip; limit_conn zones: conns"),
+        "{stdout}"
+    );
+
+    let other = test_request(
+        &dir,
+        "other.txt",
+        "GET /other HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&other);
+    assert_eq!(other.status.code(), Some(0), "{}", text(&other));
+    assert!(
+        stdout.contains("limit_req zones: none; limit_conn zones: none"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_names_a_limit_zone_once_when_two_directives_use_it() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-limit-zone-once")?;
+    let conf = write_file(
+        &dir,
+        "router.conf",
+        "listen 127.0.0.1:8080;\nlimit_req_zone $client_ip zone=perip:1m rate=10r/s;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n    location /login {\n        limit_req zone=perip burst=2;\n        limit_req zone=perip burst=5;\n    }\n}\n",
+    )?;
+    let output = test_request(
+        &dir,
+        "twice.txt",
+        "GET /login HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("limit_req zones: perip; limit_conn zones: none"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_says_a_shadow_site_forwards_what_the_backend_decides() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("test-request-shadow-backend")?;
+    let shadow = write_file(
+        &dir,
+        "shadow.conf",
+        "listen 127.0.0.1:8080;\ndecision {\n    backend http;\n    url http://127.0.0.1:9/decide;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n    mode shadow;\n}\n",
+    )?;
+    let enforce = write_file(&dir, "enforce.conf", &config("127.0.0.1:8080", ""))?;
+    let request = "GET /search?q=hello HTTP/1.1\nHost: example.com\n\n";
+
+    let output = test_request(&dir, "shadow.txt", request, &shadow, &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("shadow mode: a verdict of attack"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("and the request would be forwarded to http://127.0.0.1:9/"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("otherwise the request would be forwarded"),
+        "{stdout}"
+    );
+
+    let output = test_request(&dir, "enforce.txt", request, &enforce, &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("otherwise the request would be forwarded to http://127.0.0.1:9/"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("shadow mode: a verdict"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn start_reports_a_router_that_exited_while_starting_without_waiting_out_the_timeout()
+-> Result<(), std::io::Error> {
+    let fixture = Fixture::new("start-exited")?;
+    let held = TcpListener::bind("127.0.0.1:0")?;
+    let port = held.local_addr()?.port();
+    fixture.write(&router_config(port, &fixture.pid, 9, ""))?;
+    let started = std::time::Instant::now();
+    let output = fixture.lifecycle("start")?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the router exited while starting"),
+        "a router that exits is reported as such, not as a missing pid file: {stderr}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the exit was not noticed until the startup timeout passed"
+    );
     Ok(())
 }
