@@ -285,6 +285,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_file_owned_by_another_user_in_a_shared_directory_is_refused() -> std::io::Result<()> {
+        let dir = scratch_dir("untrusted-owner", 0o777)?;
+        let path = dir.join("router.pid");
+        std::fs::write(&path, "4242\n")?;
+        let our_uid = geteuid().as_raw();
+        let refused = check_trusted(&path, "pid file", our_uid.wrapping_add(1));
+        let accepted = check_trusted(&path, "pid file", our_uid);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            refused.err().map(|error| error.kind()),
+            Some(ErrorKind::PermissionDenied)
+        );
+        accepted
+    }
+
     #[rstest]
     #[case::plain("2145", Some(2145))]
     #[case::trailing_newline("2145\n", Some(2145))]

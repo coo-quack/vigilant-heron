@@ -616,6 +616,45 @@ fn a_second_router_with_the_same_pid_file_exits() -> Result<(), std::io::Error> 
     Ok(())
 }
 
+/// The same refusal as `a_second_router_with_the_same_pid_file_exits`, with stderr written to a file.
+/// A piped stderr would block the test while a router that did not exit still holds it.
+#[test]
+fn a_second_router_with_the_same_pid_file_is_refused_when_stderr_goes_to_a_file()
+-> Result<(), std::io::Error> {
+    let fixture = Fixture::new("second-router-file")?;
+    let upstream = spawn_upstream()?;
+    let port = free_port()?;
+    fixture.write(&router_config(port, &fixture.pid, upstream.port, ""))?;
+    assert_eq!(fixture.lifecycle("start")?.status.code(), Some(0));
+
+    let second_conf = fixture.dir.join("second.conf");
+    std::fs::write(
+        &second_conf,
+        router_config(free_port()?, &fixture.pid, upstream.port, ""),
+    )?;
+    let stderr_path = fixture.dir.join("second.stderr");
+    let mut second = Child(
+        Command::new(BIN)
+            .arg("-c")
+            .arg(&second_conf)
+            .env_remove("VIGILANT_HERON_CONFIG")
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path)?))
+            .spawn()?,
+    );
+    let status = wait_for_exit(&mut second, Duration::from_secs(10));
+    let stderr = std::fs::read_to_string(&stderr_path)?;
+    assert_eq!(status.and_then(|status| status.code()), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "another router is using the pid file {}",
+            fixture.pid.display()
+        )),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 /// Starts the router in the foreground with `conf`, and waits until its pid file exists.
 fn foreground(conf: &Path, pid: &Path) -> Result<Child, std::io::Error> {
     let child = Child(

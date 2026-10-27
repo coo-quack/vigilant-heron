@@ -639,4 +639,29 @@ mod header_tests {
         }
         assert_eq!(upgrade_request(&headers).is_some(), expected);
     }
+
+    #[test]
+    fn text_after_a_braced_variable_is_kept() -> Result<(), ConfigError> {
+        let headers = HeaderMap::new();
+        let ctx = context(&headers);
+        let ops = [op("proxy_set_header X-Braced \"${client_ip}-end\";")?];
+        let out = upstream_headers(&HeaderMap::new(), peer_addr(), &ops, &ctx);
+        assert_eq!(
+            out.get("x-braced").map(HeaderValue::as_bytes),
+            Some(&b"203.0.113.7-end"[..])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_header_named_in_connection_is_removed_and_other_headers_stay() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("X-Trace"));
+        headers.insert("x-trace", HeaderValue::from_static("1"));
+        headers.insert("x-keep", HeaderValue::from_static("2"));
+        strip_hop_by_hop(&mut headers);
+        assert!(!headers.contains_key("x-trace"));
+        assert!(!headers.contains_key(CONNECTION));
+        assert!(headers.contains_key("x-keep"));
+    }
 }

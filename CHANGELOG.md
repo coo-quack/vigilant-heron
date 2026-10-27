@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Changed: a prefix `location` and a `^~` location with the same path in one site
+  are now rejected at load as a duplicate, as nginx rejects them. Before, both were
+  accepted and the first one written was used. A configuration that has such a pair
+  must keep one of them. An `=` location may still share its path with a prefix
+  location.
+
 ## v0.2.0 (2026-10-27)
 
 - Added: `check_request_with`, the library form of `check_request` that takes an

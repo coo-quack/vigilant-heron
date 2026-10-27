@@ -2035,14 +2035,14 @@ fn parse_site(
     let proxy_headers = site_headers.unwrap_or_else(|| top.headers.to_vec());
     let mut locations: Vec<LocationConfig> = Vec::new();
     for pending in pending_locations {
-        let duplicate = locations.iter().any(|earlier| {
-            earlier.matcher == pending.matcher
-                && !matches!(pending.matcher, limits::Matcher::Regex(_))
-        });
-        if duplicate {
+        if let Some(unique) = pending.matcher.unique_path()
+            && locations
+                .iter()
+                .any(|earlier| earlier.matcher.unique_path() == Some(unique))
+        {
             return Err(invalid(
                 pending.directive,
-                "duplicate \"location\" with the same modifier and path",
+                format!("duplicate \"location\" \"{}\"", unique.1),
             ));
         }
         locations.push(LocationConfig {
@@ -2663,6 +2663,21 @@ mod tests {
         assert_eq!(
             config.access_logs.first().map(|l| l.format.name.clone()),
             Some("json".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn access_log_accepts_stdout_and_stderr_as_destinations() -> Result<(), ConfigError> {
+        let out = parse(&format!("access_log stdout;\n{BASE}"))?;
+        assert_eq!(
+            out.access_logs.first().map(|l| l.destination.clone()),
+            Some(Destination::Stdout)
+        );
+        let err = parse(&format!("access_log stderr;\n{BASE}"))?;
+        assert_eq!(
+            err.access_logs.first().map(|l| l.destination.clone()),
+            Some(Destination::Stderr)
         );
         Ok(())
     }

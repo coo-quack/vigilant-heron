@@ -1161,6 +1161,24 @@ fn default_is_read_only_in_the_built_in_file(#[case] body: &str, #[case] accepte
 }
 
 #[test]
+fn default_on_is_refused_in_the_built_in_file() {
+    let text = parse_builtin_rule("description \"d\";\ndefault on;\naction block;\npath /x;")
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(text.contains("\"default\" must be \"off\""), "{text}");
+}
+
+#[test]
+fn patterns_are_equal_when_source_and_operator_are_equal() -> Result<(), String> {
+    let plain = Pattern::new("a+", false)?;
+    assert_eq!(plain, Pattern::new("a+", false)?);
+    assert_ne!(plain, Pattern::new("a+", true)?);
+    assert_ne!(plain, Pattern::new("b+", false)?);
+    Ok(())
+}
+
+#[test]
 fn default_off_is_refused_in_a_user_rule_with_its_line() {
     let text = message(config(
         "rule user-off {\n    description \"d\";\n    default off;\n    action block;\n    path /x;\n}\n",

@@ -654,6 +654,19 @@ pub(crate) enum Matcher {
     Regex(Pattern),
 }
 
+impl Matcher {
+    /// The path that nginx keeps unique among a site's plain locations: exact
+    /// paths among themselves, and prefix paths with or without `^~` together.
+    /// Regexes may repeat, so they have none.
+    pub(crate) fn unique_path(&self) -> Option<(bool, &str)> {
+        match self {
+            Self::Exact(path) => Some((true, path)),
+            Self::Prefix(path) | Self::PrefixPriority(path) => Some((false, path)),
+            Self::Regex(_) => None,
+        }
+    }
+}
+
 /// A compiled regex location.
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -1728,6 +1741,26 @@ mod tests {
         assert!(text.contains("duplicate \"location\""), "{text}");
     }
 
+    #[rstest]
+    #[case::prefix_then_priority("location /img/ { } location ^~ /img/ { }")]
+    #[case::priority_then_prefix("location ^~ /img/ { } location /IMG/ { }")]
+    #[case::exact_twice("location = /img/ { } location = /img/ { }")]
+    fn a_plain_path_used_twice_is_rejected_as_in_nginx(#[case] block: &str) {
+        let text = message(parse(&format!("{ONE}\n{TWO}"), block));
+        assert!(text.contains("duplicate \"location\" \"/img/\""), "{text}");
+    }
+
+    #[test]
+    fn an_exact_and_a_prefix_location_may_share_a_path_as_in_nginx() {
+        assert!(
+            parse(
+                &format!("{ONE}\n{TWO}"),
+                "location = /img/ { } location /img/ { }"
+            )
+            .is_ok()
+        );
+    }
+
     #[test]
     fn a_repeated_regex_location_is_accepted_as_in_nginx() {
         let text = message(parse(
@@ -1915,6 +1948,43 @@ mod tests {
         })?;
         assert!(select_location(&site.locations, "/other").is_none());
         Ok(())
+    }
+
+    /// A regex pattern built the way `parse_location` builds one.
+    fn regex_pattern(source: &str, caseless: bool) -> Result<Pattern, regex::Error> {
+        let compiled = if caseless {
+            format!("(?i){source}")
+        } else {
+            source.to_owned()
+        };
+        Ok(Pattern {
+            source: source.to_owned(),
+            caseless,
+            regex: regex::Regex::new(&compiled)?,
+        })
+    }
+
+    #[test]
+    fn regex_patterns_compare_by_source_and_operator() -> Result<(), regex::Error> {
+        let plain = regex_pattern("a+", false)?;
+        assert_eq!(plain, regex_pattern("a+", false)?);
+        assert_ne!(plain, regex_pattern("a+", true)?);
+        assert_ne!(plain, regex_pattern("b+", false)?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_regex_pattern_displays_its_source_as_written() -> Result<(), regex::Error> {
+        let pattern = regex_pattern(r"\.php$", true)?;
+        assert_eq!(pattern.to_string(), r"\.php$");
+        Ok(())
+    }
+
+    #[test]
+    fn a_key_digest_uses_both_halves_of_its_128_bits() {
+        let table = Table::new(1);
+        let high_half_used = (0..16).any(|n| table.digest(&format!("key-{n}")) >> 64 != 0);
+        assert!(high_half_used);
     }
 
     fn store(capacity: usize, interval_ns: u64) -> Arc<ZoneStore> {
