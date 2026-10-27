@@ -654,6 +654,19 @@ pub(crate) enum Matcher {
     Regex(Pattern),
 }
 
+impl Matcher {
+    /// The path that nginx keeps unique among a site's plain locations: exact
+    /// paths among themselves, and prefix paths with or without `^~` together.
+    /// Regexes may repeat, so they have none.
+    pub(crate) fn unique_path(&self) -> Option<(bool, &str)> {
+        match self {
+            Self::Exact(path) => Some((true, path)),
+            Self::Prefix(path) | Self::PrefixPriority(path) => Some((false, path)),
+            Self::Regex(_) => None,
+        }
+    }
+}
+
 /// A compiled regex location.
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -1726,6 +1739,26 @@ mod tests {
             "location /a { } location /A { }",
         ));
         assert!(text.contains("duplicate \"location\""), "{text}");
+    }
+
+    #[rstest]
+    #[case::prefix_then_priority("location /img/ { } location ^~ /img/ { }")]
+    #[case::priority_then_prefix("location ^~ /img/ { } location /IMG/ { }")]
+    #[case::exact_twice("location = /img/ { } location = /img/ { }")]
+    fn a_plain_path_used_twice_is_rejected_as_in_nginx(#[case] block: &str) {
+        let text = message(parse(&format!("{ONE}\n{TWO}"), block));
+        assert!(text.contains("duplicate \"location\" \"/img/\""), "{text}");
+    }
+
+    #[test]
+    fn an_exact_and_a_prefix_location_may_share_a_path_as_in_nginx() {
+        assert!(
+            parse(
+                &format!("{ONE}\n{TWO}"),
+                "location = /img/ { } location /img/ { }"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
