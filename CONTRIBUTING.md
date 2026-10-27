@@ -80,10 +80,11 @@ it opens or updates the issue "Weekly mutation testing: findings". When a later
 run is clean, it closes that issue. The full output is in the `mutants-*`
 artifacts of the run. The settings are in `.cargo/mutants.toml`.
 
-Every PR also runs the `mutants-diff` job, which mutates only the lines the PR
-changes (`cargo mutants --in-diff`). It fails when a test misses one of those
-mutants, and the job summary lists them. A PR that changes no Rust code passes at
-once. To run the same check before you push:
+Every PR to `develop` also runs the `mutants-diff` job, which mutates only the
+lines the PR changes (`cargo mutants --in-diff`). A PR from `develop` to `main`
+skips it, since the job already checked each change in its own PR. It fails when a
+test misses one of those mutants, and the job summary lists them. A PR that changes
+no Rust code passes at once. To run the same check before you push:
 
 ```bash
 git diff origin/develop...HEAD > pr.diff

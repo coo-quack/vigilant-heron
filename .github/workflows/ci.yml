@@ -187,6 +187,9 @@ jobs:
   # comes with tests that notice a change. A PR that changes no Rust code has no
   # mutants and passes at once. The weekly mutants.yml covers the whole tree.
   mutants-diff:
+    # A PR to main promotes develop, whose changes this job already checked in their own
+    # PR; mutating the whole release diff again does not fit in the time limit.
+    if: github.base_ref != 'main'
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
