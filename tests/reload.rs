@@ -155,6 +155,25 @@ async fn a_successful_reload_changes_the_answer_to_new_requests() -> TestResult 
     running.stop().await
 }
 
+// Two workers, so that a reload loop that never yields cannot starve the client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edited_file_is_not_applied_without_a_reload_request() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let file = temp_file("no-request.conf")?;
+    write(&file, &config(&stub.decide_url(), &upstream.url(), 421, ""))?;
+    let running = Running::start(&file).await?;
+
+    write(&file, &config(&stub.decide_url(), &upstream.url(), 404, ""))?;
+    // Give a reload that was never requested time to happen. The answer must not change.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        unknown_host_status(&running.base).await?,
+        StatusCode::MISDIRECTED_REQUEST
+    );
+    running.stop().await
+}
+
 #[tokio::test]
 async fn a_broken_file_keeps_the_previous_configuration() -> TestResult {
     let upstream = Upstream::start().await?;
