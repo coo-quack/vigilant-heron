@@ -1329,6 +1329,79 @@ mod tests {
         assert!(redacted.starts_with("\"\":{\"\":{"));
     }
 
+    #[test]
+    fn quoted_redact_field_names_are_redacted_in_lexical_text() {
+        let redact_fields = ["nickname".to_owned()];
+        assert_eq!(
+            redact_lexical("'nickname'=alice \"nickname\"=bob", &redact_fields),
+            "'nickname'=[REDACTED] \"nickname\"=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn a_malformed_json_string_with_spaces_is_redacted_whole() {
+        let redacted = redact(
+            Some("application/json"),
+            br#"{"password": "correct horse battery", "user": "alice""#,
+        );
+        assert_eq!(redacted, r#"{"password": "[REDACTED]", "user": "alice""#);
+    }
+
+    #[test]
+    fn a_closing_bracket_inside_a_string_does_not_end_a_sensitive_container() {
+        let redacted = redact(None, br#"{"password": {"x": "}", "y": "leakme"}, "#);
+        assert_eq!(redacted, r#"{"password": [REDACTED], "#);
+    }
+
+    #[rstest]
+    #[case::object(r#"{"password": {"a": {"b": 1}, "note": "TOPSECRET"}, "#)]
+    #[case::array(r#"{"password": [[1], "TOPSECRET"], "#)]
+    fn nested_containers_under_a_sensitive_key_are_redacted_whole(#[case] body: &str) {
+        assert_eq!(
+            redact(None, body.as_bytes()),
+            r#"{"password": [REDACTED], "#
+        );
+    }
+
+    #[test]
+    fn a_field_after_a_sensitive_container_in_malformed_json_is_kept() {
+        let redacted = redact(None, br#"{"password": {"a": 1}, "user": "alice""#);
+        assert_eq!(redacted, r#"{"password": [REDACTED], "user": "alice""#);
+    }
+
+    /// Malformed bodies that drive every scanning loop of the redaction. Each loop must
+    /// finish, and must redact the secret. A mutant that stops a loop from advancing is
+    /// reported here in seconds rather than at the mutation timeout.
+    #[test]
+    fn scanning_loops_finish_and_redact_on_malformed_bodies() {
+        let secret = "zq-leak-7";
+        let bodies = [
+            format!(r#"{{"note": "a\"b", "password": "{secret}", "#),
+            format!(r#"{{"password" : "{secret}", "#),
+            format!(r#"{{"password": {secret}, "#),
+            format!(r#"{{"password": {{"a": {{"b": 1}}, "note": "{secret}"}}, "#),
+            format!("<a><password>{secret}</password><b>x</b>"),
+            format!("<>x<password>{secret}</password>"),
+        ];
+        let outputs = finishes_within(Duration::from_secs(10), move || {
+            bodies
+                .iter()
+                .map(|body| redact(None, body.as_bytes()))
+                .collect::<Vec<_>>()
+        });
+        for output in outputs {
+            assert!(!output.contains(secret), "{output}");
+        }
+    }
+
+    #[test]
+    fn truncation_at_a_multibyte_boundary_finishes_and_keeps_whole_characters() {
+        let (text, cut) = finishes_within(Duration::from_secs(10), || {
+            truncate_utf8("日本語".to_owned(), 4)
+        });
+        assert_eq!((text.as_str(), cut), ("日", true));
+    }
+
     proptest! {
         #[test]
         fn lazy_value_end_redacts_exactly_what_the_eager_version_did(
