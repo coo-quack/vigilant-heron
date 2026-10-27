@@ -330,6 +330,18 @@ mod tests {
     }
 
     #[test]
+    fn the_wait_reports_failure_once_its_limit_has_passed_and_does_not_probe_on() {
+        let calls = Cell::new(0_u32);
+        let done = wait_until(Duration::ZERO, Duration::ZERO, || {
+            calls.set(calls.get() + 1);
+            // Ends a wait that never gives up, so a broken wait fails here instead of hanging.
+            calls.get() >= 1000
+        });
+        assert!(!done, "the wait reported success after its limit");
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
     fn a_pid_file_that_cannot_be_read_is_an_error_not_an_absent_router() -> anyhow::Result<()> {
         let dir =
             std::env::temp_dir().join(format!("vh-live-pid-unreadable-{}", std::process::id()));
