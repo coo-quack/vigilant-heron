@@ -573,6 +573,45 @@ mod tests {
         assert_eq!(parse_args(&args(input)), Err(message.to_owned()));
     }
 
+    #[rstest]
+    #[case::before_help(&["-h", "--bogus"])]
+    #[case::inside_suggest_skip_rules(&["suggest-skip-rules", "--bogus", "log.json"])]
+    #[case::inside_test_request(&["test-request", "--bogus", "req.txt"])]
+    fn an_unknown_option_is_refused_wherever_it_appears(#[case] input: &[&str]) {
+        assert_eq!(
+            parse_args(&args(input)),
+            Err("unknown option \"--bogus\"".to_owned())
+        );
+    }
+
+    #[test]
+    fn positive_suggest_thresholds_are_read_as_given() -> Result<(), String> {
+        let command = parse_args(&args(&[
+            "suggest-skip-rules",
+            "log.json",
+            "--min-judged",
+            "60",
+            "--min-clients",
+            "12",
+            "--min-days",
+            "4",
+            "--max-attack",
+            "0.2",
+            "--max-ai-instruction",
+            "0.25",
+        ]))?
+        .command;
+        let Command::SuggestSkipRules { options, .. } = command else {
+            return Err("not a suggest-skip-rules command".to_owned());
+        };
+        assert_eq!(options.min_judged, 60);
+        assert_eq!(options.min_clients, 12);
+        assert_eq!(options.min_days, 4);
+        assert!((options.max_attack - 0.2).abs() < f64::EPSILON);
+        assert!((options.max_ai_instruction - 0.25).abs() < f64::EPSILON);
+        Ok(())
+    }
+
     fn test_request(file: &str, client: IpAddr) -> Command {
         Command::TestRequest {
             file: PathBuf::from(file),

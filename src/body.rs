@@ -378,4 +378,10 @@ mod tests {
         };
         assert!(!truncated.is_empty_body());
     }
+
+    #[test]
+    fn body_too_large_names_the_limit_directive() {
+        let message = BodyTooLarge.to_string();
+        assert!(message.contains("client_max_body_size"), "{message}");
+    }
 }

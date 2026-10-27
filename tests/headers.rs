@@ -210,3 +210,26 @@ async fn a_bad_operation_fails_to_load_with_its_line() -> Result<(), BoxError> {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_request_without_a_body_is_forwarded_without_a_content_length() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream.url(), "", "")).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/forwarded",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    // Forwarding keeps the request as the client sent it: no length header is added.
+    let echo = reply.json();
+    assert_eq!(received(&echo, "content-length"), None);
+    assert_eq!(received(&echo, "transfer-encoding"), None);
+    proxy.stop().await
+}

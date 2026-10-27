@@ -689,6 +689,21 @@ mod tests {
         assert!(LogFormat::compile("x", Escape::Default, "$http_x_other", &redact).is_ok());
     }
 
+    #[test]
+    fn a_braced_variable_name_ends_at_the_first_character_outside_the_name() {
+        assert!(LogFormat::compile("x", Escape::Default, "${http_x-y}", &[]).is_err());
+        assert!(LogFormat::compile("x", Escape::Default, "${http_x}-y", &[]).is_ok());
+    }
+
+    #[test]
+    fn braced_variable_names_may_contain_underscores() {
+        let headers = HeaderMap::new();
+        assert_eq!(
+            render("${input_tokens}", Escape::Default, &record(at(0)), &headers),
+            "1234"
+        );
+    }
+
     #[rstest]
     #[case::unknown("$no_such_variable")]
     #[case::lone_dollar("cost $ 5")]

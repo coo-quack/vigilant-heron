@@ -607,3 +607,28 @@ async fn a_transport_refusal_is_logged_with_the_client_address() -> TestResult {
     assert_eq!(fields.get(2), Some(&"127.0.0.1"), "{line}");
     proxy.stop().await
 }
+
+#[tokio::test]
+async fn the_access_log_keeps_writing_to_a_moved_file_until_sigusr1() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("moved");
+    let moved = log_path("moved-away");
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&moved);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    get_with_id(&proxy.base(), "/articles", "moved-1").await?;
+    wait_for_line(&path, "moved-1").await?;
+    std::fs::rename(&path, &moved)?;
+    get_with_id(&proxy.base(), "/articles", "moved-2").await?;
+    wait_for_line(&moved, "moved-2").await?;
+    // No SIGUSR1 was sent, so the log must not have reopened the path.
+    let at_path = std::fs::read_to_string(&path).unwrap_or_default();
+    assert!(
+        !at_path.contains("moved-2"),
+        "the access log reopened its file without a signal"
+    );
+    proxy.stop().await
+}
