@@ -220,6 +220,22 @@ mod tests {
         assert!(parse_str(&source).is_err());
     }
 
+    #[test]
+    fn blocks_nested_to_the_documented_limit_are_accepted() {
+        let source = format!("{}{}", "a {".repeat(MAX_DEPTH), "}".repeat(MAX_DEPTH));
+        assert!(parse_str(&source).is_ok());
+    }
+
+    #[test]
+    fn one_block_past_the_documented_limit_is_an_error() {
+        let source = format!(
+            "{}{}",
+            "a {".repeat(MAX_DEPTH + 1),
+            "}".repeat(MAX_DEPTH + 1)
+        );
+        assert!(parse_str(&source).is_err());
+    }
+
     proptest::proptest! {
         #[test]
         fn parsing_never_panics(source in "[a-z0-9 ;{}\"'#\\\\\n]{0,200}") {

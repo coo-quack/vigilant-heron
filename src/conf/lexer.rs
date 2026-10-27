@@ -254,6 +254,24 @@ mod tests {
         assert_eq!(tokens.last().map(|t| t.line), Some(3));
     }
 
+    #[test]
+    fn a_backslash_newline_inside_a_string_counts_one_line() {
+        let tokens = tokenize("\"a\\\nb\"\nc").unwrap_or_default();
+        assert_eq!(tokens.last().map(|t| t.line), Some(3));
+    }
+
+    #[test]
+    fn other_escapes_inside_a_string_do_not_count_lines() {
+        let tokens = tokenize("\"C:\\path\"\nc").unwrap_or_default();
+        assert_eq!(tokens.last().map(|t| t.line), Some(2));
+    }
+
+    #[test]
+    fn braces_end_a_word_without_whitespace() {
+        assert_eq!(words("a}b"), ["a", "b"]);
+        assert_eq!(words("a{b"), ["a", "b"]);
+    }
+
     proptest::proptest! {
         #[test]
         fn lexing_never_panics(source in "\\PC{0,200}") {
