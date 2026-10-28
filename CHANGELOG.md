@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 (2026-10-29)
 
 - Added: the site directive `static_query_params <name> ...;` lets a static asset
   request with a cache-busting query, such as WordPress's `?ver=6.8.3`, skip the
