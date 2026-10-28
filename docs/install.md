@@ -192,6 +192,66 @@ real_ip_header CF-Connecting-IP;
 
 Cloudflare publishes its ranges and changes them now and then. A range that is missing from `real_ip_from` makes requests from it look like they come from Cloudflare.
 
+### Try shadow mode beside a live site with an nginx mirror
+
+To measure the router on real traffic without putting it in the response path, let nginx send it a copy of each request with the [`mirror`](https://nginx.org/en/docs/http/ngx_http_mirror_module.html) module. nginx serves the site as before and discards the router's answers. The router forwards its copy to a sink that answers 204, so a POST does not run twice.
+
+```nginx
+# In the site's server block.
+mirror /__vh_mirror;
+mirror_request_body on;
+
+location = /__vh_mirror {
+    internal;
+    proxy_pass http://127.0.0.1:8090$request_uri;   # the router; the original URI
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    # Remove any header that only the origin may see, such as a secret your CDN adds.
+    # proxy_set_header X-Origin-Secret "";
+    proxy_connect_timeout 200ms;
+    proxy_send_timeout 2s;
+    proxy_read_timeout 2s;
+    access_log off;
+}
+
+# The sink that the router forwards to.
+server {
+    listen 127.0.0.1:8091;
+    access_log off;
+    location / { return 204; }
+}
+```
+
+On the router, the site is in shadow mode, forwards to the sink, and trusts `X-Real-IP` from nginx only:
+
+```nginx
+real_ip_from 127.0.0.1;
+real_ip_header X-Real-IP;
+
+site example.com {
+    upstream http://127.0.0.1:8091;
+    mode shadow;
+}
+```
+
+The short timeouts bound how long nginx waits on a slow or stopped router.
+
+Two things change what the router sees:
+
+- **Requests that nginx answers before the mirror runs are not copied**, such as a `return` in a `location`. The router's counts then cover only the requests nginx passes on.
+- **An internal redirect after the mirror has run copies the request again.** The `index` directive is one: nginx turns `/` into `/index.php` and runs the mirror a second time, so every request for `/` is logged and judged twice. Two lines with the same time, client, method and path show it. For PHP, pass `/` to PHP without the redirect:
+
+  ```nginx
+  location = / {
+      include snippets/fastcgi-php.conf;   # fastcgi_index makes the script /index.php
+      fastcgi_pass unix:/run/php/php-fpm.sock;
+  }
+  ```
+
+The status in the router's log is the sink's 204, not the site's. To stop the trial, remove the `mirror` lines and reload nginx.
+
 ## Run as a service with systemd
 
 To run the router as a service, run it in the foreground under systemd, not with `start`. systemd then restarts it when it crashes, reloads it on `systemctl reload`, and stops it gracefully. This unit assumes a system user `vigilant-heron`, a binary in `/usr/local/bin`, and the configuration in `/etc/vigilant-heron`. The configuration must set the pid file in the runtime directory:
