@@ -12,6 +12,12 @@ standard library.
   `path`, `query`, `headers`, `content_type`, `body`) and `note`. All data is
   synthetic: example.com and example.jp hosts, 192.0.2.x, 198.51.100.x and
   203.0.113.x addresses.
+- `dataset/field.jsonl`: requests seen in a shadow trial on a live WordPress
+  site that the model scored close to `block_threshold` from either side, or
+  missed. Each `note` gives the score seen there. Only the request shapes are
+  kept: the host is example.com and no client data is included. The set is
+  small, so read it row by row as a regression check when prompts, thresholds
+  or rules change, not as a rate. `--split both` does not include it.
 - `config.template.conf`: the router configuration. It uses the Clef backend,
   enforce mode, `block_threshold = 0.5`, `debug_headers = true`, and empty
   `deny_paths`, `fail_closed_path` and `static_extensions`. An empty
@@ -69,7 +75,7 @@ python3 -I eval/run.py --clef-url "https://api.cloudflare.com/client/v4/accounts
 
 Options:
 
-- `--split dev|holdout|both` (default `both`)
+- `--split dev|holdout|both|field` (default `both`, which is dev and holdout)
 - `--limit N`: at most N rows of each split
 - `--max-yen X` (default 30): the budget in JPY for base spend plus this run
 - `--spent-yen X` (default 0): JPY that earlier runs spent. Each run starts from
