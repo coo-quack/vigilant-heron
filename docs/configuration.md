@@ -659,7 +659,7 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params)) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
 
 ### `static_location`
 
@@ -668,6 +668,23 @@ File extensions of plain GET or HEAD requests with no query and no body that ski
 - **Context:** site.
 
 Path prefixes under which the static skip (`static_extensions`) may apply. Every path reading must start with one of them, so `/static/..;/img/a.css` is inspected. Compared lowercased. Repeatable; each prefix must start with `/`. Set it when the static files live in known directories, so that a static extension elsewhere is always inspected.
+
+### `static_query_params`
+
+- **Syntax:** `static_query_params <name> ...;`
+- **Default:** none. A static asset request with any query is inspected.
+- **Context:** site.
+
+Query parameters that a static asset request may carry and still skip the backend, such as the `ver` that WordPress adds to every stylesheet and script (`/style.css?ver=6.8.3`). The query must be made only of these parameters, each written as `name=value` with a value of 1 to 64 ASCII letters, digits, `.`, `_` or `-`. The value is checked as received, so an escape (`%`), a `+`, an empty value, an empty query or any other parameter sends the request to the backend. Names are compared as written, with their case. The other conditions of the static skip still apply, and block rules run before it. Repeatable; each name is 1 to 64 letters, digits, `_` or `-`.
+
+A page view loads many such assets at once. Without this directive each of them goes to the backend, which costs a call each and can exceed `max_concurrency_per_client` for an ordinary visitor.
+
+```nginx
+site example.com {
+    upstream http://127.0.0.1:8081;
+    static_query_params ver;    # WordPress: /wp-includes/js/jquery/jquery.min.js?ver=3.7.1
+}
+```
 
 ### `debug_headers`
 

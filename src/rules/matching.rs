@@ -212,9 +212,9 @@ impl<'a> RuleInput<'a> {
         }
     }
 
-    /// Whether the request has a query string, even an empty one.
-    pub(crate) fn has_query(&self) -> bool {
-        self.query.is_some()
+    /// The raw query string, if the request has one, even an empty one.
+    pub(crate) fn raw_query(&self) -> Option<&'a str> {
+        self.query
     }
 
     fn query_text(&self) -> &str {
