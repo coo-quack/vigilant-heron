@@ -475,7 +475,7 @@ def start_stub_if_needed():
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--backend", choices=sorted(BACKENDS), default="clef")
-    parser.add_argument("--split", choices=["dev", "holdout", "both"], default="both")
+    parser.add_argument("--split", choices=["dev", "holdout", "both", "field"], default="both")
     parser.add_argument("--offline", action="store_true", help="use the stub decider instead of the provider")
     parser.add_argument("--clef-url", help="full clef-flash endpoint URL (Clef, without --offline)")
     parser.add_argument("--jev-url", default=JEV_DEFAULT_URL, help="System One endpoint for Jev")

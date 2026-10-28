@@ -32,7 +32,8 @@ decides the request ends the evaluation.
    It is skipped only when every [path reading](#path-readings) ends in a static
    extension with no earlier script extension, the raw path has no `;`, `\`, `%2F`,
    `%5C` or `%3B`, and no `fail_closed_path` matches. A `static_location` restricts
-   it to some prefixes.
+   it to some prefixes. A query made only of `static_query_params` parameters with
+   plain values, such as `?ver=6.8.3`, counts as no query.
 7. **Decision model.** The request is sent to the backend, and the policy
    compares the returned scores with `block_threshold` and
    `instruction_threshold`. The outcome is `model` when a threshold is reached and
@@ -98,7 +99,7 @@ group, so `on_decision_error` never applies to it.
 
 Attackers can try a denial-of-service (DoS) attack against the decision backend: they keep many requests in flight so that the concurrency slots stay full, and the requests of other clients then fail in the rate-limit group. With `on_rate_limit allow`, a DoS attack of this kind makes requests skip the model. The router limits it per client with `decision` `max_concurrency_per_client` (default 8, and at most `max_concurrency`): a client that already has its share of calls in flight is refused at once with `decision_error=client_busy`, and only that client follows `on_client_busy`, so other clients keep being judged. This cap does not prevent a DoS attack from many addresses. For a site that prefers safety over availability, keep `on_client_busy block` and set `on_rate_limit block`, and limit each client with `limit_req` and `limit_conn`.
 
-A client over its share can also be a legitimate user. Behind a shared address, such as an office or school NAT, or behind a proxy whose client address is not set up with `real_ip_from`, many users look like one client, and they can get the 429. Raise `max_concurrency_per_client`, or set `on_client_busy allow`, so that the excess skips the model while rules still apply.
+A client over its share can also be a legitimate user. Behind a shared address, such as an office or school NAT, or behind a proxy whose client address is not set up with `real_ip_from`, many users look like one client, and they can get the 429. Raise `max_concurrency_per_client`, or set `on_client_busy allow`, so that the excess skips the model while rules still apply. A single visitor can also exceed it when a page loads many assets with a cache-busting query, such as WordPress's `?ver=`, because each one goes to the model. Set [`static_query_params`](/configuration#static-query-params) so that those assets take the static skip.
 
 Two more rules apply to failures:
 

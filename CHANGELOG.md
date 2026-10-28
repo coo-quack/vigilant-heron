@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.4.0 (2026-10-29)
+
+- Added: the site directive `static_query_params <name> ...;` lets a static asset
+  request with a cache-busting query, such as WordPress's `?ver=6.8.3`, skip the
+  backend. The query must be made only of the listed parameters, each with a plain
+  value of 1 to 64 letters, digits, `.`, `_` or `-`. Before, any query sent the
+  request to the backend, so a page view sent every such asset there and could hit
+  `max_concurrency_per_client`. Unset, the static skip still requires no query.
+
 ## v0.3.0 (2026-10-28)
 
 - Changed: a prefix `location` and a `^~` location with the same path in one site

@@ -172,6 +172,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "fail_closed_path",
     "static_extensions",
     "static_location",
+    "static_query_params",
     "debug_headers",
     "access_log",
     "allow",
@@ -433,6 +434,8 @@ pub struct SiteConfig {
     pub static_extensions: Vec<String>,
     /// Path prefixes under which a static skip may apply, lowercased. Empty means anywhere.
     pub static_locations: Vec<String>,
+    /// Query parameters, such as `ver`, that a static asset request may carry and still skip.
+    pub static_query_params: Vec<String>,
     /// Whether responses carry the `x-vigilant-heron` header.
     pub debug_headers: bool,
     /// The site's own access logs. `None` inherits the top-level ones; `Some(empty)` is `access_log off`.
@@ -1837,6 +1840,7 @@ fn parse_site(
     let mut on_decision_error = FailureAction::Allow;
     let mut static_extensions: Option<Vec<String>> = None;
     let mut static_locations: Vec<String> = Vec::new();
+    let mut static_query_params: Vec<String> = Vec::new();
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
@@ -1969,6 +1973,29 @@ fn parse_site(
                     }
                 }
                 static_locations.extend(child.args.iter().map(|p| p.to_ascii_lowercase()));
+            }
+            "static_query_params" => {
+                if child.args.is_empty() {
+                    return Err(invalid(
+                        child,
+                        "\"static_query_params\" needs at least one parameter name",
+                    ));
+                }
+                for name in &child.args {
+                    let valid = (1..=64).contains(&name.len())
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+                    if !valid {
+                        return Err(invalid(
+                            child,
+                            format!(
+                                "\"static_query_params\" name must be 1 to 64 letters, digits, _ or -: {name}"
+                            ),
+                        ));
+                    }
+                }
+                static_query_params.extend(child.args.iter().cloned());
             }
             "debug_headers" => {
                 once(&mut seen, child)?;
@@ -2111,6 +2138,7 @@ fn parse_site(
                 .collect()
         }),
         static_locations,
+        static_query_params,
         debug_headers,
         access_logs,
         timeouts,
@@ -2807,6 +2835,35 @@ mod tests {
             message(parse(&with_site("    static_location;\n")))
                 .contains("\"static_location\" needs at least one path prefix")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_params_keep_their_case_and_must_be_plain_names() -> Result<(), ConfigError> {
+        let config = parse(&with_site(
+            "    static_query_params ver;\n    static_query_params V_1;\n",
+        ))?;
+        assert_eq!(first_site(&config)?.static_query_params, ["ver", "V_1"]);
+        let unset = parse(&with_site(""))?;
+        assert_eq!(
+            first_site(&unset)?.static_query_params,
+            Vec::<String>::new()
+        );
+        assert!(
+            message(parse(&with_site("    static_query_params;\n")))
+                .contains("\"static_query_params\" needs at least one parameter name")
+        );
+        for bad in ["ver=1", "a.b", "%76er", &"v".repeat(65)] {
+            assert!(
+                message(parse(&with_site(&format!(
+                    "    static_query_params {bad};\n"
+                ))))
+                .contains(&format!(
+                    "\"static_query_params\" name must be 1 to 64 letters, digits, _ or -: {bad}"
+                )),
+                "{bad}"
+            );
+        }
         Ok(())
     }
 

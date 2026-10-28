@@ -3,7 +3,7 @@
 This page takes you from nothing to a blocked request in about ten minutes. You will write one small configuration file, check it, run the router, and send it a test attack.
 
 ::: warning Status
-vigilant-heron is in early development. Run every new site in shadow mode first, and read the log before you enforce anything.
+vigilant-heron is in early development. Run every new site in shadow mode first, and read the log before you enforce anything. To try it beside a live site without changing its responses, see [Try shadow mode beside a live site with an nginx mirror](/install#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror).
 :::
 
 ## 1. Install
