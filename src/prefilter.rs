@@ -210,8 +210,10 @@ pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
 ///
 /// Every condition must hold:
 ///
-/// - a GET or HEAD with no query, no body and the raw path free of `;`, `\`, `%2F`,
-///   `%5C` and `%3B` (case-insensitive);
+/// - a GET or HEAD with no body and the raw path free of `;`, `\`, `%2F`, `%5C` and
+///   `%3B` (case-insensitive);
+/// - no query, or one made only of `static_query_params` parameters, see
+///   [`cache_busters_only`];
 /// - under a `static_location` prefix, when the site sets any: every view starts with one;
 /// - in every view, the last segment has a static extension and no earlier segment
 ///   has a script extension;
@@ -225,7 +227,13 @@ pub(crate) fn static_skip(
     body_is_empty: bool,
 ) -> bool {
     let plain_read = *input.method == Method::GET || *input.method == Method::HEAD;
-    if !(plain_read && !input.has_query() && body_is_empty) {
+    if !(plain_read && body_is_empty) {
+        return false;
+    }
+    if input
+        .raw_query()
+        .is_some_and(|query| !cache_busters_only(site, query))
+    {
         return false;
     }
     let raw = input.raw_path.to_ascii_lowercase();
@@ -242,6 +250,30 @@ pub(crate) fn static_skip(
         return false;
     }
     views.iter().all(|view| is_static_view(site, view)) && !fails_closed(site, views)
+}
+
+/// Longest value of a `static_query_params` parameter that keeps the static skip.
+const MAX_CACHE_BUSTER_LEN: usize = 64;
+
+/// Returns true when a raw query is made only of the site's `static_query_params`,
+/// such as the `?ver=6.8.3` that `WordPress` adds.
+///
+/// Each `&`-separated part must be `name=value` with a listed name, compared as
+/// received, and a value of 1 to 64 ASCII letters, digits, `.`, `_` or `-`. The value
+/// is checked raw, so an escape (`%`) or a `+` makes the request inspected. An empty
+/// query, an empty part and any other parameter do too.
+fn cache_busters_only(site: &SiteConfig, query: &str) -> bool {
+    query.split('&').all(|part| {
+        part.split_once('=').is_some_and(|(name, value)| {
+            site.static_query_params
+                .iter()
+                .any(|allowed| allowed == name)
+                && (1..=MAX_CACHE_BUSTER_LEN).contains(&value.len())
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+    })
 }
 
 /// Returns true when a lowercase view ends in a static extension and no earlier segment
@@ -506,6 +538,85 @@ mod tests {
         );
         assert_eq!(
             screen_path(&config, &Method::GET, "/other/x.css", false, true),
+            Screening::Skip
+        );
+        Ok(())
+    }
+
+    /// Screens a GET of `raw_path?query` with no body.
+    fn screen_query(site: &SiteConfig, raw_path: &str, query: &str) -> Screening {
+        let headers = HeaderMap::new();
+        let client = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let input = RuleInput::new(&Method::GET, raw_path, Some(query), &headers, &[], client);
+        screen(site, &input, &lower_views(raw_path), true)
+    }
+
+    #[rstest]
+    #[case::wordpress_version("ver=6.8.3", Screening::Skip)]
+    #[case::hash("ver=979b8d030d", Screening::Skip)]
+    #[case::two_listed("ver=1&v=a_b-c", Screening::Skip)]
+    #[case::longest_value(&format!("ver={}", "a".repeat(64)), Screening::Skip)]
+    #[case::value_too_long(&format!("ver={}", "a".repeat(65)), Screening::Inspect)]
+    #[case::empty_query("", Screening::Inspect)]
+    #[case::empty_value("ver=", Screening::Inspect)]
+    #[case::no_value("ver", Screening::Inspect)]
+    #[case::empty_part("ver=1&", Screening::Inspect)]
+    #[case::other_parameter("ver=1&x=1", Screening::Inspect)]
+    #[case::unlisted_only("x=1", Screening::Inspect)]
+    #[case::name_case_differs("VER=1", Screening::Inspect)]
+    #[case::escaped_value("ver=%3Cscript%3E", Screening::Inspect)]
+    #[case::plus_in_value("ver=1+1", Screening::Inspect)]
+    #[case::slash_in_value("ver=../../etc/passwd", Screening::Inspect)]
+    #[case::second_equals("ver=1=2", Screening::Inspect)]
+    fn static_query_params_let_only_listed_plain_values_skip(
+        #[case] query: &str,
+        #[case] expected: Screening,
+    ) -> Result<(), ConfigError> {
+        // Built-in rules would catch some of these first; this checks the static skip alone.
+        let config = site("static_query_params ver v;\n    builtin_rules off;")?;
+        assert_eq!(
+            screen_query(&config, "/wp-includes/js/jquery.min.js", query),
+            expected,
+            "{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::no_directive("", "/a.css", "ver=1")]
+    #[case::not_static("static_query_params ver;", "/index.php", "ver=1")]
+    #[case::script_earlier("static_query_params ver;", "/index.php/x.css", "ver=1")]
+    #[case::outside_static_location(
+        "static_query_params ver;\n    static_location /static/;",
+        "/img/a.css",
+        "ver=1"
+    )]
+    fn static_query_params_do_not_widen_the_rest_of_the_static_skip(
+        #[case] fields: &str,
+        #[case] raw_path: &str,
+        #[case] query: &str,
+    ) -> Result<(), ConfigError> {
+        let config = site(fields)?;
+        assert_eq!(
+            screen_query(&config, raw_path, query),
+            Screening::Inspect,
+            "{raw_path}?{query}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_block_rule_still_runs_before_a_static_skip_with_a_cache_buster() -> Result<(), ConfigError>
+    {
+        let config = site(
+            "static_query_params ver;\n    rule no-old-jquery {\n        description \"old jquery\";\n        action block;\n        query ~ \"^ver=1\\.\";\n    }",
+        )?;
+        assert_eq!(
+            screen_query(&config, "/jquery.js", "ver=1.12.4"),
+            Screening::Rule(Some(Arc::from("no-old-jquery")))
+        );
+        assert_eq!(
+            screen_query(&config, "/jquery.js", "ver=3.7.1"),
             Screening::Skip
         );
         Ok(())
