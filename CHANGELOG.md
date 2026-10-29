@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.1 (2026-10-29)
+
+- Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more
+  `allow` rows: views of the WordPress login page after a redirect from wp-admin,
+  which Clef-flash scored up to 0.91 in a shadow trial. The router itself is
+  unchanged from v0.4.0.
+
 ## v0.4.0 (2026-10-29)
 
 - Added: the site directive `static_query_params <name> ...;` lets a static asset
