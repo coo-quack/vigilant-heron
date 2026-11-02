@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    BoxError, StubDecider, TestResult, Upstream, json_response, send, spawn_server, start_proxy,
+    BoxError, StubDecider, TestResult, Upstream, json_response, request_id_header, send,
+    spawn_server, start_proxy,
 };
 use http::{Method, Request, StatusCode};
 use hyper::body::Incoming;
@@ -697,5 +698,46 @@ async fn a_refused_request_is_answered_without_the_delay_of_another_limit() -> T
         elapsed < Duration::from_millis(500),
         "the refused request waited {elapsed:?}; the delay of one second must not apply"
     );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_limit_rejection_carries_the_request_id_header() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let log = log_path("rejection-request-id");
+    let _ = std::fs::remove_file(&log);
+    let top = "request_id_header x-request-id;\nlimit_req_zone $client_ip zone=login:1m rate=1r/m;";
+    let site = "location /wp-login.php {\n        limit_req zone=login burst=0;\n        limit_req_status 429;\n    }";
+    let proxy = start_proxy(&config(
+        &log,
+        &decider.decide_url(),
+        &upstream.url(),
+        top,
+        site,
+    ))
+    .await?;
+    let _ = send(
+        &proxy.base(),
+        Method::POST,
+        LOGIN,
+        "example.com",
+        &[("x-request-id", "limit-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    let limited = send(
+        &proxy.base(),
+        Method::POST,
+        LOGIN,
+        "example.com",
+        &[("x-request-id", "limit-id-2")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(limited.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(request_id_header(&limited), "limit-id-2");
     proxy.stop().await
 }

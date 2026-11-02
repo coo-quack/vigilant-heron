@@ -203,7 +203,8 @@ const JSON_TEMPLATE: &str = concat!(
     r#""action":"$action","reason":"$reason","rule_id":"$rule_id","would_have":"$would_have","attack":"$attack","#,
     r#""ai_instruction":"$ai_instruction","category":"$category","#,
     r#""decision_error":"$decision_error","retry_after":"$retry_after","#,
-    r#""input_tokens":"$input_tokens","latency_ms":"$latency_ms"}"#
+    r#""input_tokens":"$input_tokens","latency_ms":"$latency_ms","#,
+    r#""user_agent":"$http_user_agent"}"#
 );
 
 /// The built-in `main` template. The free-text values are quoted, so a value with spaces or `=` cannot add a field.

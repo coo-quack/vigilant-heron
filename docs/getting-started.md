@@ -104,7 +104,7 @@ curl -i "http://127.0.0.1:8080/?id=1%20UNION%20SELECT%20password%20FROM%20users"
   -H "Host: example.com"
 ```
 
-The response is now `403 Forbidden`, and the upstream never sees the request. The normal request from step 6 still returns `200 OK`.
+The response is now `403 Forbidden`, and the upstream never sees the request. Its body is one line that names the request id, and the same id is in the `X-Request-ID` header and in the access log. The normal request from step 6 still returns `200 OK`.
 
 On a real site, check the same things before you rely on enforce, and keep a way back. [From shadow mode to enforce](/rollout) lists the checks to run right after the switch.
 
