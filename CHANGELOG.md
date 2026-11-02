@@ -2,22 +2,6 @@
 
 ## v0.5.0 (2026-11-03)
 
-- Changed: the packaged logrotate file also rotates `/var/log/vigilant-heron/*.json`, so the
-  JSON access log that the installation guide now suggests is rotated too.
-
-- Changed: the install script's next steps and the install guide now suggest
-  `access_log /var/log/vigilant-heron/access.json json;` instead of a `main` access log at
-  `access.log`, because the guide's tools, `shadow-report` and `suggest-skip-rules`, read the
-  json format. The router itself is unchanged.
-
-- Changed: the guide [From shadow mode to enforce](docs/rollout.md) and the rollout skill now
-  point to the features added since they were written: the packaged `install.sh` and systemd
-  unit, the WordPress skip rules, `test-request --url` and checks without the API token,
-  `$block_query`, request ids, `shadow-report`, the redaction of file parts and the 2000 ms
-  default `timeout`.
-  Its User-Agent advice now uses the `user_agent` key of the JSON log. The router itself is
-  unchanged.
-
 - Added: `skills/vigilant-heron-rollout/SKILL.md`, an agent skill that drives the guide
   [From shadow mode to enforce](docs/rollout.md) on a real server: the seven phases as a
   checklist with the gate before each next phase, the commands to run and what to look
@@ -33,15 +17,6 @@
   switching to enforce, and running it safely. It is linked from the sidebar, the README
   and Getting started. The router itself is unchanged.
 
-- Fixed: a static-looking path no longer takes the static skip when an upstream might
-  read it as something else. It goes to the backend instead. This covers an encoded
-  `?`, `#` or NUL (`%3F`, `%23`, `%00`, in any letter case), any encoded `%` (`%25`, so
-  double and triple encodings such as `%253F` and `%25253F`), the escapes `%u`, `%c0`
-  and `%c1`, and a script extension in any dot-separated part of a segment, such as
-  `/x.php.js` or `/x.phar/a.js`. Before, `/x.php%3Fa.js` and `/x.php%00.js` were
-  forwarded as static assets without calling the backend. The list of script
-  extensions also gains `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`,
-  `shtml`, `shtm`, `cfm`, `cfc`, `ashx`, `asmx` and `axd`.
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
   instructions to a reader, comment form submissions and search queries) and three
@@ -60,15 +35,14 @@
   is readable by root only, because systemd reads it as root. The script stops, before
   it writes anything, when one of its target paths is a symbolic link, when the group
   `adm` is missing, or when the user `vigilant-heron` has another primary group.
+  The logrotate file rotates `/var/log/vigilant-heron/*.log` and `*.json`, and the
+  script's next steps suggest `access_log /var/log/vigilant-heron/access.json json;`,
+  the format that `shadow-report` and `suggest-skip-rules` read.
 
 - Added: `test-request --url <url>` checks one request given as a URL, so no file is
   needed. `http://` and `https://` URLs set the Host header from the host name, and a
   path (starting with `/`) needs `--host <name>`. `--method <m>` (GET by default) and
   `--header 'Name: value'` (repeatable) complete the request.
-- Changed: `-t`, `-T` and `test-request` no longer fail when the token variable named
-  by `api_token_env` is not set. They print a warning that the router will not start
-  without it, and the check goes on. Starting the router, in the foreground or with
-  `start` or `restart`, still fails when the variable is not set.
 
 - Added: the `$block_query` log variable. It holds the query string of a blocked
   request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted
@@ -100,6 +74,27 @@
   `--full-addresses` is given. It never calls a backend and never reads the
   configuration. See [Summarize a shadow log](/cli#summarize-a-shadow-log).
 
+- Added: every request has a request id. When `request_id_header` is not set, or
+  its value is missing, empty, longer than 64 characters, or contains a space or a
+  non-ASCII character, the router makes a 16-character id for the request. Each
+  response that the router writes itself after reading the request carries the id
+  in an `X-Request-ID` header: blocks, redirects, 429 answers and limit rejections,
+  and failures such as a 502 from an unreachable upstream. A forwarded upstream
+  response does not get the header. A `block_status 444` still sends nothing.
+
+- Added: the built-in `json` log format has a `user_agent` key, the `User-Agent`
+  request header, escaped like the other values. The `main` format is unchanged.
+
+- Added: a "WordPress behind nginx" example in the installation guide. It puts the
+  router in the request path of a PHP site, with a second nginx server that runs PHP
+  behind the router and a `backup` server that keeps the site up while the router is
+  down. The example also shows how to take the router out of the path again.
+
+- Changed: `-t`, `-T` and `test-request` no longer fail when the token variable named
+  by `api_token_env` is not set. They print a warning that the router will not start
+  without it, and the check goes on. Starting the router, in the foreground or with
+  `start` or `restart`, still fails when the variable is not set.
+
 - Changed: the content of a file part in a `multipart/form-data` body, a part whose
   `Content-Disposition` has a `filename` or `filename*` parameter, is no longer sent
   to the backend. It is replaced by `[REDACTED]`; the part headers (field name,
@@ -107,6 +102,42 @@
   field name was sensitive or listed in `redact_field`. The new decision directive
   `redact_file_parts on | off;`, default `on`, controls this, and
   `redact_file_parts off;` restores the old behavior.
+
+- Changed: a block without a `block_page` answers a plain-text body,
+  `Request blocked. Request ID: <id>`, instead of an empty body (a 403 used to answer
+  `Forbidden`). The id is the one in the `X-Request-ID` header and in the access log.
+  A `block_page` is sent as before. Both kinds of block body also carry
+  `X-Content-Type-Options: nosniff`.
+
+- Changed: `$request_id` is never empty, so the `main` format's `request_id="..."` is
+  always filled, and a `proxy_set_header` that uses it sends the generated id to the
+  upstream. A request-id header that is longer than 64 characters, or contains a
+  space or a non-ASCII character, is no longer logged as sent: the router logs its
+  generated id instead. Before, a longer value was logged cut to 128 bytes.
+
+- Changed: the default `timeout` is now 2000ms for every backend (it was 300ms). Without
+  a `timeout` line, a call to the backend may take up to 2 seconds, so a visitor can wait
+  that long for a judged request. The new default comes from measurements taken from a
+  server in Tokyo. In a shadow trial, Clef-flash answered 864 calls with a p99 of 1,780 ms
+  and a maximum of 1,985 ms, and none timed out at 2000ms (at 1000ms, 84 calls timed out
+  in 25.7 hours). Jev answered 300 calls with a p50 of 133 ms, a p99 of 185 ms and a
+  maximum of 307 ms, so a fast backend can set a shorter value. To keep the old behavior,
+  set `timeout 300ms;`.
+
+- Changed: the evaluation's field split has a SQL injection probe from the shadow trial
+  (#86), and the Japanese post-save rows of the dev and holdout splits send a Referer
+  that matches the post (#98). The router itself is unchanged by these rows.
+
+- Fixed: a static-looking path no longer takes the static skip when an upstream might
+  read it as something else. It goes to the backend instead. This covers an encoded
+  `?`, `#` or NUL (`%3F`, `%23`, `%00`, in any letter case), any encoded `%` (`%25`, so
+  double and triple encodings such as `%253F` and `%25253F`), the escapes `%u`, `%c0`
+  and `%c1`, and a script extension in any dot-separated part of a segment, such as
+  `/x.php.js` or `/x.phar/a.js`. Before, `/x.php%3Fa.js` and `/x.php%00.js` were
+  forwarded as static assets without calling the backend. The list of script
+  extensions also gains `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`,
+  `shtml`, `shtm`, `cfm`, `cfc`, `ashx`, `asmx` and `axd`.
+
 - Fixed: a `multipart/form-data` body longer than `inspect_body` was sent with
   lexical redaction only, so a `password` part, or a part named in `redact_field`,
   inside the first `inspect_body` bytes reached the backend as it was. The parts
@@ -118,39 +149,6 @@
   of the whole body. A delimiter now counts only at the start of a line, parts after
   a `--boundary--` line are still read, a folded `Content-Disposition` line is read
   as one line, and a quoted boundary may contain `;`.
-
-- Added: every request has a request id. When `request_id_header` is not set, or
-  its value is missing, empty, longer than 64 characters, or contains a space or a
-  non-ASCII character, the router makes a 16-character id for the request. Each
-  response that the router writes itself after reading the request carries the id
-  in an `X-Request-ID` header: blocks, redirects, 429 answers and limit rejections,
-  and failures such as a 502 from an unreachable upstream. A forwarded upstream
-  response does not get the header. A `block_status 444` still sends nothing.
-- Added: the built-in `json` log format has a `user_agent` key, the `User-Agent`
-  request header, escaped like the other values. The `main` format is unchanged.
-- Changed: a block without a `block_page` answers a plain-text body,
-  `Request blocked. Request ID: <id>`, instead of an empty body (a 403 used to answer
-  `Forbidden`). The id is the one in the `X-Request-ID` header and in the access log.
-  A `block_page` is sent as before. Both kinds of block body also carry
-  `X-Content-Type-Options: nosniff`.
-- Changed: `$request_id` is never empty, so the `main` format's `request_id="..."` is
-  always filled, and a `proxy_set_header` that uses it sends the generated id to the
-  upstream. A request-id header that is longer than 64 characters, or contains a
-  space or a non-ASCII character, is no longer logged as sent: the router logs its
-  generated id instead. Before, a longer value was logged cut to 128 bytes.
-- Changed: the default `timeout` is now 2000ms for every backend (it was 300ms). Without
-  a `timeout` line, a call to the backend may take up to 2 seconds, so a visitor can wait
-  that long for a judged request. The new default comes from measurements taken from a
-  server in Tokyo. In a shadow trial, Clef-flash answered 864 calls with a p99 of 1,780 ms
-  and a maximum of 1,985 ms, and none timed out at 2000ms (at 1000ms, 84 calls timed out
-  in 25.7 hours). Jev answered 300 calls with a p50 of 133 ms, a p99 of 185 ms and a
-  maximum of 307 ms, so a fast backend can set a shorter value. To keep the old behavior,
-  set `timeout 300ms;`.
-
-- Added: a "WordPress behind nginx" example in the installation guide. It puts the
-  router in the request path of a PHP site, with a second nginx server that runs PHP
-  behind the router and a `backup` server that keeps the site up while the router is
-  down. The example also shows how to take the router out of the path again.
 
 ## v0.4.1 (2026-10-29)
 
