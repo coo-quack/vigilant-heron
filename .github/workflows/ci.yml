@@ -244,7 +244,7 @@ jobs:
       # Without --in-place, cargo-mutants builds each mutant in a copy of the tree, so the
       # checked-out source is never changed.
       # A non-zero exit code is recorded, not raised here, so the upload step still runs.
-      # A shard with no mutants of a Rust diff exits 0 and writes empty result files.
+      # A shard with no mutants to test exits 0 and writes empty result files.
       - id: run
         env:
           SHARD: ${{ matrix.shard }}
@@ -258,7 +258,7 @@ jobs:
           # cargo-mutants writes mutants.out whenever it tests a mutant. When it has none
           # to test (the diff is empty, changes no Rust file, or changes only tests), it
           # exits 0 without writing it, so empty result files are written here. A shard
-          # that fails without results still fails: the status above is not 0.
+          # that exits non-zero without results skips this, so its upload below fails.
           out="$RUNNER_TEMP/mutants/mutants.out"
           if [ "$status" = 0 ] && [ ! -d "$out" ]; then
             mkdir -p "$out"
