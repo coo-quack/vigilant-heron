@@ -7,11 +7,14 @@ standard library.
 
 ## Files
 
-- `dataset/dev.jsonl` and `dataset/holdout.jsonl`: 200 rows each, 90 `block`
-  and 110 `allow`. Each row has `id`, `label`, `kind`, `request` (`method`,
+- `dataset/dev.jsonl` and `dataset/holdout.jsonl`: 211 rows each, 93 `block`
+  and 118 `allow`. Each row has `id`, `label`, `kind`, `request` (`method`,
   `path`, `query`, `headers`, `content_type`, `body`) and `note`. All data is
   synthetic: example.com and example.jp hosts, 192.0.2.x, 198.51.100.x and
-  203.0.113.x addresses.
+  203.0.113.x addresses. The last 11 rows of each split (ids ending in 201 to
+  211) are Japanese: eight `allow` rows (WordPress post saves with instructions
+  to a reader, comment forms and search queries) and three `block` rows of
+  prompt injection aimed at an AI.
 - `dataset/field.jsonl`: requests seen in a shadow trial on a live WordPress
   site that the model scored close to `block_threshold` from either side, or
   missed. Each `note` gives the score seen there. Only the request shapes are
