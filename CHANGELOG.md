@@ -85,6 +85,14 @@
   upstream. A request-id header that is longer than 64 characters, or contains a
   space or a non-ASCII character, is no longer logged as sent: the router logs its
   generated id instead. Before, a longer value was logged cut to 128 bytes.
+- Changed: the default `timeout` is now 2000ms for every backend (it was 300ms). Without
+  a `timeout` line, a call to the backend may take up to 2 seconds, so a visitor can wait
+  that long for a judged request. The new default comes from measurements taken from a
+  server in Tokyo. In a shadow trial, Clef-flash answered 864 calls with a p99 of 1,780 ms
+  and a maximum of 1,985 ms, and none timed out at 2000ms (at 1000ms, 84 calls timed out
+  in 25.7 hours). Jev answered 300 calls with a p50 of 133 ms, a p99 of 185 ms and a
+  maximum of 307 ms, so a fast backend can set a shorter value. To keep the old behavior,
+  set `timeout 300ms;`.
 
 - Added: a "WordPress behind nginx" example in the installation guide. It puts the
   router in the request path of a PHP site, with a second nginx server that runs PHP

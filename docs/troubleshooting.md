@@ -62,7 +62,7 @@ To test a change without blocking anyone, set `mode shadow;` on the site, reload
 
 **Fix:** these settings are in the `decision` block unless noted.
 
-- `timeout` (default 300ms) is the time allowed for one decision. Raise it only if the model is consistently slow.
+- `timeout` (default 2000ms) is the time allowed for one decision. Raise it only if the model is consistently slow.
 - `queue_timeout` (default 0, no queueing) is how long a call may wait for a free slot. It must not be longer than `timeout`. A request that waits longer gets `backend_busy`.
 - `max_concurrency` (default 64) is the number of model calls in flight at once. Lower it if the model's rate limit is smaller.
 - `on_rate_limit` and `on_decision_error` are per site. Both default to `allow`, so a request that the model cannot judge is forwarded. Set one to `block` if you prefer to refuse such requests. Rules still apply in either case.

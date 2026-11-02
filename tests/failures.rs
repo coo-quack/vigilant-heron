@@ -774,6 +774,170 @@ site example.com {{
     proxy.stop().await
 }
 
+/// A configuration without a `timeout` line gets the 2000 ms default through `Config::parse_str`.
+#[test]
+fn decision_timeout_defaults_to_2000_ms_when_the_directive_is_absent() -> TestResult {
+    let config = Config::parse_str(
+        "listen 127.0.0.1:0;\n\
+         decision {\n    backend http;\n    url \"http://127.0.0.1:9/decide\";\n}\n\
+         site example.com {\n    upstream \"http://127.0.0.1:9\";\n}\n",
+        "test.conf",
+    )?;
+    assert_eq!(config.decision.timeout, Duration::from_millis(2000));
+    Ok(())
+}
+
+/// The 2000 ms default is the same for each backend, so a `decision` block with no `timeout` line
+/// gets it whichever backend it names.
+#[test]
+fn decision_timeout_defaults_to_2000_ms_for_every_backend_when_the_directive_is_absent()
+-> TestResult {
+    let decisions = [
+        "backend jev;",
+        "backend clef;\n    model clef-flash;\n    url \"https://example.test/clef\";\n    api_token_env CLOUDFLARE_AI_TOKEN;",
+        "backend strands;\n    url \"http://127.0.0.1:9/v1/systemone\";",
+        "backend http;\n    url \"http://127.0.0.1:9/decide\";",
+    ];
+    for decision in decisions {
+        let text = format!(
+            "listen 127.0.0.1:0;\ndecision {{\n    {decision}\n}}\n\
+             site example.com {{\n    upstream \"http://127.0.0.1:9\";\n}}\n"
+        );
+        let config =
+            Config::parse_str_with_lookup(&text, "test.conf", |_| Some("test-token".to_owned()))?;
+        assert_eq!(
+            config.decision.timeout,
+            Duration::from_millis(2000),
+            "the default timeout for: {decision}"
+        );
+    }
+    Ok(())
+}
+
+/// With the default timeout, a silent backend ends a call after about 2 seconds. Until then the
+/// call holds the only slot and its client's share: another client is refused as `backend_busy`
+/// (`on_rate_limit block`), and the same client as `client_busy` (429 by default).
+#[tokio::test]
+async fn default_timeout_holds_the_slot_and_the_client_share_until_it_ends_the_wait() -> TestResult
+{
+    let decider = GatedDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+real_ip_from 127.0.0.0/8;
+real_ip_header x-real-ip;
+
+decision {{
+    backend http;
+    url "{decide}";
+    max_concurrency 1;
+}}
+
+default_status 421;
+
+site example.com {{
+    upstream "{upstream}";
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    on_rate_limit block;
+}}
+"#,
+        decide = decider.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy_config(Config::parse_str(&text, "test.conf")?).await?;
+    let base = proxy.base();
+
+    let holder_base = base.clone();
+    let started = Instant::now();
+    let holder = tokio::spawn(async move {
+        let reply = get_as(&holder_base, "/holder", "203.0.113.1", "default-holder").await;
+        reply.map(|reply| (reply, started.elapsed()))
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while decider.calls() == 0 {
+        if Instant::now() > deadline {
+            return Err("the holding request never reached the backend".into());
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let same_client = get_as(&base, "/same", "203.0.113.1", "default-same").await?;
+    let other_client = get_as(&base, "/other", "203.0.113.2", "default-other").await?;
+    assert_eq!(
+        same_client.status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the holder's own client is over its share (client_busy)"
+    );
+    assert_eq!(
+        other_client.status,
+        StatusCode::FORBIDDEN,
+        "the other client finds no free slot (backend_busy), and on_rate_limit block applies"
+    );
+
+    let (holder_reply, elapsed) = holder.await??;
+    assert_eq!(
+        holder_reply.status,
+        StatusCode::OK,
+        "after the timeout, on_decision_error allow forwards the holder"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(2000),
+        "the holder answered after {elapsed:?}, before the 2000 ms default"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "the holder answered after {elapsed:?}, long after the 2000 ms default"
+    );
+    proxy.stop().await
+}
+
+/// With the default timeout, a backend that answers at once is judged at once, not after the timeout.
+#[tokio::test]
+async fn fast_backend_answer_is_judged_without_waiting_for_the_default_timeout() -> TestResult {
+    let decider = GatedDecider::start().await?;
+    decider.release(1);
+    let upstream = Upstream::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+
+decision {{
+    backend http;
+    url "{decide}";
+}}
+
+default_status 421;
+
+site example.com {{
+    upstream "{upstream}";
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        decide = decider.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy_config(Config::parse_str(&text, "test.conf")?).await?;
+    let started = Instant::now();
+    let reply = get_as(&proxy.base(), "/fast", "203.0.113.1", "default-fast").await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "the backend's low score forwards the request"
+    );
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "the fast answer came after {elapsed:?}, which is not an immediate judgment"
+    );
+    proxy.stop().await
+}
+
 /// A client over its share whose request body is still unread gets 429, and the connection closes.
 #[tokio::test]
 async fn client_busy_refusal_with_an_unread_body_closes_the_connection() -> TestResult {

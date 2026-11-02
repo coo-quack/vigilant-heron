@@ -507,10 +507,21 @@ Name of the environment variable that holds the bearer token. The token itself i
 ### `timeout`
 
 - **Syntax:** `timeout <time>;`
-- **Default:** `300ms`.
+- **Default:** `2000ms`.
 - **Context:** decision.
 
 Time allowed for one decision, including any wait for a slot. Must be greater than 0.
+
+The timeout is a ceiling. A backend that answers at once is judged at once, not after the timeout. A visitor can wait up to `timeout` for a request that goes to the model, and a call that is still waiting when the timeout ends it becomes a decision error, so `on_decision_error` decides that request.
+
+A longer timeout has a cost. Each call holds one of the `max_concurrency` slots until it is answered or the timeout ends it. With a slow backend, fewer new calls get a slot. A call also uses up its client's `max_concurrency_per_client` share while it waits, so a second request from that client gets 429 by default (`on_client_busy`).
+
+A fast backend can use a shorter value, so its visitors wait less and its slots free up sooner. The default of 2000 ms is the value that gave no timeouts for Clef-flash in a shadow trial. The figures below were measured from a server in Tokyo:
+
+- Clef-flash, 864 calls in a shadow trial with `timeout 2000ms`: p99 1,780 ms, maximum 1,985 ms, no timeouts. With `timeout 1000ms`, 84 calls timed out in 25.7 hours.
+- Jev (`jev-latest`), 300 calls: p50 133 ms, p99 185 ms, maximum 307 ms.
+
+Measure the slowest answers of your own backend from your server before you shorten the value.
 
 ### `queue_timeout`
 
