@@ -21,6 +21,15 @@
   it writes anything, when one of its target paths is a symbolic link, when the group
   `adm` is missing, or when the user `vigilant-heron` has another primary group.
 
+- Added: `test-request --url <url>` checks one request given as a URL, so no file is
+  needed. `http://` and `https://` URLs set the Host header from the host name, and a
+  path (starting with `/`) needs `--host <name>`. `--method <m>` (GET by default) and
+  `--header 'Name: value'` (repeatable) complete the request.
+- Changed: `-t`, `-T` and `test-request` no longer fail when the token variable named
+  by `api_token_env` is not set. They print a warning that the router will not start
+  without it, and the check goes on. Starting the router, in the foreground or with
+  `start` or `restart`, still fails when the variable is not set.
+
 - Added: the `$block_query` log variable. It holds the query string of a blocked
   request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted
   by the same rules as the event sent to the decision backend. It is empty for every other

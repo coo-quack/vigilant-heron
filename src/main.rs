@@ -3,6 +3,7 @@
 mod cli;
 mod lifecycle;
 mod pidfile;
+mod request_url;
 
 use std::future::Future;
 use std::io::{Read, Write};
@@ -13,8 +14,12 @@ use std::process::ExitCode;
 use anyhow::{Context, anyhow};
 use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
 use pidfile::PidFile;
+use request_url::UrlRequest;
 use tokio::signal::unix::{SignalKind, signal};
-use vigilant_heron::{Config, ErrorLogHandle, SuggestOptions, install_error_log, serve_reloadable};
+use vigilant_heron::{
+    CheckedConfig, Config, ErrorLogHandle, SuggestOptions, check_request_with, install_error_log,
+    serve_reloadable,
+};
 
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
 
@@ -63,6 +68,9 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
         Command::TestRequest { file, client } => {
             Ok(test_request(&resolve_config(config), &file, client))
         }
+        Command::TestUrl { request, client } => {
+            Ok(test_url_request(&resolve_config(config), &request, client))
+        }
         Command::SuggestSkipRules { file, options } => Ok(suggest_skip_rules(&file, &options)),
         Command::Start => lifecycle::start(&resolve_config(config)),
         Command::Stop => lifecycle::stop(&resolve_config(config)),
@@ -91,16 +99,20 @@ fn resolve_config(flag: Option<PathBuf>) -> PathBuf {
 /// includes expanded.
 fn test_configuration(path: &Path, dump: bool) -> ExitCode {
     let mut stderr = std::io::stderr();
-    if let Err(error) = Config::load(path) {
-        let _ = writeln!(stderr, "vigilant-heron: {error}");
-        let _ = writeln!(stderr, "configuration file {} test failed", path.display());
-        return ExitCode::FAILURE;
-    }
+    let checked = match Config::load_for_check(path) {
+        Ok(checked) => checked,
+        Err(error) => {
+            let _ = writeln!(stderr, "vigilant-heron: {error}");
+            let _ = writeln!(stderr, "configuration file {} test failed", path.display());
+            return ExitCode::FAILURE;
+        }
+    };
     let _ = writeln!(
         stderr,
         "configuration file {} test is successful",
         path.display()
     );
+    warn_unset_token(&checked);
     if !dump {
         return ExitCode::SUCCESS;
     }
@@ -126,19 +138,39 @@ fn test_configuration(path: &Path, dump: bool) -> ExitCode {
 /// Runs `test-request`: reads the raw request from `file` (or stdin for `-`), checks it
 /// against the configuration, and prints the report to stdout. Errors go to stderr, exit 1.
 fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
-    let mut stderr = std::io::stderr();
     let raw = match read_input(file) {
         Ok(raw) => raw,
         Err(error) => {
             let _ = writeln!(
-                stderr,
+                std::io::stderr(),
                 "vigilant-heron: cannot read the request file {}: {error}",
                 file.display()
             );
             return ExitCode::FAILURE;
         }
     };
-    match vigilant_heron::check_request(config, &raw, client) {
+    check_and_report(config, &raw, client)
+}
+
+/// Runs `test-request --url`: the request the URL and its options describe is checked
+/// as a request file with the same text would be, and the report is the same.
+fn test_url_request(config: &Path, request: &UrlRequest, client: IpAddr) -> ExitCode {
+    check_and_report(config, &request.to_raw(), client)
+}
+
+/// Checks the raw request `raw` against the configuration, and prints the report to stdout.
+/// The configuration is read for a check, so an unset token variable only gets a warning.
+fn check_and_report(config: &Path, raw: &[u8], client: IpAddr) -> ExitCode {
+    let mut stderr = std::io::stderr();
+    let checked = match Config::load_for_check(config) {
+        Ok(checked) => checked,
+        Err(error) => {
+            let _ = writeln!(stderr, "vigilant-heron: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    warn_unset_token(&checked);
+    match check_request_with(&checked.config, raw, client) {
         Ok(check) => {
             let report = check.to_string();
             let mut stdout = std::io::stdout();
@@ -155,6 +187,17 @@ fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
             let _ = writeln!(stderr, "vigilant-heron: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Warns on stderr that the router will not start while the token variable is unset.
+/// The check itself still passes; only starting the router needs the variable.
+fn warn_unset_token(checked: &CheckedConfig) {
+    if let Some(name) = &checked.unset_token {
+        let _ = writeln!(
+            std::io::stderr(),
+            "warning: {name} (api_token_env) is not set; the router will not start without it"
+        );
     }
 }
 
