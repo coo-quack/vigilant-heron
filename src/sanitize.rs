@@ -1208,6 +1208,7 @@ mod tests {
             client_ip: "203.0.113.7",
             redact_headers: &[],
             redact_fields: &[],
+            redact_file_parts: true,
             inspect_body_bytes: 0,
         });
         assert_eq!(
