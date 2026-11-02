@@ -22,6 +22,7 @@ export default defineConfig({
         text: "Guide",
         items: [
           { text: "Getting Started", link: "/getting-started" },
+          { text: "From shadow mode to enforce", link: "/rollout" },
           { text: "Installation", link: "/install" },
           { text: "Command line", link: "/cli" },
           { text: "How it works", link: "/how-it-works" },
