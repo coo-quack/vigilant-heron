@@ -26,13 +26,22 @@ fn section<'a>(doc: &'a str, level: usize, title: &str) -> Option<&'a str> {
     let heading = format!("\n{} {title}\n", "#".repeat(level));
     let start = doc.find(&heading)? + heading.len();
     let body = doc.get(start..)?;
-    let end = (2..=level)
+    let end = (1..=level)
         .filter_map(|hashes| body.find(&format!("\n{} ", "#".repeat(hashes))))
         .min();
     match end {
         Some(end) => body.get(..end),
         None => Some(body),
     }
+}
+
+#[test]
+fn a_section_ends_at_a_heading_of_the_same_or_a_higher_level() {
+    let doc = "\n### Wanted\nbody\n#### Deeper\nkept\n## Next\nafter\n";
+    assert_eq!(section(doc, 3, "Wanted"), Some("body\n#### Deeper\nkept"));
+
+    let doc = "\n## One\nx\n# Above\ny\n";
+    assert_eq!(section(doc, 2, "One"), Some("x"));
 }
 
 /// Returns the first `nginx` code block in the `###` section titled `title` whose text starts

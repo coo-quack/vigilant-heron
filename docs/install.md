@@ -207,8 +207,12 @@ server {
     client_max_body_size 64m;              # the same limit as the router and the inner server
 
     # Paths that are never served. This is a minimum, not a full list.
-    # Dotfiles are denied, except those under /.well-known/.
+    # Dotfiles are denied, except those under /.well-known/. Scripts there are denied too,
+    # so that a script is never served as source.
     location ^~ /.well-known/ {
+        location ~* \.(php|phtml)$ {
+            deny all;
+        }
         try_files $uri =404;
     }
 
@@ -285,6 +289,8 @@ server {
 }
 ```
 
+The inner server trusts `X-Real-IP` from `127.0.0.1`, so any process on the same host can set the client address that the inner server reports. Keep the inner server on the loopback address, as above.
+
 The router reads its own settings from its configuration file:
 
 ```nginx
@@ -320,11 +326,11 @@ Each part has a reason:
 
 **Permalinks.** The fallback `/index.php?$args` lets a path such as `/about/` reach WordPress, which then finds the page. The outer nginx still sends the original URI to the router through `$request_uri`, so the router sees `/about/`, not `/index.php`.
 
-**The backup server.** nginx sends requests to the router, and sends them to the `backup` server only while the router is unavailable. With `max_fails=1 fail_timeout=10s`, one failed attempt marks the router unavailable for 10 seconds. The outer PHP location uses `proxy_next_upstream error;` instead of the default `error timeout`. With the default, a GET whose router sends nothing for longer than `proxy_read_timeout` (60 seconds by default) is sent again to the backup, which bypasses the router, and that timeout can also mark the router unavailable for `fail_timeout`. With `error`, only a router that cannot be reached, or that fails while nginx sends the request or reads the response header, moves the request to the backup. nginx does not send a POST to another server after it was sent to the router, and a 403 or 429 from the router is a response, not an error, so nginx does not retry it.
+**The backup server.** nginx sends requests to the router, and sends them to the `backup` server only while the router is unavailable. With `max_fails=1 fail_timeout=10s`, one failed attempt marks the router unavailable for 10 seconds. The outer PHP location uses `proxy_next_upstream error;` instead of the default `error timeout`. With the default, a GET for which the router sends nothing for longer than `proxy_read_timeout` (60 seconds by default), after nginx has sent the request, is sent again to the backup, which bypasses the router. With `error`, that request is not passed on, so slowness cannot move it past the router. A timeout is still an unsuccessful attempt, though, so with `max_fails=1` one timed-out request marks the router unavailable for `fail_timeout` (10 seconds), and the backup serves the requests in that time. While traffic goes to the backup, nothing is checked by the router, and `fail_closed_path` does not apply. If the router hangs, switch back (see below). With `error`, only a router that cannot be reached, or that fails while nginx sends the request or reads the response header, moves a request to the backup. nginx does not send a POST to another server after it was sent to the router, and a 403 or 429 from the router is a response, not an error, so nginx does not retry it.
 
 **Failure settings.** `on_decision_error` and `on_rate_limit` both default to `allow`, so when the backend fails, the router forwards the request. Set `block` to refuse it instead. See [`on_decision_error`](/configuration#on-decision-error) and [`on_rate_limit`](/configuration#on-rate-limit).
 
-**Client address.** This example assumes that nginx faces the visitors directly. If Cloudflare or another proxy is in front of the outer nginx, first set the visitor's address on the outer nginx with `set_real_ip_from` and `real_ip_header`, as in [Cloudflare in front](#cloudflare-in-front). Otherwise `$remote_addr` is the proxy's address, and the router and WordPress see the proxy as the visitor.
+**Client address.** This example assumes that nginx faces the visitors directly. If Cloudflare or another proxy is in front of the outer nginx, first set the visitor's address on the outer nginx with the [nginx realip module](https://nginx.org/en/docs/http/ngx_http_realip_module.html): `set_real_ip_from` lists the proxy's addresses, and `real_ip_header` names the header that carries the visitor's address, such as `real_ip_header CF-Connecting-IP;` for Cloudflare. Otherwise `$remote_addr` is the proxy's address, and the router and WordPress see the proxy as the visitor.
 
 **Switching back.** To take the router out of the request path, point the upstream at the inner server only:
 
@@ -335,7 +341,7 @@ upstream php_router {
 }
 ```
 
-Then run `nginx -s reload`. nginx checks the new configuration before it applies it, and keeps the old one if the check fails.
+Then check the file with `nginx -t`, and reload with `nginx -s reload`. The [nginx command-line switches](https://nginx.org/en/docs/switches.html) describe both: `-t` tests the configuration file, and `reload` applies it to the running server. nginx also checks the new configuration before it applies it, and keeps the old one if the check fails.
 
 ### Try shadow mode beside a live site with an nginx mirror
 
