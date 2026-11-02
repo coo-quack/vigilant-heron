@@ -181,6 +181,11 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "vigilant-heron") | .version')
           bash scripts/check-release-binaries.sh "$RUNNER_TEMP/dist" "$version"
+      # The install script on the real paths (no --root): the user and group, owners,
+      # modes and a second run. The x86_64 binary from the build above runs on this
+      # runner, and the runner is a throwaway VM with sudo.
+      - name: Check the install script on the real paths
+        run: sudo sh scripts/check-install.sh "$RUNNER_TEMP/dist/linux_amd64/vigilant-heron"
 
   # Mutation testing of the lines this PR changes (cargo mutants --in-diff, with
   # .cargo/mutants.toml). It fails when a test misses a mutant, so changed code

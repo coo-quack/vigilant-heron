@@ -224,6 +224,24 @@ fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResul
 }
 
 #[test]
+fn the_systemd_unit_in_the_install_guide_is_the_packaged_file() -> TestResult {
+    let doc = read("docs/install.md")?;
+    let body = section(&doc, "Run as a service with systemd")
+        .ok_or("docs/install.md has no \"## Run as a service with systemd\" section")?;
+    let block = body
+        .split("```ini\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .ok_or("docs/install.md has no ini block in the systemd section")?;
+    assert_eq!(
+        block,
+        read("packaging/systemd/vigilant-heron.service")?,
+        "the unit in docs/install.md differs from packaging/systemd/vigilant-heron.service"
+    );
+    Ok(())
+}
+
+#[test]
 fn the_block_query_example_in_the_logging_docs_loads() -> TestResult {
     let doc = read("docs/logging.md")?;
     let format = doc
