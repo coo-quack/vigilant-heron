@@ -1579,8 +1579,14 @@ fn test_request_reports_an_encoded_question_mark_in_a_static_path_as_sent_to_the
         ),
         "{stdout}"
     );
+    Ok(())
+}
 
-    // Control: a plain static path still takes the skip under the same configuration.
+#[test]
+fn test_request_reports_a_plain_static_path_as_taking_the_static_skip() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("test-request-plain-static")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
     let plain = test_request(
         &dir,
         "plain.txt",
@@ -1588,11 +1594,9 @@ fn test_request_reports_an_encoded_question_mark_in_a_static_path_as_sent_to_the
         &conf,
         &[],
     )?;
-    assert!(
-        stdout_of(&plain).contains("static asset skip: applies"),
-        "{}",
-        stdout_of(&plain)
-    );
+    let stdout = stdout_of(&plain);
+    assert_eq!(plain.status.code(), Some(0), "{}", text(&plain));
+    assert!(stdout.contains("static asset skip: applies"), "{stdout}");
     Ok(())
 }
 
