@@ -7,6 +7,11 @@
   instructions to a reader, a comment form and search queries) and three `block`
   rows of prompt injection aimed at an AI. The router itself is unchanged.
 
+- Added: a "WordPress behind nginx" example in the installation guide. It puts the
+  router in the request path of a PHP site, with a second nginx server that runs PHP
+  behind the router and a `backup` server that keeps the site up while the router is
+  down. The example also shows how to take the router out of the path again.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more

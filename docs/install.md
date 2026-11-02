@@ -192,6 +192,113 @@ real_ip_header CF-Connecting-IP;
 
 Cloudflare publishes its ranges and changes them now and then. A range that is missing from `real_ip_from` makes requests from it look like they come from Cloudflare.
 
+### WordPress behind nginx
+
+This layout puts the router in the request path of a PHP site, such as WordPress on PHP-FPM. The outer nginx serves static files itself and sends only PHP requests to the router. The router forwards each allowed request to a second nginx server on the same host, and that server runs PHP.
+
+The outer nginx server sends PHP requests to the router with the original URI:
+
+```nginx
+server {
+    listen 443 ssl;                        # add your TLS certificate and key here
+    server_name example.com;
+    root /var/www/example;
+    index index.php;                       # a request for / is answered by index.php
+    client_max_body_size 64m;              # the same limit as the router and the inner server
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ \.php$ {
+        try_files $uri =404;               # a missing script is a 404 here, not a router request
+        proxy_pass http://php_router$request_uri;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+The upstream goes in the `http` block:
+
+```nginx
+upstream php_router {
+    server 127.0.0.1:8090 max_fails=1 fail_timeout=10s;   # the router
+    server 127.0.0.1:8091 backup;                         # the inner server, used while the router is down
+    keepalive 16;
+}
+```
+
+The inner server runs PHP. It is the router's upstream:
+
+```nginx
+server {
+    listen 127.0.0.1:8091;
+    server_name example.com;
+    root /var/www/example;
+    index index.php;
+    client_max_body_size 64m;
+    set_real_ip_from 127.0.0.1;            # the router and the outer nginx both connect from here
+    real_ip_header X-Real-IP;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_param HTTPS on;
+        fastcgi_param REQUEST_SCHEME https;
+        fastcgi_param SERVER_PORT 443;
+        fastcgi_pass unix:/run/php/php-fpm.sock;
+    }
+}
+```
+
+The router reads its own settings from its configuration file:
+
+```nginx
+listen 127.0.0.1:8090;                     # the upstream above names this address
+real_ip_from 127.0.0.1;                    # trust X-Real-IP only from the outer nginx
+real_ip_header X-Real-IP;
+
+decision {
+    backend jev;                           # reads TYPESAFE_API_KEY, as in the example above
+}
+
+site example.com {
+    upstream http://127.0.0.1:8091;        # the inner server
+    client_max_body_size 64m;              # the router's default is 1m
+}
+```
+
+Each part has a reason:
+
+**Why there is an inner server.** PHP-FPM speaks FastCGI, not HTTP, and the router can forward only to an `http://` upstream. The inner nginx server accepts HTTP from the router and passes PHP requests to PHP-FPM over FastCGI.
+
+**HTTPS and the client address.** The outer nginx terminates TLS, so the inner server receives plain HTTP. `HTTPS on` and `SERVER_PORT 443` tell PHP that the visitor used HTTPS. Without them, WordPress can build `http://` links or redirect in a loop. `set_real_ip_from` with `real_ip_header X-Real-IP` makes the inner server take the visitor's address from the header that the outer nginx sets. Without it, WordPress and security plugins see every visitor as `127.0.0.1`.
+
+**Request size.** The router's `client_max_body_size` defaults to `1m`, so an upload above 1 MB gets 413 from the router. Set the same limit on the outer nginx, the router and the inner server. Otherwise the one with the smallest limit refuses the upload first.
+
+**The URI and the index redirect.** `index index.php;` makes nginx answer a request for `/` with `/index.php`. nginx makes this an internal redirect, so the request then matches `location ~ \.php$`. The default index is `index.html`, so without this line a request for `/` would not reach PHP. `$request_uri` is the URI the client sent, so the router receives `/`, not `/index.php`.
+
+**Static files.** A request for a file such as `/style.css` matches only `location /`, which has no `proxy_pass`. nginx serves the file itself, so the router never sees it and no model call is made for it.
+
+**The backup server.** nginx sends requests to the router, and sends them to the `backup` server only while the router is unavailable. With `max_fails=1 fail_timeout=10s`, one failed attempt marks the router unavailable for 10 seconds. nginx passes a request to the next server only on an error or a timeout, which is the default `proxy_next_upstream error timeout`. nginx does not send a POST to another server after it was sent to the router. A 403 or 429 from the router is a response, not an error, so nginx does not retry it.
+
+**Switching back.** To take the router out of the request path, point the upstream at the inner server only, then reload nginx so that it re-reads its configuration:
+
+```nginx
+upstream php_router {
+    server 127.0.0.1:8091;
+    keepalive 16;
+}
+```
+
 ### Try shadow mode beside a live site with an nginx mirror
 
 To measure the router on real traffic without putting it in the response path, let nginx send it a copy of each request with the [`mirror`](https://nginx.org/en/docs/http/ngx_http_mirror_module.html) module. nginx serves the site as before and discards the router's answers. The router forwards its copy to a sink that answers 204, so a POST does not run twice.

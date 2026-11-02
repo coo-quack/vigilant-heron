@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::path::PathBuf;
 
+use vigilant_heron::Config;
 use vigilant_heron::directives::{
     DECISION_DIRECTIVES, SITE_DIRECTIVES, STARTUP_ONLY_DIRECTIVES, TOP_LEVEL_DIRECTIVES,
 };
@@ -16,6 +17,42 @@ type TestResult = Result<(), Box<dyn Error>>;
 fn read(relative: &str) -> Result<String, Box<dyn Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative);
     Ok(std::fs::read_to_string(path)?)
+}
+
+/// Returns the body of the first `nginx` code block in the `### <heading>` section
+/// whose first line is `first_line`.
+fn nginx_block_in_section<'a>(doc: &'a str, heading: &str, first_line: &str) -> Option<&'a str> {
+    let start = doc.find(&format!("\n### {heading}\n"))?;
+    let body = doc.get(start..)?;
+    let block_start = body.find(&format!("```nginx\n{first_line}"))? + "```nginx\n".len();
+    let block = body.get(block_start..)?;
+    block.get(..block.find("\n```")?)
+}
+
+#[test]
+fn the_wordpress_router_example_loads_with_the_values_it_documents() -> TestResult {
+    let doc = read("docs/install.md")?;
+    let block = nginx_block_in_section(&doc, "WordPress behind nginx", "listen 127.0.0.1:8090;")
+        .ok_or("docs/install.md has no router example in the \"WordPress behind nginx\" section")?;
+
+    // The token comes from the environment at run time; the test supplies a fixed value.
+    let config = Config::parse_str_with_lookup(block, "docs/install.md", |_| {
+        Some("docs-test-token".to_owned())
+    })?;
+
+    assert_eq!(config.listen, "127.0.0.1:8090");
+    assert_eq!(config.realip.header.as_str(), "x-real-ip");
+    assert_eq!(config.realip.trusted.len(), 1);
+    let site = config.sites.first().ok_or("the example has no site")?;
+    assert_eq!(
+        site.upstream
+            .authority()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some("127.0.0.1:8091")
+    );
+    assert_eq!(site.timeouts.max_body_bytes, Some(64 * 1024 * 1024));
+    Ok(())
 }
 
 /// Returns the text of the `## <title>` section, up to the next level-2 heading.
