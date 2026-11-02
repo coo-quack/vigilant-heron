@@ -16,6 +16,13 @@
   carry personal data. Add it to your own `log_format` to use it. See
   [Logging](/logging#block-query).
 
+- Added: the site directive `static_query_token on | off;`, off by default. With `on`,
+  a static asset request whose whole query is one bare token, such as WordPress's
+  `?wp-mce-49110-20250317` on the TinyMCE editor files, skips the backend. The token
+  must be 1 to 64 letters, digits, `.`, `_` or `-`, with no `=`, `&` or escape. Before,
+  each such request went to the backend, and a post editor page could exceed
+  `max_concurrency_per_client`. The other conditions of the static skip still apply.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more
