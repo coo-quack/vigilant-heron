@@ -9,6 +9,20 @@
   `eval/rules.py` reports them as rows without model results until the providers
   are measured again.
 
+- Added: the `$block_query` log variable. It holds the query string of a blocked
+  request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted
+  by the same rules as the event sent to the decision backend. It is empty for every other
+  request, and it is not in the built-in `json` and `main` formats, since a query can
+  carry personal data. Add it to your own `log_format` to use it. See
+  [Logging](/logging#block-query).
+
+- Added: `examples/rules.d/wordpress.conf`, an optional rule file with four skip
+  rules for WordPress sites: `wp-public-pages`, `wp-login-page`, `wp-admin-assets`
+  and `wp-robots`. Copy it to `rules.d/` and include it to spare the decision model
+  the front-page views with numeric parameters, the login page, the admin script and
+  style loaders and `robots.txt`. Block rules still run first. The WordPress rules
+  section of docs/rules.md lists each rule.
+
 - Added: the site directive `static_query_token on | off;`, off by default. With `on`,
   a static asset request whose whole query is one bare token, such as WordPress's
   `?wp-mce-49110-20250317` on the TinyMCE editor files, skips the backend. The token
