@@ -5,6 +5,7 @@ mod lifecycle;
 mod pidfile;
 mod request_url;
 
+use std::fmt::Display;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -17,8 +18,8 @@ use pidfile::PidFile;
 use request_url::UrlRequest;
 use tokio::signal::unix::{SignalKind, signal};
 use vigilant_heron::{
-    CheckedConfig, Config, ErrorLogHandle, SuggestOptions, check_request_with, install_error_log,
-    serve_reloadable,
+    CheckedConfig, Config, ErrorLogHandle, ShadowOptions, ShadowReport, SuggestOptions,
+    check_request_with, install_error_log, serve_reloadable,
 };
 
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
@@ -72,6 +73,7 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
             Ok(test_url_request(&resolve_config(config), &request, client))
         }
         Command::SuggestSkipRules { file, options } => Ok(suggest_skip_rules(&file, &options)),
+        Command::ShadowReport { files, options } => Ok(shadow_report(&files, &options)),
         Command::Start => lifecycle::start(&resolve_config(config)),
         Command::Stop => lifecycle::stop(&resolve_config(config)),
         Command::Restart => lifecycle::restart(&resolve_config(config)),
@@ -144,7 +146,7 @@ fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
             let _ = writeln!(
                 std::io::stderr(),
                 "vigilant-heron: cannot read the request file {}: {error}",
-                file.display()
+                input_name(file)
             );
             return ExitCode::FAILURE;
         }
@@ -218,11 +220,37 @@ fn suggest_skip_rules(file: &Path, options: &SuggestOptions) -> ExitCode {
             let _ = writeln!(
                 stderr,
                 "vigilant-heron: cannot read the access log {}: {error}",
-                file.display()
+                input_name(file)
             );
             return ExitCode::FAILURE;
         }
     };
+    print_report(&report)
+}
+
+/// Runs `shadow-report`: reads each access log in `files`, in the order given, prints the
+/// report to stdout, and never reads the configuration. A file that cannot be opened or
+/// read stops the command: the error names the file, goes to stderr, and exits 1.
+fn shadow_report(files: &[PathBuf], options: &ShadowOptions) -> ExitCode {
+    let mut stderr = std::io::stderr();
+    let mut report = ShadowReport::new(options);
+    for file in files {
+        let result = std::fs::File::open(file)
+            .and_then(|opened| report.read_log(std::io::BufReader::new(opened)));
+        if let Err(error) = result {
+            let _ = writeln!(
+                stderr,
+                "vigilant-heron: cannot read the access log {}: {error}",
+                input_name(file)
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    print_report(&report)
+}
+
+/// Writes a report to stdout. A write that fails gives exit 1.
+fn print_report(report: &impl Display) -> ExitCode {
     let mut stdout = std::io::stdout();
     if stdout
         .write_all(report.to_string().as_bytes())
@@ -232,6 +260,15 @@ fn suggest_skip_rules(file: &Path, options: &SuggestOptions) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// How an input file is named in an error message: `standard input` for `-`, otherwise the path.
+fn input_name(file: &Path) -> String {
+    if file == Path::new("-") {
+        "standard input".to_owned()
+    } else {
+        file.display().to_string()
+    }
 }
 
 /// Reads a file whole, or standard input for `-`.

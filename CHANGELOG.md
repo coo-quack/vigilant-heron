@@ -82,6 +82,15 @@
   each such request went to the backend, and a post editor page could exceed
   `max_concurrency_per_client`. The other conditions of the static skip still apply.
 
+- Added: `vigilant-heron shadow-report <access-log>...` summarizes one or more `json`
+  access logs from a shadow trial as plain text, before a switch to enforce. The
+  report gives the counts by `reason` and by decision error cause, the counts per UTC
+  day, the would-block and block lines, the `client_busy` bursts, the backend latency
+  and timeouts per hour, and the input tokens, with a cost estimate when
+  `--usd-per-mtok <price>` is given. Client addresses are shortened unless
+  `--full-addresses` is given. It never calls a backend and never reads the
+  configuration. See [Summarize a shadow log](/cli#summarize-a-shadow-log).
+
 - Changed: the content of a file part in a `multipart/form-data` body, a part whose
   `Content-Disposition` has a `filename` or `filename*` parameter, is no longer sent
   to the backend. It is replaced by `[REDACTED]`; the part headers (field name,

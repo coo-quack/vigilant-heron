@@ -10,6 +10,7 @@
 //!   built-in rule blocks.
 //! - `suggest_skip_rules`: learning skip-rule candidates from 10,000 json access
 //!   log lines held in memory.
+//! - `shadow_report`: summarizing the same 10,000 lines for the shadow report.
 //! - `config_load`: parsing and validating `examples/vigilant-heron.conf` with a
 //!   fixed token lookup, so no environment variable is needed.
 //!
@@ -22,7 +23,10 @@ use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
-use vigilant_heron::{Config, Outcome, SuggestOptions, check_request_with, suggest_skip_rules};
+use vigilant_heron::{
+    Config, Outcome, ShadowOptions, ShadowReport, SuggestOptions, check_request_with,
+    suggest_skip_rules,
+};
 
 /// The sample configuration: one site, the HTTP decision backend (never called by
 /// `check_request`, so no key or server is needed), and a skip rule for `/?p=123`.
@@ -168,6 +172,18 @@ fn bench_suggest_skip_rules(c: &mut Criterion) {
     });
 }
 
+fn bench_shadow_report(c: &mut Criterion) {
+    let log = synthetic_log();
+    let options = ShadowOptions::default();
+    c.bench_function("shadow_report/10k_lines", |b| {
+        b.iter(|| {
+            let mut report = ShadowReport::new(&options);
+            let result = report.read_log(black_box(log.as_bytes()));
+            black_box((result, report))
+        });
+    });
+}
+
 /// The shipped sample configuration, embedded so the bench does not depend on the
 /// working directory. Its `api_token_env` reads a variable that is not set in CI, so
 /// the token lookup is a fixed value and the bench measures parsing and validation.
@@ -195,6 +211,7 @@ criterion_group!(
     benches,
     bench_check_request,
     bench_suggest_skip_rules,
+    bench_shadow_report,
     bench_config_load
 );
 criterion_main!(benches);
