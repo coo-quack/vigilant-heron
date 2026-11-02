@@ -28,7 +28,6 @@ decision {
     model jev-latest;                       # any identifier of 1 to 100 characters from A-Za-z0-9._-
     url https://api.typesafe.ai/v1/systemone;
     api_token_env TYPESAFE_API_KEY;
-    timeout 300ms;
 }
 ```
 
@@ -46,7 +45,6 @@ decision {
     model clef-flash;                       # or clef
     url https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef-flash;
     api_token_env CLOUDFLARE_AI_TOKEN;
-    timeout 3000ms;
 }
 ```
 
@@ -71,7 +69,6 @@ and `StrandsAgents/strands-decider-E4B-gemma4-v1-2610`. Then point the router at
 decision {
     backend strands;
     url http://127.0.0.1:8099/v1/systemone;
-    timeout 1000ms;
 }
 ```
 
@@ -159,6 +156,8 @@ To choose thresholds for a site:
    acceptable.
 
 ## Timeouts and failures
+
+The default `timeout` is 2000 ms for every backend, and the examples above leave it unset. A fast backend can set a shorter value, and [the `timeout` reference](/configuration#timeout) lists the measurements behind the default.
 
 Set `timeout` above the typical latency of the backend you chose. If a backend's
 answers regularly arrive after `timeout`, every request becomes a decision error

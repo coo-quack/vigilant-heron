@@ -36,7 +36,7 @@ const DEFAULT_MAX_CONCURRENCY: usize = 64;
 /// Default `max_concurrency_per_client`, capped at `max_concurrency` when that is smaller.
 const DEFAULT_MAX_CONCURRENCY_PER_CLIENT: usize = 8;
 /// Default decision timeout.
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(300);
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Default block threshold for a site.
 const DEFAULT_BLOCK_THRESHOLD: f64 = 0.87;
 /// Default AI-instruction threshold for a site.
@@ -2282,7 +2282,7 @@ mod tests {
         assert_eq!(config.worker_threads, None);
         assert_eq!(config.max_connections, 1024);
         assert_eq!(config.default_status, StatusCode::MISDIRECTED_REQUEST);
-        assert_eq!(config.decision.timeout, Duration::from_millis(300));
+        assert_eq!(config.decision.timeout, Duration::from_millis(2000));
         assert_eq!(config.decision.queue_timeout, Duration::ZERO);
         assert_eq!(config.decision.max_concurrency, 64);
         assert_eq!(config.decision.inspect_body_bytes, 8192);
