@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added: `skills/vigilant-heron-rollout/SKILL.md`, an agent skill that drives the guide
+  [From shadow mode to enforce](docs/rollout.md) on a real server: the seven phases as a
+  checklist with the gate before each next phase, the commands to run and what to look
+  for in their output, and hard rules for the agent (ask the operator before any change
+  to live traffic or to enforce mode, never print tokens, test near misses with
+  `test-request` before widening a skip rule). Install it with
+  `npx skills add coo-quack/vigilant-heron`. A test in tests/docs.rs keeps its links and
+  command-line flags in step with `docs/`. The router itself is unchanged.
+
 - Added: the guide [From shadow mode to enforce](docs/rollout.md), which walks through a
   rollout in seven phases: the checks before a first install, a shadow trial beside the
   site, reading the shadow log, skip rules, putting the router in the request path,
