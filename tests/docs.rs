@@ -21,27 +21,41 @@ fn read(relative: &str) -> Result<String, Box<dyn Error>> {
 }
 
 /// Returns the text of the section titled `title` at heading `level` (`2` for `##`), up to the
-/// next heading of the same or a higher level.
+/// next heading of the same or a higher level. Lines inside fenced code blocks are not headings,
+/// so a `# comment` in a configuration example does not end the section.
 fn section<'a>(doc: &'a str, level: usize, title: &str) -> Option<&'a str> {
     let heading = format!("\n{} {title}\n", "#".repeat(level));
     let start = doc.find(&heading)? + heading.len();
     let body = doc.get(start..)?;
-    let end = (1..=level)
-        .filter_map(|hashes| body.find(&format!("\n{} ", "#".repeat(hashes))))
-        .min();
-    match end {
-        Some(end) => body.get(..end),
-        None => Some(body),
+    let mut in_fence = false;
+    let mut offset: usize = 0;
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            let hashes = line.bytes().take_while(|&b| b == b'#').count();
+            if (1..=level).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ') {
+                return body.get(..offset.saturating_sub(1));
+            }
+        }
+        offset += line.len();
     }
+    Some(body)
 }
 
 #[test]
 fn a_section_ends_at_a_heading_of_the_same_or_a_higher_level() {
     let doc = "\n### Wanted\nbody\n#### Deeper\nkept\n## Next\nafter\n";
     assert_eq!(section(doc, 3, "Wanted"), Some("body\n#### Deeper\nkept"));
+}
 
-    let doc = "\n## One\nx\n# Above\ny\n";
-    assert_eq!(section(doc, 2, "One"), Some("x"));
+#[test]
+fn a_hash_line_inside_a_code_block_does_not_end_a_section() {
+    let doc = "\n## Unit\n```ini\n# a comment\n[Unit]\n```\nafter\n## Next\nx\n";
+    assert_eq!(
+        section(doc, 2, "Unit"),
+        Some("```ini\n# a comment\n[Unit]\n```\nafter")
+    );
 }
 
 /// Returns the first `nginx` code block in the `###` section titled `title` whose text starts
