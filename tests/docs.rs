@@ -222,3 +222,19 @@ fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResul
     assert!(missing.is_empty(), "no Default cell for {missing:?}");
     Ok(())
 }
+
+#[test]
+fn the_block_query_example_in_the_logging_docs_loads() -> TestResult {
+    let doc = read("docs/logging.md")?;
+    let format = doc
+        .lines()
+        .find(|line| line.starts_with("log_format blocked "))
+        .ok_or("docs/logging.md has no log_format blocked example")?;
+    let text = format!(
+        "listen 127.0.0.1:0;\n{format}\naccess_log stdout blocked;\n\
+         decision {{ backend http; url \"http://127.0.0.1:9/decide\"; }}\n\
+         site example.com {{ upstream \"http://127.0.0.1:9\"; }}\n"
+    );
+    vigilant_heron::Config::parse_str(&text, "docs/logging.md")?;
+    Ok(())
+}
