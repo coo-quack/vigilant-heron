@@ -700,10 +700,15 @@ fn content_disposition_params(headers: &str) -> impl Iterator<Item = (&str, &str
         .map(|(key, value)| (key.trim(), value.trim()))
 }
 
-/// Returns true for the parameter names that make a part a file part: `filename` and
-/// `filename*`, in any letter case. The value is not decoded.
+/// Returns true when a `Content-Disposition` parameter name marks a file part: `filename`,
+/// `filename*`, or an RFC 2231 continuation such as `filename*0` and `filename*0*`, in any
+/// letter case. The value is not decoded.
 fn is_file_part_key(key: &str) -> bool {
-    key.eq_ignore_ascii_case("filename") || key.eq_ignore_ascii_case("filename*")
+    key.get(..8)
+        .is_some_and(|head| head.eq_ignore_ascii_case("filename"))
+        && key
+            .get(8..)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('*'))
 }
 
 fn is_form_content_type(content_type: Option<&str>) -> bool {
@@ -2053,6 +2058,10 @@ mod tests {
     #[rstest]
     #[case::filename("name=\"upload\"; filename=\"pic.jpg\"")]
     #[case::filename_star("name=\"upload\"; filename*=UTF-8''%E5%86%99%E7%9C%9F.jpg")]
+    #[case::filename_continuation("name=\"upload\"; filename*0=\"a\"; filename*1=\".jpg\"")]
+    #[case::filename_encoded_continuation(
+        "name=\"upload\"; filename*0*=UTF-8''a; filename*1=\".jpg\""
+    )]
     #[case::filename_in_upper_case("name=\"upload\"; FILENAME=\"a.txt\"")]
     fn file_parts_are_redacted_with_their_headers_kept(#[case] disposition: &str) {
         let body = format!(
