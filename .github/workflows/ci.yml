@@ -244,14 +244,26 @@ jobs:
       # Without --in-place, cargo-mutants builds each mutant in a copy of the tree, so the
       # checked-out source is never changed.
       # A non-zero exit code is recorded, not raised here, so the upload step still runs.
-      # A shard with no mutants exits 0 and writes empty result files, so it passes.
+      # A shard with no mutants of a Rust diff exits 0 and writes empty result files.
       - id: run
         env:
           SHARD: ${{ matrix.shard }}
         run: |
+          set +e
           cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --shard "$SHARD/$SHARD_TOTAL" \
             --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked \
-            --output "$RUNNER_TEMP/mutants" || echo "status=$?" >> "$GITHUB_OUTPUT"
+            --output "$RUNNER_TEMP/mutants" 2>&1 | tee "$RUNNER_TEMP/mutants.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" != 0 ]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi
+          # A diff with no Rust change makes cargo-mutants exit 0 without writing
+          # mutants.out. Only then are empty result files written, so the upload below
+          # still fails for a shard that ended without results for another reason.
+          out="$RUNNER_TEMP/mutants/mutants.out"
+          if [ "$status" = 0 ] && [ ! -d "$out" ] \
+            && grep -qE 'Diff (file is empty|changes no Rust source files)' "$RUNNER_TEMP/mutants.log"; then
+            mkdir -p "$out"
+            for kind in missed timeout caught unviable; do : > "$out/$kind.txt"; done
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
