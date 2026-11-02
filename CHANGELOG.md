@@ -4,7 +4,7 @@
 
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
-  instructions to a reader, comment form posts and search queries) and three
+  instructions to a reader, comment form submissions and search queries) and three
   `block` rows of prompt injection aimed at an AI. The router itself is unchanged.
   `eval/rules.py` reports them as rows without model results until the providers
   are measured again.
