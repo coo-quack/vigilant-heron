@@ -75,6 +75,25 @@
   each such request went to the backend, and a post editor page could exceed
   `max_concurrency_per_client`. The other conditions of the static skip still apply.
 
+- Changed: the content of a file part in a `multipart/form-data` body, a part whose
+  `Content-Disposition` has a `filename` or `filename*` parameter, is no longer sent
+  to the backend. It is replaced by `[REDACTED]`; the part headers (field name,
+  file name, content type) are still sent. Before, file content was sent unless the
+  field name was sensitive or listed in `redact_field`. The new decision directive
+  `redact_file_parts on | off;`, default `on`, controls this, and
+  `redact_file_parts off;` restores the old behavior.
+- Fixed: a `multipart/form-data` body longer than `inspect_body` was sent with
+  lexical redaction only, so a `password` part, or a part named in `redact_field`,
+  inside the first `inspect_body` bytes reached the backend as it was. The parts
+  before the cut are now redacted by name, and so is the cut part when its headers
+  are complete. Text that is not inside a part (before the first delimiter, after a
+  `--boundary--` line, or after a cut that leaves no complete part headers) is
+  scanned as text, the way a body without multipart framing is. A body whose
+  framing is broken, not just cut, still falls back to name-based lexical redaction
+  of the whole body. A delimiter now counts only at the start of a line, parts after
+  a `--boundary--` line are still read, a folded `Content-Disposition` line is read
+  as one line, and a quoted boundary may contain `;`.
+
 - Added: every request has a request id. When `request_id_header` is not set, or
   its value is missing, empty, longer than 64 characters, or contains a space or a
   non-ASCII character, the router makes a 16-character id for the request. Each

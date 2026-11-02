@@ -1100,3 +1100,88 @@ async fn an_upstream_failure_carries_the_request_id_header() -> TestResult {
     assert_eq!(request_id_header(&reply), "failure-id-1");
     proxy.stop().await
 }
+
+/// A multipart body of about 880 bytes with a `password` part, then a file part whose
+/// content starts past the first 512 bytes that are inspected.
+fn multipart_body_longer_than_inspect_body() -> Bytes {
+    let file_content = "EXIFGPS".repeat(100);
+    Bytes::from(format!(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2-zq\r\n\
+         --BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"pic.jpg\"\r\n\
+         Content-Type: image/jpeg\r\n\r\n{file_content}\r\n--BB--\r\n"
+    ))
+}
+
+#[tokio::test]
+async fn a_multipart_body_longer_than_inspect_body_sends_neither_the_file_bytes_nor_the_password()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    let body = multipart_body_longer_than_inspect_body();
+    assert!(body.len() > 512 && body.len() <= 1024, "{}", body.len());
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[("content-type", "multipart/form-data; boundary=BB")],
+        body,
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    let forwarded_body = event["event"]["untrusted"]["body"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!forwarded_body.contains("hunter2"), "{forwarded_body}");
+    assert!(!forwarded_body.contains("EXIFGPS"), "{forwarded_body}");
+    assert!(
+        forwarded_body.contains("name=\"password\""),
+        "{forwarded_body}"
+    );
+    assert!(
+        forwarded_body.contains("filename=\"pic.jpg\""),
+        "{forwarded_body}"
+    );
+    assert_eq!(event["event"]["meta"]["body_truncated"], true);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn redact_file_parts_off_sends_the_start_of_the_file_but_not_the_password() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let config = config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS).replacen(
+        "    inspect_body 512;\n",
+        "    inspect_body 512;\n    redact_file_parts off;\n",
+        1,
+    );
+    let proxy = start_proxy(&config).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[("content-type", "multipart/form-data; boundary=BB")],
+        multipart_body_longer_than_inspect_body(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    let forwarded_body = event["event"]["untrusted"]["body"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!forwarded_body.contains("hunter2"), "{forwarded_body}");
+    assert!(forwarded_body.contains("EXIFGPS"), "{forwarded_body}");
+    proxy.stop().await
+}

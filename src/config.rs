@@ -226,6 +226,7 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
     "max_body",
     "redact_header",
     "redact_field",
+    "redact_file_parts",
 ];
 
 /// Validated configuration for the whole proxy.
@@ -290,6 +291,8 @@ pub struct DecisionConfig {
     /// Extra body field names to redact before sending, lowercased. Each name is
     /// matched exactly, with the field name compared case-insensitively.
     pub redact_fields: Vec<String>,
+    /// Whether the content of a multipart file part is replaced by `[REDACTED]`.
+    pub redact_file_parts: bool,
 }
 
 /// Timers and header limits of client connections, set at the top level only.
@@ -1548,6 +1551,7 @@ where
     let mut inspect_body = DEFAULT_INSPECT_BODY;
     let mut redact_headers = Vec::new();
     let mut redact_fields = Vec::new();
+    let mut redact_file_parts = true;
     let mut backend_line = directive;
     let mut token_line = directive;
     let mut model_line = directive;
@@ -1630,6 +1634,10 @@ where
                     ));
                 }
                 redact_fields.extend(child.args.iter().map(|f| f.to_ascii_lowercase()));
+            }
+            "redact_file_parts" => {
+                once(&mut seen, child)?;
+                redact_file_parts = parse_bool(child, one_arg(child)?)?;
             }
             other => {
                 return Err(invalid(
@@ -1770,6 +1778,7 @@ where
         inspect_body_bytes: inspect_body,
         redact_headers,
         redact_fields,
+        redact_file_parts,
     })
 }
 
@@ -3057,6 +3066,41 @@ mod tests {
     fn redact_field_needs_a_name() {
         let text = with_decision("    backend http;\n    redact_field;\n");
         assert!(message(parse(&text)).contains("\"redact_field\" needs at least one field name"));
+    }
+
+    #[test]
+    fn redact_file_parts_defaults_to_on() -> Result<(), ConfigError> {
+        let config = parse(&with_decision("    backend http;\n"))?;
+        assert!(config.decision.redact_file_parts);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::on("on", true)]
+    #[case::off("off", false)]
+    fn redact_file_parts_reads_on_and_off(
+        #[case] value: &str,
+        #[case] expected: bool,
+    ) -> Result<(), ConfigError> {
+        let text = with_decision(&format!(
+            "    backend http;\n    redact_file_parts {value};\n"
+        ));
+        assert_eq!(parse(&text)?.decision.redact_file_parts, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn redact_file_parts_rejects_other_values() {
+        let text = with_decision("    backend http;\n    redact_file_parts yes;\n");
+        assert!(message(parse(&text)).contains("\"redact_file_parts\" must be \"on\" or \"off\""));
+    }
+
+    #[test]
+    fn redact_file_parts_is_set_once() {
+        let text = with_decision(
+            "    backend http;\n    redact_file_parts on;\n    redact_file_parts off;\n",
+        );
+        assert!(message(parse(&text)).contains("duplicate directive \"redact_file_parts\""));
     }
 
     #[test]
