@@ -483,7 +483,7 @@ A reload keeps connections open. Use `sudo systemctl restart vigilant-heron` onl
 
 The unit runs the router with systemd's hardening options, so it can write only to its runtime directory and to `/var/log/vigilant-heron`.
 
-The logrotate file rotates each `/var/log/vigilant-heron/*.log` file daily, as the `vigilant-heron` user, and keeps 14 rotated files. After each rotation it sends SIGUSR1, so the router opens its log files again.
+The logrotate file rotates each `/var/log/vigilant-heron/*.log` and `*.json` file daily, as the `vigilant-heron` user, and keeps 14 rotated files. After each rotation it sends SIGUSR1, so the router opens its log files again.
 
 ## Updating
 

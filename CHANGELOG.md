@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Changed: the packaged logrotate file also rotates `/var/log/vigilant-heron/*.json`, so the
+  JSON access log that the installation guide now suggests is rotated too.
+
 - Changed: the install script's next steps and the install guide now suggest
   `access_log /var/log/vigilant-heron/access.json json;` instead of a `main` access log at
   `access.log`, because the guide's tools, `shadow-report` and `suggest-skip-rules`, read the
