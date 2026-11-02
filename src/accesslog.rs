@@ -42,6 +42,7 @@ pub(crate) enum Field {
     Method,
     Path,
     QueryShape,
+    BlockQuery,
     Status,
     Action,
     Reason,
@@ -74,6 +75,7 @@ impl Field {
             "method" => Self::Method,
             "path" => Self::Path,
             "query_shape" => Self::QueryShape,
+            "block_query" => Self::BlockQuery,
             "status" => Self::Status,
             "action" => Self::Action,
             "reason" => Self::Reason,
@@ -289,6 +291,9 @@ pub(crate) struct AccessRecord<'a> {
     pub(crate) path: &'a str,
     /// Raw query string, without the "?", when the request had one.
     pub(crate) query: Option<&'a str>,
+    /// The query for `$block_query`: set only for a blocked request, already redacted
+    /// by [`crate::sanitize::block_query`]. `None` for every other request.
+    pub(crate) block_query: Option<String>,
     /// Status of the response.
     pub(crate) status: u16,
     /// `allow`, `block`, `redirect`, or `reject` for requests answered before a decision.
@@ -340,6 +345,7 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::Method => text(record.method),
         Field::Path => text(record.path),
         Field::QueryShape => record.query.and_then(crate::sanitize::query_shape),
+        Field::BlockQuery => record.block_query.as_deref().and_then(text),
         Field::Status => Some(record.status.to_string()),
         Field::Action => text(record.action),
         Field::Reason => text(record.reason),
@@ -517,6 +523,7 @@ mod tests {
             method: "GET",
             path: "/articles",
             query: None,
+            block_query: None,
             status: 200,
             action: "allow",
             reason: "model",
@@ -545,6 +552,64 @@ mod tests {
         LogFormat::compile("test", escape, text, &[])
             .map(|format| format.render(record, headers))
             .unwrap_or_default()
+    }
+
+    /// A record of a blocked request whose block query is `query`.
+    fn blocked_record(query: Option<&str>) -> AccessRecord<'static> {
+        AccessRecord {
+            action: "block",
+            block_query: query.map(str::to_owned),
+            ..record(at(0))
+        }
+    }
+
+    #[test]
+    fn block_query_renders_the_redacted_query_of_a_blocked_request() {
+        let headers = HeaderMap::new();
+        let blocked = blocked_record(Some("token=[REDACTED]&q=1"));
+        assert_eq!(
+            render("$block_query", Escape::Default, &blocked, &headers),
+            "token=[REDACTED]&q=1"
+        );
+    }
+
+    #[test]
+    fn block_query_is_empty_when_the_request_was_not_blocked() {
+        let headers = HeaderMap::new();
+        let allowed = record(at(0));
+        assert_eq!(
+            render("$block_query", Escape::Default, &allowed, &headers),
+            "-"
+        );
+        assert_eq!(
+            render("\"$block_query\"", Escape::Json, &allowed, &headers),
+            "\"\""
+        );
+    }
+
+    #[test]
+    fn block_query_escapes_a_newline_and_a_quote() {
+        let headers = HeaderMap::new();
+        let blocked = blocked_record(Some("a=\"1\"\nb=2"));
+        assert_eq!(
+            render("$block_query", Escape::Default, &blocked, &headers),
+            "a=\\\"1\\\"\\x0Ab=2"
+        );
+        assert_eq!(
+            render("\"$block_query\"", Escape::Json, &blocked, &headers),
+            "\"a=\\\"1\\\"\\nb=2\""
+        );
+    }
+
+    #[test]
+    fn the_built_in_formats_do_not_log_the_block_query() {
+        for format in [LogFormat::json(), LogFormat::main()] {
+            assert!(
+                !format.pieces.contains(&Piece::Field(Field::BlockQuery)),
+                "the {} format must not log $block_query",
+                format.name
+            );
+        }
     }
 
     #[rstest]
