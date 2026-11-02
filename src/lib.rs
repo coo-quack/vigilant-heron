@@ -19,16 +19,19 @@ mod config;
 mod decision;
 mod error;
 mod limits;
+mod log_lines;
 mod logsink;
 mod policy;
 mod prefilter;
 mod proxy;
 mod realip;
 mod request_check;
+mod request_id;
 mod router;
 mod rules;
 mod sanitize;
 mod server;
+mod shadow_report;
 mod skip_suggest;
 mod system_one;
 #[cfg(test)]
@@ -39,15 +42,16 @@ mod tunnel;
 pub use accesslog::LogFormat;
 pub use block::{BlockResponse, BlockStatus};
 pub use config::{
-    AccessLogConfig, BackendConfig, Config, ConnectionConfig, DecisionConfig, ErrorLogConfig,
-    FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, ProcessSettings, SiteAction,
-    SiteConfig, SiteTimeouts, dump_configuration, process_settings,
+    AccessLogConfig, BackendConfig, CheckedConfig, Config, ConnectionConfig, DecisionConfig,
+    ErrorLogConfig, FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, ProcessSettings,
+    SiteAction, SiteConfig, SiteTimeouts, dump_configuration, process_settings,
 };
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
 pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_request_with};
 pub use server::{serve, serve_reloadable};
+pub use shadow_report::{ShadowOptions, ShadowReport};
 pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
 pub use system_one::{ApiToken, ClefModel};
 

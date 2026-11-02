@@ -38,7 +38,7 @@ jobs:
       - run: corepack enable pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.12.1'
+          node-version: '26.13.0'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level=high
@@ -154,7 +154,7 @@ jobs:
       - run: corepack enable pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.12.1'
+          node-version: '26.13.0'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm run dup
@@ -181,18 +181,34 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 --locked \
             | jq -r '.packages[] | select(.name == "vigilant-heron") | .version')
           bash scripts/check-release-binaries.sh "$RUNNER_TEMP/dist" "$version"
+      # The install script on the real paths (no --root): the user and group, owners,
+      # modes and a second run. The x86_64 binary from the build above runs on this
+      # runner, and the runner is a throwaway VM with sudo.
+      - name: Check the install script on the real paths
+        run: sudo sh scripts/check-install.sh "$RUNNER_TEMP/dist/linux_amd64/vigilant-heron"
 
   # Mutation testing of the lines this PR changes (cargo mutants --in-diff, with
   # .cargo/mutants.toml). It fails when a test misses a mutant, so changed code
   # comes with tests that notice a change. A PR that changes no Rust code has no
   # mutants and passes at once. The weekly mutants.yml covers the whole tree.
-  mutants-diff:
-    # A PR to main promotes develop, whose changes this job already checked in their own
-    # PR; mutating the whole release diff again does not fit in the time limit.
-    if: github.base_ref != 'main'
+  #
+  # The mutants are split over the shards of mutants-diff-shard, which run in
+  # parallel. A PR to main (a release PR) has 32 shards, because it can change
+  # everything since the last release; every other PR has 8. The shard count is
+  # written twice, in the matrix and in SHARD_TOTAL, and both come from the same
+  # condition, so shard k always runs as `--shard k/N` with the N of its own run.
+  mutants-diff-shard:
     runs-on: ubuntu-latest
+    # The whole tree has 2242 mutants (cargo mutants --list), so a release PR gives a
+    # shard at most 71. #108's 78 mutants took 63 minutes with --jobs 2 (0.8 minute
+    # each); at that rate 71 take about 57 minutes, so 120 leaves room.
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(github.base_ref == 'main' && '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]' || '[0,1,2,3,4,5,6,7]') }}
     env:
+      SHARD_TOTAL: ${{ github.base_ref == 'main' && 32 || 8 }}
       # cargo runs the test binaries through prlimit (6 GiB of address space, 4 GiB
       # per file), so a mutant that loops while allocating or writing is killed, and
       # counts as caught, instead of taking the runner down. The compiler is not limited.
@@ -220,37 +236,41 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: git diff "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/pr.diff"
+      # Every shard computes the same mutant list from the same diff, then runs its own slice.
+      # --baseline=skip: the required `test` job already runs the unmutated suite, so a shard
+      # does not repeat it. With no baseline there is no measured test time to scale, so the
+      # test timeout is fixed at 300 s, as in mutants.yml.
+      # --jobs 2 runs two mutants at a time on the runner's 4 vCPUs, as the single job did.
+      # Without --in-place, cargo-mutants builds each mutant in a copy of the tree, so the
+      # checked-out source is never changed.
+      # A non-zero exit code is recorded, not raised here, so the upload step still runs.
+      # A shard with no mutants to test exits 0 and writes empty result files.
       - id: run
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --jobs 2 --cargo-arg=--locked \
-            --output "$RUNNER_TEMP/mutants" || echo "status=$?" >> "$GITHUB_OUTPUT"
-      - name: Summarise missed and timed-out mutants
-        if: always()
-        run: |
+          set +e
+          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --shard "$SHARD/$SHARD_TOTAL" \
+            --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked \
+            --output "$RUNNER_TEMP/mutants" 2>&1 | tee "$RUNNER_TEMP/mutants.log"
+          status=${PIPESTATUS[0]}
+          if [ "$status" != 0 ]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi
+          # cargo-mutants writes mutants.out whenever it tests a mutant. When it has none
+          # to test (the diff is empty, changes no Rust file, or changes only tests), it
+          # exits 0 without writing it, so empty result files are written here. A shard
+          # that exits non-zero without results skips this, so its upload below fails.
           out="$RUNNER_TEMP/mutants/mutants.out"
-          {
-            echo "## Mutation testing of this PR's changes"
-            for kind in missed timeout caught unviable; do
-              n=0
-              if [ -f "$out/$kind.txt" ]; then n=$(wc -l < "$out/$kind.txt" | tr -d ' '); fi
-              echo "- $kind: $n"
-            done
-            for kind in missed timeout; do
-              if [ -s "$out/$kind.txt" ]; then
-                echo
-                echo "### $kind"
-                echo '```text'
-                cat "$out/$kind.txt"
-                echo '```'
-              fi
-            done
-          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" = 0 ] && [ ! -d "$out" ]; then
+            mkdir -p "$out"
+            for kind in missed timeout caught unviable; do : > "$out/$kind.txt"; done
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: mutants-diff
+          name: mutants-diff-${{ matrix.shard }}
           path: ${{ runner.temp }}/mutants/mutants.out
-          if-no-files-found: ignore
+          # Every shard writes mutants.out, even with no mutants, so a missing one is an error.
+          if-no-files-found: error
       - name: Fail when cargo-mutants found a problem
         if: steps.run.outputs.status != ''
         env:
@@ -258,3 +278,56 @@ jobs:
         run: |
           echo "cargo-mutants exited with status $STATUS: see the job summary" >&2
           exit 1
+
+  # Collects the shards and reports one result for the whole check. It always runs,
+  # also when a shard failed or was cancelled, so every PR gets a result; a PR to main
+  # requires this check. Its name is the required check, so keep the name.
+  mutants-diff:
+    needs: mutants-diff-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        # When no shard uploaded anything, the step fails; the summary then counts zero
+        # and the last step still fails the check.
+        continue-on-error: true
+        with:
+          pattern: mutants-diff-*
+          path: mutant-results
+          merge-multiple: false
+      - name: Summarise missed and timed-out mutants
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/report"
+          for kind in missed timeout caught unviable; do
+            find mutant-results -name "$kind.txt" -exec cat {} + > "$RUNNER_TEMP/report/$kind.txt" 2>/dev/null || true
+          done
+          shards=$(find mutant-results -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
+          {
+            echo "## Mutation testing of this PR's changes"
+            echo "- shards with results: $shards"
+            for kind in missed timeout caught unviable; do
+              n=$(wc -l < "$RUNNER_TEMP/report/$kind.txt" | tr -d ' ')
+              echo "- $kind: $n"
+            done
+            for kind in missed timeout; do
+              if [ -s "$RUNNER_TEMP/report/$kind.txt" ]; then
+                echo
+                echo "### $kind"
+                echo '```text'
+                cat "$RUNNER_TEMP/report/$kind.txt"
+                echo '```'
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Fail unless every shard succeeded
+        env:
+          SHARDS_RESULT: ${{ needs.mutants-diff-shard.result }}
+        run: |
+          if [ "$SHARDS_RESULT" != success ]; then
+            echo "The mutants-diff-shard jobs ended with result $SHARDS_RESULT: see the shard logs" >&2
+            exit 1
+          fi

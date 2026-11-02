@@ -81,7 +81,7 @@ jobs:
       - run: corepack enable pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.12.1'
+          node-version: '26.13.0'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level=high
@@ -150,6 +150,10 @@ jobs:
             mkdir "$name"
             install -m 755 "dist/linux_$arch/vigilant-heron" "$name/vigilant-heron"
             cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/README.md" "$name/"
+            # packaging/install.sh finds the binary at ../vigilant-heron and the sample at ../examples.
+            cp -R "$GITHUB_WORKSPACE/packaging" "$name/"
+            mkdir "$name/examples"
+            cp "$GITHUB_WORKSPACE/examples/vigilant-heron.conf" "$name/examples/"
             tar -czf "assets/$name.tar.gz" "$name"
           done
           (cd assets && sha256sum -- *.tar.gz > SHA256SUMS)

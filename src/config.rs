@@ -5,6 +5,7 @@
 //! the header names the decision block redacts. Every error names the file and
 //! line of the directive that caused it.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -35,7 +36,7 @@ const DEFAULT_MAX_CONCURRENCY: usize = 64;
 /// Default `max_concurrency_per_client`, capped at `max_concurrency` when that is smaller.
 const DEFAULT_MAX_CONCURRENCY_PER_CLIENT: usize = 8;
 /// Default decision timeout.
-const DEFAULT_TIMEOUT: Duration = Duration::from_millis(300);
+const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Default block threshold for a site.
 const DEFAULT_BLOCK_THRESHOLD: f64 = 0.87;
 /// Default AI-instruction threshold for a site.
@@ -78,8 +79,6 @@ const JEV_MODEL: &str = "jev-latest";
 const JEV_TOKEN_ENV: &str = "TYPESAFE_API_KEY";
 /// The model used when `model` is omitted with backend strands.
 const STRANDS_MODEL: &str = "strands-decider";
-/// Longest request id that is logged; longer values are cut.
-pub(crate) const MAX_REQUEST_ID_BYTES: usize = 128;
 /// File extensions that skip the backend when `static_extensions` is not given.
 const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
     "css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "woff", "woff2", "ttf", "map",
@@ -173,6 +172,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "static_extensions",
     "static_location",
     "static_query_params",
+    "static_query_token",
     "debug_headers",
     "access_log",
     "allow",
@@ -226,6 +226,7 @@ pub const DECISION_DIRECTIVES: &[&str] = &[
     "max_body",
     "redact_header",
     "redact_field",
+    "redact_file_parts",
 ];
 
 /// Validated configuration for the whole proxy.
@@ -243,6 +244,7 @@ pub struct Config {
     /// closing them. `None` waits for them indefinitely, as nginx does by default.
     pub worker_shutdown_timeout: Option<Duration>,
     /// Header whose value is logged as `$request_id`. It is not sent to the decision backend.
+    /// A missing or unusable value is replaced by a generated id.
     pub request_id_header: Option<HeaderName>,
     /// How the client address is chosen.
     pub realip: RealIp,
@@ -289,6 +291,8 @@ pub struct DecisionConfig {
     /// Extra body field names to redact before sending, lowercased. Each name is
     /// matched exactly, with the field name compared case-insensitively.
     pub redact_fields: Vec<String>,
+    /// Whether the content of a multipart file part is replaced by `[REDACTED]`.
+    pub redact_file_parts: bool,
 }
 
 /// Timers and header limits of client connections, set at the top level only.
@@ -393,6 +397,10 @@ pub enum BackendConfig {
 
 /// Configuration for one site, selected by the request `Host`.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each site switch is its own on/off directive, read and checked independently"
+)]
 pub struct SiteConfig {
     /// Host names that select this site, as written in the configuration (normalized).
     pub hosts: Vec<String>,
@@ -436,6 +444,8 @@ pub struct SiteConfig {
     pub static_locations: Vec<String>,
     /// Query parameters, such as `ver`, that a static asset request may carry and still skip.
     pub static_query_params: Vec<String>,
+    /// Whether a static asset request whose query is one bare token (`?wp-mce-49110-20250317`) may skip.
+    pub static_query_token: bool,
     /// Whether responses carry the `x-vigilant-heron` header.
     pub debug_headers: bool,
     /// The site's own access logs. `None` inherits the top-level ones; `Some(empty)` is `access_log off`.
@@ -511,6 +521,23 @@ pub enum FailureAction {
     Block,
 }
 
+/// A configuration read for a check that calls no backend: `-t`, `-T` and `test-request`.
+///
+/// It is for checks only. Do not serve from it: a token that is not set holds a
+/// placeholder, and the router would start without a real token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedConfig {
+    /// The configuration. A token that is not set holds a placeholder, which is never sent.
+    pub config: Config,
+    /// The token variable that is not set, when the configuration names one. The router
+    /// will not start without it.
+    pub unset_token: Option<String>,
+}
+
+/// The token a check uses for a variable that is not set. A check calls no backend, so
+/// the placeholder is never sent.
+const UNSET_TOKEN_PLACEHOLDER: &str = "not-set-for-check";
+
 impl Config {
     /// Reads the configuration file at `path`, following its includes.
     ///
@@ -521,6 +548,23 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let directives = conf::load_file(path)?;
         build(&directives, &|name| std::env::var(name).ok())
+    }
+
+    /// Reads the configuration file at `path` for a check that calls no backend, as
+    /// `-t`, `-T` and `test-request` do. A token variable that is not set is not an
+    /// error here: its name is returned in [`CheckedConfig::unset_token`], and the
+    /// check passes on the rest of the file. A variable that is set but blank is still
+    /// an error. [`Config::load`] is unchanged, so starting the router still needs it.
+    ///
+    /// This is for checks only. Never serve from the returned configuration: the token
+    /// may be a placeholder, and [`Config::load`] is the one to start the router with.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Config::load`], except for an unset token variable.
+    pub fn load_for_check(path: &Path) -> Result<CheckedConfig, ConfigError> {
+        let directives = conf::load_file(path)?;
+        check_directives(&directives, &|name| std::env::var(name).ok())
     }
 
     /// Parses configuration text, named `origin` in error messages. Includes are
@@ -1507,6 +1551,7 @@ where
     let mut inspect_body = DEFAULT_INSPECT_BODY;
     let mut redact_headers = Vec::new();
     let mut redact_fields = Vec::new();
+    let mut redact_file_parts = true;
     let mut backend_line = directive;
     let mut token_line = directive;
     let mut model_line = directive;
@@ -1589,6 +1634,10 @@ where
                     ));
                 }
                 redact_fields.extend(child.args.iter().map(|f| f.to_ascii_lowercase()));
+            }
+            "redact_file_parts" => {
+                once(&mut seen, child)?;
+                redact_file_parts = parse_bool(child, one_arg(child)?)?;
             }
             other => {
                 return Err(invalid(
@@ -1729,6 +1778,26 @@ where
         inspect_body_bytes: inspect_body,
         redact_headers,
         redact_fields,
+        redact_file_parts,
+    })
+}
+
+/// Builds the configuration for a check. A token variable that `lookup` does not give is
+/// replaced by [`UNSET_TOKEN_PLACEHOLDER`] and recorded, so the build goes on.
+fn check_directives<F>(directives: &[Directive], lookup: &F) -> Result<CheckedConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let unset = RefCell::new(None);
+    let config = build(directives, &|name: &str| {
+        lookup(name).or_else(|| {
+            *unset.borrow_mut() = Some(name.to_owned());
+            Some(UNSET_TOKEN_PLACEHOLDER.to_owned())
+        })
+    })?;
+    Ok(CheckedConfig {
+        config,
+        unset_token: unset.into_inner(),
     })
 }
 
@@ -1841,6 +1910,7 @@ fn parse_site(
     let mut static_extensions: Option<Vec<String>> = None;
     let mut static_locations: Vec<String> = Vec::new();
     let mut static_query_params: Vec<String> = Vec::new();
+    let mut static_query_token = false;
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
@@ -1997,6 +2067,10 @@ fn parse_site(
                 }
                 static_query_params.extend(child.args.iter().cloned());
             }
+            "static_query_token" => {
+                once(&mut seen, child)?;
+                static_query_token = parse_bool(child, one_arg(child)?)?;
+            }
             "debug_headers" => {
                 once(&mut seen, child)?;
                 debug_headers = parse_bool(child, one_arg(child)?)?;
@@ -2139,6 +2213,7 @@ fn parse_site(
         }),
         static_locations,
         static_query_params,
+        static_query_token,
         debug_headers,
         access_logs,
         timeouts,
@@ -2207,7 +2282,7 @@ mod tests {
         assert_eq!(config.worker_threads, None);
         assert_eq!(config.max_connections, 1024);
         assert_eq!(config.default_status, StatusCode::MISDIRECTED_REQUEST);
-        assert_eq!(config.decision.timeout, Duration::from_millis(300));
+        assert_eq!(config.decision.timeout, Duration::from_millis(2000));
         assert_eq!(config.decision.queue_timeout, Duration::ZERO);
         assert_eq!(config.decision.max_concurrency, 64);
         assert_eq!(config.decision.inspect_body_bytes, 8192);
@@ -2285,6 +2360,53 @@ mod tests {
                     site example.com {\n    upstream http://upstream:80;\n}\n";
         let result = Config::parse_str_with_lookup(text, "test.conf", |_| Some("   ".to_owned()));
         assert!(message(result).contains("is empty"));
+    }
+
+    /// Reads `text` for a check, with the token variables read through `lookup`.
+    fn check(
+        text: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<CheckedConfig, ConfigError> {
+        let directives = conf::parse_source(text, "test.conf")?;
+        check_directives(&directives, &lookup)
+    }
+
+    const UNSET_TOKEN_TEXT: &str = "listen 127.0.0.1:8080;\ndecision {\n    api_token_env ABSENT;\n}\n\
+                                    site example.com {\n    upstream http://upstream:80;\n}\n";
+
+    #[test]
+    fn a_check_names_an_unset_token_variable_and_still_loads() -> Result<(), ConfigError> {
+        let checked = check(UNSET_TOKEN_TEXT, |_| None)?;
+        assert_eq!(checked.unset_token.as_deref(), Some("ABSENT"));
+        assert!(matches!(
+            &checked.config.decision.backend,
+            BackendConfig::Jev { token, .. } if token.expose() == UNSET_TOKEN_PLACEHOLDER
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_check_names_no_token_variable_when_the_variable_is_set() -> Result<(), ConfigError> {
+        let checked = check(UNSET_TOKEN_TEXT, |_| Some("tok-123".to_owned()))?;
+        assert_eq!(checked.unset_token, None);
+        assert!(matches!(
+            &checked.config.decision.backend,
+            BackendConfig::Jev { token, .. } if token.expose() == "tok-123"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_check_still_rejects_a_blank_token_variable() {
+        let result = check(UNSET_TOKEN_TEXT, |_| Some("   ".to_owned()));
+        assert!(message(result).contains("ABSENT (api_token_env) is empty"));
+    }
+
+    #[test]
+    fn a_check_still_reports_other_errors_with_their_line() {
+        let text = "listen 127.0.0.1:8080;\ndecision {\n    backend nope;\n}\n\
+                    site example.com {\n    upstream http://upstream:80;\n}\n";
+        assert!(message(check(text, |_| None)).contains("test.conf:3:"));
     }
 
     #[rstest]
@@ -2612,6 +2734,13 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_static_extensions_list_turns_the_static_skip_off() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    static_extensions;\n"))?;
+        assert_eq!(first_site(&config)?.static_extensions, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
     fn debug_headers_takes_on_or_off() -> Result<(), ConfigError> {
         let config = parse(&with_site("    debug_headers on;\n"))?;
         assert!(first_site(&config)?.debug_headers);
@@ -2868,6 +2997,38 @@ mod tests {
     }
 
     #[test]
+    fn static_query_token_is_off_when_the_directive_is_absent() -> Result<(), ConfigError> {
+        let config = parse(&with_site(""))?;
+        assert!(!first_site(&config)?.static_query_token);
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_token_set_to_on_is_enabled() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    static_query_token on;\n"))?;
+        assert!(first_site(&config)?.static_query_token);
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_token_refuses_a_value_other_than_on_or_off() {
+        assert!(
+            message(parse(&with_site("    static_query_token yes;\n")))
+                .contains("\"static_query_token\" must be \"on\" or \"off\"")
+        );
+    }
+
+    #[test]
+    fn static_query_token_refuses_a_duplicate_directive() {
+        assert!(
+            message(parse(&with_site(
+                "    static_query_token on;\n    static_query_token off;\n"
+            )))
+            .contains("duplicate directive \"static_query_token\"")
+        );
+    }
+
+    #[test]
     fn max_concurrency_per_client_defaults_to_eight_capped_at_the_global_cap()
     -> Result<(), ConfigError> {
         let config = parse(&with_decision("    backend http;\n"))?;
@@ -2905,6 +3066,41 @@ mod tests {
     fn redact_field_needs_a_name() {
         let text = with_decision("    backend http;\n    redact_field;\n");
         assert!(message(parse(&text)).contains("\"redact_field\" needs at least one field name"));
+    }
+
+    #[test]
+    fn redact_file_parts_defaults_to_on() -> Result<(), ConfigError> {
+        let config = parse(&with_decision("    backend http;\n"))?;
+        assert!(config.decision.redact_file_parts);
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::on("on", true)]
+    #[case::off("off", false)]
+    fn redact_file_parts_reads_on_and_off(
+        #[case] value: &str,
+        #[case] expected: bool,
+    ) -> Result<(), ConfigError> {
+        let text = with_decision(&format!(
+            "    backend http;\n    redact_file_parts {value};\n"
+        ));
+        assert_eq!(parse(&text)?.decision.redact_file_parts, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn redact_file_parts_rejects_other_values() {
+        let text = with_decision("    backend http;\n    redact_file_parts yes;\n");
+        assert!(message(parse(&text)).contains("\"redact_file_parts\" must be \"on\" or \"off\""));
+    }
+
+    #[test]
+    fn redact_file_parts_is_set_once() {
+        let text = with_decision(
+            "    backend http;\n    redact_file_parts on;\n    redact_file_parts off;\n",
+        );
+        assert!(message(parse(&text)).contains("duplicate directive \"redact_file_parts\""));
     }
 
     #[test]

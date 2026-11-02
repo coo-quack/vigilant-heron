@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
 use common::{
-    BoxError, GatedDecider, Reply, TestResult, Upstream, closed_port_url, send, start_proxy_config,
+    BoxError, GatedDecider, Reply, TestResult, Upstream, closed_port_url, request_id_header, send,
+    start_proxy_config,
 };
 use http::{Method, StatusCode};
 use rstest::rstest;
@@ -533,6 +534,13 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
         excess_expected,
         "the excess follows on_client_busy"
     );
+    // Only the router's own 429 carries the request id; an answer forwarded from the backend does not.
+    let expected_header = if excess_expected == 429 {
+        "flood-excess"
+    } else {
+        ""
+    };
+    assert_eq!(request_id_header(&excess), expected_header);
     let excess_line = wait_for_access_line(&log, "flood-excess").await?;
     assert_eq!(excess_line["decision_error"], "client_busy");
     assert_eq!(excess_line["reason"], excess_reason);
@@ -554,10 +562,11 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
     proxy.stop().await
 }
 
-/// Without failure directives, a client over its share is answered 429 and the backend is
-/// not called.
+/// Without failure directives, a client over its share is answered 429 with its request id and an
+/// empty body, and the backend is not called.
 #[tokio::test]
-async fn client_busy_defaults_to_429_without_calling_the_backend() -> TestResult {
+async fn client_busy_defaults_to_429_with_the_request_id_without_calling_the_backend() -> TestResult
+{
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
     let mut setup = Setup::new(fake.url.clone(), upstream.url());
@@ -585,6 +594,7 @@ async fn client_busy_defaults_to_429_without_calling_the_backend() -> TestResult
 
     assert_eq!(excess.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(excess.text().is_empty(), "the 429 has an empty body");
+    assert_eq!(request_id_header(&excess), "default-excess");
     assert_eq!(
         fake.calls.load(Ordering::SeqCst),
         calls_before,
@@ -764,6 +774,74 @@ site example.com {{
     proxy.stop().await
 }
 
+/// The 2000 ms default is the same for each backend, so a `decision` block with no `timeout` line
+/// gets it whichever backend it names.
+#[rstest]
+#[case::jev("backend jev;")]
+#[case::clef(
+    "backend clef;\n    model clef-flash;\n    url \"https://example.test/clef\";\n    api_token_env CLOUDFLARE_AI_TOKEN;"
+)]
+#[case::strands("backend strands;\n    url \"http://127.0.0.1:9/v1/systemone\";")]
+#[case::http("backend http;\n    url \"http://127.0.0.1:9/decide\";")]
+fn decision_timeout_defaults_to_2000_ms_for_every_backend_when_the_directive_is_absent(
+    #[case] decision: &str,
+) -> TestResult {
+    let text = format!(
+        "listen 127.0.0.1:0;\ndecision {{\n    {decision}\n}}\n\
+         site example.com {{\n    upstream \"http://127.0.0.1:9\";\n}}\n"
+    );
+    let config =
+        Config::parse_str_with_lookup(&text, "test.conf", |_| Some("test-token".to_owned()))?;
+    assert_eq!(config.decision.timeout, Duration::from_millis(2000));
+    Ok(())
+}
+
+/// With the default timeout, a backend that answers at once is judged at once, not after the timeout.
+#[tokio::test]
+async fn fast_backend_answer_is_judged_without_waiting_for_the_default_timeout() -> TestResult {
+    let decider = GatedDecider::start().await?;
+    decider.release(1);
+    let upstream = Upstream::start().await?;
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+
+decision {{
+    backend http;
+    url "{decide}";
+}}
+
+default_status 421;
+
+site example.com {{
+    upstream "{upstream}";
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+}}
+"#,
+        decide = decider.decide_url(),
+        upstream = upstream.url(),
+    );
+    let proxy = start_proxy_config(Config::parse_str(&text, "test.conf")?).await?;
+    let started = Instant::now();
+    let reply = get_as(&proxy.base(), "/fast", "203.0.113.1", "default-fast").await?;
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "the backend's low score forwards the request"
+    );
+    // The stub answers at once over loopback, so 1000 ms is far below the 2000 ms default and
+    // still leaves room for a loaded runner.
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "the fast answer came after {elapsed:?}, which is not an immediate judgment"
+    );
+    proxy.stop().await
+}
+
 /// A client over its share whose request body is still unread gets 429, and the connection closes.
 #[tokio::test]
 async fn client_busy_refusal_with_an_unread_body_closes_the_connection() -> TestResult {
@@ -809,5 +887,27 @@ async fn client_busy_refusal_with_an_unread_body_closes_the_connection() -> Test
 
     assert!(head.starts_with("http/1.1 429"), "{head}");
     assert!(head.contains("connection: close"), "{head}");
+    proxy.stop().await
+}
+
+/// A backend 429 that `on_rate_limit block` turns into a block answers with the request id.
+#[tokio::test]
+async fn a_rate_limit_blocked_by_on_rate_limit_carries_the_request_id_header() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.on_rate_limit = "block";
+    let proxy = start_proxy_config(setup.config()?).await?;
+
+    let reply = get_as(
+        &proxy.base(),
+        "/articles/ratelimited",
+        "203.0.113.1",
+        "rate-blocked-1",
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(request_id_header(&reply), "rate-blocked-1");
     proxy.stop().await
 }

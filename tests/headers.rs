@@ -233,3 +233,60 @@ async fn a_request_without_a_body_is_forwarded_without_a_content_length() -> Tes
     assert_eq!(received(&echo, "transfer-encoding"), None);
     proxy.stop().await
 }
+
+#[tokio::test]
+async fn a_proxy_set_header_request_id_is_the_generated_id_when_the_request_has_none() -> TestResult
+{
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream.url(),
+        "request_id_header x-request-id;",
+        "proxy_set_header X-Id $request_id;",
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/hello",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let id = received(&reply.json(), "x-id").unwrap_or_default();
+    assert_eq!(id.len(), 16, "{id}");
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{id}");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_proxy_set_header_request_id_is_the_client_id_when_the_request_has_one() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream.url(),
+        "request_id_header x-request-id;",
+        "proxy_set_header X-Id $request_id;",
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/hello",
+        "example.com",
+        &[("x-request-id", "given-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(received(&reply.json(), "x-id").as_deref(), Some("given-1"));
+    proxy.stop().await
+}

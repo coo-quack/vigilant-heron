@@ -12,9 +12,10 @@ use anyhow::{Context, anyhow, bail};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process};
 
-use vigilant_heron::SuggestOptions;
+use vigilant_heron::{ShadowOptions, SuggestOptions};
 
 use crate::pidfile;
+use crate::request_url::UrlRequest;
 
 /// What `-s` asks the running router to do, as nginx's `-s` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,14 @@ pub(crate) enum Command {
         /// The client address the access list sees.
         client: IpAddr,
     },
+    /// `test-request --url <url>`: screen the request that a URL describes, and print the report,
+    /// without calling the backend.
+    TestUrl {
+        /// The request built from the URL and its options.
+        request: UrlRequest,
+        /// The client address the access list sees.
+        client: IpAddr,
+    },
     /// `suggest-skip-rules <file>`: suggest skip rules from a `json` access log and print them.
     /// Nothing is applied, and the configuration is not read.
     SuggestSkipRules {
@@ -86,6 +95,14 @@ pub(crate) enum Command {
         file: PathBuf,
         /// The site filter and the learning thresholds.
         options: SuggestOptions,
+    },
+    /// `shadow-report <file>...`: summarize `json` access logs from a shadow trial and print
+    /// the report. Nothing is sent to a backend, and the configuration is not read.
+    ShadowReport {
+        /// The access logs, read in the order given. Each is a plain file.
+        files: Vec<PathBuf>,
+        /// The list limit, the price for the cost estimate, and the address form.
+        options: ShadowOptions,
     },
     /// `-h`, `--help`.
     Help,
@@ -107,8 +124,12 @@ pub(crate) const USAGE: &str = "\
 Usage: vigilant-heron [-h] [-v] [-t] [-T] [-c <path>] [-s <signal>]
        vigilant-heron start|stop|restart [-c <path>]
        vigilant-heron test-request <file> [-c <path>] [--client <address>]
+       vigilant-heron test-request --url <url> [--host <name>] [--method <m>]
+                             [--header 'Name: value'] [-c <path>] [--client <address>]
        vigilant-heron suggest-skip-rules <file> [--site <name>] [--min-judged <n>] [--min-clients <n>]
                              [--min-days <n>] [--max-attack <x>] [--max-ai-instruction <x>]
+       vigilant-heron shadow-report <file>... [--max-lines <n>] [--usd-per-mtok <price>]
+                             [--full-addresses]
 
 Options:
   -h, --help            show this help and exit
@@ -125,6 +146,13 @@ Options:
                         use -s reload for configuration changes: it keeps connections
   test-request <file>   report what the router would do with a raw HTTP/1.1 request
                         in <file> (- reads stdin), without calling the decision backend
+  test-request --url <url>
+                        the same, with the request built from a URL: http:// or https://
+                        sets the Host header, and a path (starting with /) needs --host
+  --host <name>         test-request --url: the Host header for a path
+  --method <m>          test-request --url: the request method (default GET)
+  --header 'Name: value'
+                        test-request --url: a request header; repeat it for more
   --client <address>    client address for the access list with test-request
                         (default 127.0.0.1; real_ip settings are not applied)
   suggest-skip-rules <file>
@@ -138,6 +166,14 @@ Options:
   --max-ai-instruction <x>
                         suggest-skip-rules: highest ai_instruction score allowed,
                         0 to 1 (default 0.3)
+  shadow-report <file>...
+                        summarize json access logs from a shadow trial (several files
+                        are read in order; plain files only); prints the report and
+                        never reads the configuration
+  --max-lines <n>       shadow-report: would-block and block lines to list (default 50)
+  --usd-per-mtok <price>
+                        shadow-report: USD per million input tokens, to estimate the cost
+  --full-addresses      shadow-report: print client addresses in full (default: shortened)
 ";
 
 /// The options of `suggest-skip-rules`, with their names as the command line writes them.
@@ -149,6 +185,54 @@ const SUGGEST_FLAGS: [&str; 6] = [
     "--max-attack",
     "--max-ai-instruction",
 ];
+
+/// The options of `shadow-report`, with their names as the command line writes them.
+const SHADOW_FLAGS: [&str; 2] = ["--max-lines", "--usd-per-mtok"];
+
+/// The options of `test-request --url`, as written. `--header` may repeat.
+#[derive(Default)]
+struct RequestWords {
+    url: Option<String>,
+    host: Option<String>,
+    method: Option<String>,
+    headers: Vec<String>,
+}
+
+/// The options of `test-request --url`, with their names as the command line writes them.
+const REQUEST_FLAGS: [&str; 4] = ["--url", "--host", "--method", "--header"];
+
+impl RequestWords {
+    /// Stores the value of one option. Each option may be given once, except `--header`.
+    fn set(&mut self, flag: &str, value: &str) -> Result<(), String> {
+        let slot = match flag {
+            "--url" => &mut self.url,
+            "--host" => &mut self.host,
+            "--method" => &mut self.method,
+            _ => {
+                self.headers.push(value.to_owned());
+                return Ok(());
+            }
+        };
+        if slot.is_some() {
+            return Err(format!("{flag} is given more than once"));
+        }
+        *slot = Some(value.to_owned());
+        Ok(())
+    }
+
+    /// The first of the `test-request --url` options that is given, by its name.
+    fn first(&self) -> Option<&'static str> {
+        [
+            ("--url", self.url.is_some()),
+            ("--host", self.host.is_some()),
+            ("--method", self.method.is_some()),
+            ("--header", !self.headers.is_empty()),
+        ]
+        .into_iter()
+        .find(|(_, given)| *given)
+        .map(|(flag, _)| flag)
+    }
+}
 
 /// The words and options of a command line, read before the action is chosen.
 #[derive(Default)]
@@ -163,14 +247,22 @@ struct Words<'a> {
     dump: bool,
     request_check: bool,
     suggest: bool,
+    shadow: bool,
     signal: Option<SignalCommand>,
     lifecycle: Option<&'a str>,
     config: Option<PathBuf>,
     client: Option<IpAddr>,
-    /// Bare arguments: the request file of test-request or suggest-skip-rules. Any other use is an error.
+    /// The `test-request --url` options.
+    request: RequestWords,
+    /// Bare arguments: the request file of test-request, the access logs of suggest-skip-rules
+    /// or shadow-report. Any other use is an error.
     operands: Vec<&'a str>,
     /// The `suggest-skip-rules` options, as written, with the value of each.
     suggest_values: Vec<(&'a str, String)>,
+    /// The `shadow-report` options, as written, with the value of each.
+    shadow_values: Vec<(&'a str, String)>,
+    /// `--full-addresses`: shadow-report prints client addresses in full.
+    full_addresses: bool,
 }
 
 /// Reads the command line. The first error is returned as text for the usage message.
@@ -202,6 +294,13 @@ fn read_words(args: &[String]) -> Result<Words<'_>, String> {
                 }
                 words.suggest = true;
             }
+            "shadow-report" => {
+                if words.shadow {
+                    return Err("shadow-report is given more than once".to_owned());
+                }
+                words.shadow = true;
+            }
+            "--full-addresses" => words.full_addresses = true,
             "-h" | "--help" => words.help = true,
             "-v" | "--version" => words.version = true,
             "-t" => words.test = true,
@@ -211,6 +310,10 @@ fn read_words(args: &[String]) -> Result<Words<'_>, String> {
             }
             "-c" | "--config" => words.config = Some(path_value(arg, rest.next())?),
             "--client" => words.client = Some(address_value(arg, rest.next())?),
+            "--url" | "--host" | "--method" | "--header" => {
+                let value = rest.next().ok_or_else(|| format!("{arg} needs a value"))?;
+                words.request.set(arg, value)?;
+            }
             "-s" => {
                 if words.signal.is_some() {
                     return Err("-s is given more than once".to_owned());
@@ -225,19 +328,31 @@ fn read_words(args: &[String]) -> Result<Words<'_>, String> {
                 let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
                 words.suggest_values.push((flag, value.clone()));
             }
+            flag if SHADOW_FLAGS.contains(&flag) => {
+                let value = rest.next().ok_or_else(|| format!("{flag} needs a value"))?;
+                words.shadow_values.push((flag, value.clone()));
+            }
             "-" => words.operands.push("-"),
             other => match (
                 other.strip_prefix("--config="),
                 other.strip_prefix("--client="),
-                suggest_flag_value(other),
+                flag_value(other, &SUGGEST_FLAGS),
+                flag_value(other, &SHADOW_FLAGS),
+                flag_value(other, &REQUEST_FLAGS),
             ) {
-                (Some(value), _, _) => {
+                (Some(value), _, _, _, _) => {
                     words.config = Some(path_value("--config", Some(&value.to_owned()))?);
                 }
-                (_, Some(value), _) => {
+                (_, Some(value), _, _, _) => {
                     words.client = Some(address_value("--client", Some(&value.to_owned()))?);
                 }
-                (_, _, Some((flag, value))) => words.suggest_values.push((flag, value.to_owned())),
+                (_, _, Some((flag, value)), _, _) => {
+                    words.suggest_values.push((flag, value.to_owned()));
+                }
+                (_, _, _, Some((flag, value)), _) => {
+                    words.shadow_values.push((flag, value.to_owned()));
+                }
+                (_, _, _, _, Some((flag, value))) => words.request.set(flag, value)?,
                 _ if other.starts_with('-') => return Err(format!("unknown option \"{other}\"")),
                 _ => words.operands.push(other),
             },
@@ -246,28 +361,42 @@ fn read_words(args: &[String]) -> Result<Words<'_>, String> {
     Ok(words)
 }
 
-/// Checks how the words combine, then chooses the one action.
-fn choose_command(words: Words<'_>) -> Result<Options, String> {
+/// Refuses the option words that do not belong to the action the command line names.
+fn check_combinations(words: &Words<'_>) -> Result<(), String> {
     let Words {
         help,
         version,
-        test,
-        dump,
         request_check,
         suggest,
-        signal,
-        lifecycle,
-        config,
+        shadow,
         client,
+        request,
         operands,
         suggest_values,
+        shadow_values,
+        full_addresses,
+        ..
     } = words;
+    let (help, version, request_check, suggest, shadow, full_addresses) = (
+        *help,
+        *version,
+        *request_check,
+        *suggest,
+        *shadow,
+        *full_addresses,
+    );
     if !help && !version && !request_check {
-        if !suggest && let Some(operand) = operands.first() {
+        if !suggest
+            && !shadow
+            && let Some(operand) = operands.first()
+        {
             return Err(format!("unknown option \"{operand}\""));
         }
         if client.is_some() {
             return Err("--client can only be used with test-request".to_owned());
+        }
+        if let Some(flag) = request.first() {
+            return Err(format!("{flag} can only be used with test-request"));
         }
     }
     if !help
@@ -277,15 +406,60 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
     {
         return Err(format!("{flag} can only be used with suggest-skip-rules"));
     }
+    if !help && !version && !shadow {
+        if let Some((flag, _)) = shadow_values.first() {
+            return Err(format!("{flag} can only be used with shadow-report"));
+        }
+        if full_addresses {
+            return Err("--full-addresses can only be used with shadow-report".to_owned());
+        }
+    }
     if request_check && suggest {
         return Err("suggest-skip-rules cannot be combined with test-request".to_owned());
     }
+    if request_check && shadow {
+        return Err("shadow-report cannot be combined with test-request".to_owned());
+    }
+    if suggest && shadow {
+        return Err("shadow-report cannot be combined with suggest-skip-rules".to_owned());
+    }
+    Ok(())
+}
+
+/// Checks how the words combine, then chooses the one action.
+fn choose_command(words: Words<'_>) -> Result<Options, String> {
+    check_combinations(&words)?;
+    let Words {
+        help,
+        version,
+        test,
+        dump,
+        request_check,
+        suggest,
+        shadow,
+        signal,
+        lifecycle,
+        config,
+        client,
+        request,
+        operands,
+        suggest_values,
+        shadow_values,
+        full_addresses,
+    } = words;
     let command = if help {
         Command::Help
     } else if version {
         Command::Version
     } else if request_check {
-        test_request_command(&operands, client, lifecycle, test, signal.is_some())?
+        test_request_command(
+            &operands,
+            client,
+            lifecycle,
+            test,
+            signal.is_some(),
+            &request,
+        )?
     } else if suggest {
         suggest_command(
             &operands,
@@ -294,6 +468,15 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
             test,
             signal.is_some(),
             &suggest_values,
+        )?
+    } else if shadow {
+        shadow_command(
+            &operands,
+            config.is_some(),
+            lifecycle,
+            test,
+            signal.is_some(),
+            shadow_options(&shadow_values, full_addresses)?,
         )?
     } else if let Some(word) = lifecycle {
         if test {
@@ -320,14 +503,15 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
     Ok(Options { config, command })
 }
 
-/// The command of `test-request <file>`. The file is the one bare operand, and the
-/// word may not be combined with the other actions.
+/// The command of `test-request <file>` or `test-request --url <url>`. The file is the one
+/// bare operand, and the word may not be combined with the other actions.
 fn test_request_command(
     operands: &[&str],
     client: Option<IpAddr>,
     lifecycle: Option<&str>,
     test: bool,
     signal: bool,
+    request: &RequestWords,
 ) -> Result<Command, String> {
     if let Some(word) = lifecycle {
         return Err(format!("test-request cannot be combined with {word}"));
@@ -338,15 +522,31 @@ fn test_request_command(
     if signal {
         return Err("test-request cannot be combined with -s".to_owned());
     }
+    let client = client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    if let Some(url) = &request.url {
+        if !operands.is_empty() {
+            return Err("give either --url or a request file, not both".to_owned());
+        }
+        let built = UrlRequest::new(
+            url,
+            request.host.as_deref(),
+            request.method.as_deref(),
+            &request.headers,
+        )?;
+        return Ok(Command::TestUrl {
+            request: built,
+            client,
+        });
+    }
+    if let Some(flag) = request.first() {
+        return Err(format!("{flag} can only be used with --url"));
+    }
     let file = match operands {
         [only] => PathBuf::from(only),
         [] => return Err("test-request needs a request file (or - for stdin)".to_owned()),
         _ => return Err("give only one request file".to_owned()),
     };
-    Ok(Command::TestRequest {
-        file,
-        client: client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    })
+    Ok(Command::TestRequest { file, client })
 }
 
 /// The command of `suggest-skip-rules <file>`. The file is the one bare operand. The word
@@ -384,16 +584,85 @@ fn suggest_command(
     })
 }
 
+/// The command of `shadow-report <file>...`. Each bare operand is an access log, read in
+/// the order given. The word reads only the logs, so `-c` and the other actions are errors.
+fn shadow_command(
+    operands: &[&str],
+    config_given: bool,
+    lifecycle: Option<&str>,
+    test: bool,
+    signal: bool,
+    options: ShadowOptions,
+) -> Result<Command, String> {
+    if config_given {
+        return Err("shadow-report reads only the access logs; -c is not used".to_owned());
+    }
+    if let Some(word) = lifecycle {
+        return Err(format!("shadow-report cannot be combined with {word}"));
+    }
+    if test {
+        return Err("shadow-report cannot be combined with -t or -T".to_owned());
+    }
+    if signal {
+        return Err("shadow-report cannot be combined with -s".to_owned());
+    }
+    if operands.is_empty() {
+        return Err("shadow-report needs at least one access log file".to_owned());
+    }
+    Ok(Command::ShadowReport {
+        files: operands.iter().map(PathBuf::from).collect(),
+        options,
+    })
+}
+
+/// The options of `shadow-report`. Each option may be given once. The defaults are the
+/// ones the documentation states.
+fn shadow_options(
+    values: &[(&str, String)],
+    full_addresses: bool,
+) -> Result<ShadowOptions, String> {
+    let mut options = ShadowOptions {
+        full_addresses,
+        ..ShadowOptions::default()
+    };
+    let mut seen: Vec<&str> = Vec::new();
+    for (flag, value) in values {
+        note_option(&mut seen, flag)?;
+        match *flag {
+            "--max-lines" => options.max_lines = count_value(flag, value)?,
+            "--usd-per-mtok" => options.usd_per_mtok = Some(price_value(flag, value)?),
+            other => return Err(format!("unknown option \"{other}\"")),
+        }
+    }
+    Ok(options)
+}
+
+/// Reads a price in USD, which must be a number above 0.
+fn price_value(option: &str, value: &str) -> Result<f64, String> {
+    match value.parse::<f64>() {
+        Ok(price) if price.is_finite() && price > 0.0 => Ok(price),
+        _ => Err(format!(
+            "{option} must be a number above 0, not \"{value}\""
+        )),
+    }
+}
+
+/// Records one option of an action. An option that the action already has is refused.
+fn note_option<'a>(seen: &mut Vec<&'a str>, flag: &'a str) -> Result<(), String> {
+    if seen.contains(&flag) {
+        return Err(format!("{flag} is given more than once"));
+    }
+    seen.push(flag);
+    Ok(())
+}
+
 /// The site filter and thresholds from the `suggest-skip-rules` options. Each option may
 /// be given once. The defaults are the thresholds of the documentation.
 fn suggest_options(values: &[(&str, String)]) -> Result<SuggestOptions, String> {
     let mut options = SuggestOptions::default();
     let mut seen: Vec<&str> = Vec::new();
     for (flag, value) in values {
-        if seen.contains(flag) {
-            return Err(format!("{flag} is given more than once"));
-        }
-        seen.push(flag);
+        note_option(&mut seen, flag)?;
         match *flag {
             "--site" => {
                 if value.is_empty() {
@@ -432,10 +701,10 @@ fn score_value(option: &str, value: &str) -> Result<f64, String> {
     }
 }
 
-/// Splits `--name=value` for a `suggest-skip-rules` option. The name is one of [`SUGGEST_FLAGS`].
-fn suggest_flag_value(arg: &str) -> Option<(&'static str, &str)> {
+/// Splits `--name=value` for one of `flags`, the options of one action.
+fn flag_value<'a>(arg: &'a str, flags: &[&'static str]) -> Option<(&'static str, &'a str)> {
     let (name, value) = arg.split_once('=')?;
-    let flag = SUGGEST_FLAGS.into_iter().find(|flag| *flag == name)?;
+    let flag = flags.iter().copied().find(|flag| *flag == name)?;
     Some((flag, value))
 }
 
@@ -560,7 +829,17 @@ mod tests {
     #[case::suggest_with_thresholds(&["suggest-skip-rules", "log.json", "--min-judged", "60", "--min-clients=12", "--min-days", "4", "--max-attack", "0.2", "--max-ai-instruction=0.25"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions { min_judged: 60, min_clients: 12, min_days: 4, max_attack: 0.2, max_ai_instruction: 0.25, ..SuggestOptions::default() } } })]
     #[case::suggest_score_one(&["suggest-skip-rules", "log.json", "--max-attack", "1"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions { max_attack: 1.0, ..SuggestOptions::default() } } })]
     #[case::suggest_help_wins(&["suggest-skip-rules", "-h"], Options { config: None, command: Command::Help })]
+    #[case::shadow_with_files(&["shadow-report", "a.json", "b.json"], Options { config: None, command: Command::ShadowReport { files: vec![PathBuf::from("a.json"), PathBuf::from("b.json")], options: ShadowOptions::default() } })]
+    #[case::shadow_file_before_word(&["a.json", "shadow-report"], Options { config: None, command: Command::ShadowReport { files: vec![PathBuf::from("a.json")], options: ShadowOptions::default() } })]
+    #[case::shadow_with_options(&["shadow-report", "a.json", "--max-lines", "5", "--usd-per-mtok=3.5", "--full-addresses"], Options { config: None, command: Command::ShadowReport { files: vec![PathBuf::from("a.json")], options: ShadowOptions { max_lines: 5, usd_per_mtok: Some(3.5), full_addresses: true } } })]
+    #[case::shadow_full_addresses_before_word(&["--full-addresses", "shadow-report", "a.json"], Options { config: None, command: Command::ShadowReport { files: vec![PathBuf::from("a.json")], options: ShadowOptions { full_addresses: true, ..ShadowOptions::default() } } })]
+    #[case::shadow_help_wins(&["shadow-report", "-h"], Options { config: None, command: Command::Help })]
     #[case::help_wins_over_test_request(&["test-request", "-h"], Options { config: None, command: Command::Help })]
+    #[case::test_url_absolute(&["test-request", "--url", "http://example.com/a?b=1"], Options { config: None, command: url_request("example.com", "/a?b=1", "GET", &[], LOCALHOST) })]
+    #[case::test_url_with_config(&["-c", "/a.conf", "test-request", "--url", "https://example.com"], Options { config: Some(PathBuf::from("/a.conf")), command: url_request("example.com", "/", "GET", &[], LOCALHOST) })]
+    #[case::test_url_path_with_host(&["test-request", "--url", "/p?q=1", "--host", "example.com"], Options { config: None, command: url_request("example.com", "/p?q=1", "GET", &[], LOCALHOST) })]
+    #[case::test_url_method_and_headers(&["test-request", "--url=http://example.com/", "--method", "post", "--header", "X-A: 1", "--header=X-B: 2"], Options { config: None, command: url_request("example.com", "/", "POST", &["X-A: 1", "X-B: 2"], LOCALHOST) })]
+    #[case::test_url_with_client(&["test-request", "--url", "http://example.com/", "--client", "203.0.113.7"], Options { config: None, command: url_request("example.com", "/", "GET", &[], "203.0.113.7".parse().unwrap_or(LOCALHOST)) })]
     fn a_valid_command_line_parses(#[case] input: &[&str], #[case] expected: Options) {
         assert_eq!(parse_args(&args(input)), Ok(expected));
     }
@@ -619,7 +898,35 @@ mod tests {
         }
     }
 
+    /// The command of `test-request --url` for the request with this host, target, method and headers.
+    fn url_request(
+        host: &str,
+        target: &str,
+        method: &str,
+        headers: &[&str],
+        client: IpAddr,
+    ) -> Command {
+        Command::TestUrl {
+            request: UrlRequest {
+                method: method.to_owned(),
+                host: host.to_owned(),
+                target: target.to_owned(),
+                headers: headers.iter().map(|line| (*line).to_owned()).collect(),
+            },
+            client,
+        }
+    }
+
     const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn test_url_defaults_the_client_to_the_loopback_address() {
+        assert_eq!(
+            parse_args(&args(&["test-request", "--url", "http://example.com/"]))
+                .map(|options| options.command),
+            Ok(url_request("example.com", "/", "GET", &[], LOCALHOST))
+        );
+    }
 
     #[test]
     fn test_request_defaults_the_client_to_the_loopback_address() {
@@ -662,6 +969,42 @@ mod tests {
     #[case::suggest_score_nan(&["suggest-skip-rules", "a.json", "--max-ai-instruction", "NaN"], "--max-ai-instruction must be a number from 0 to 1, not \"NaN\"")]
     #[case::suggest_option_without_word(&["--min-judged", "60"], "--min-judged can only be used with suggest-skip-rules")]
     #[case::site_with_test_request(&["test-request", "req.txt", "--site", "example.test"], "--site can only be used with suggest-skip-rules")]
+    #[case::shadow_without_file(&["shadow-report"], "shadow-report needs at least one access log file")]
+    #[case::shadow_with_config(&["shadow-report", "a.json", "-c", "x.conf"], "shadow-report reads only the access logs; -c is not used")]
+    #[case::shadow_with_test(&["shadow-report", "a.json", "-t"], "shadow-report cannot be combined with -t or -T")]
+    #[case::shadow_with_signal(&["shadow-report", "a.json", "-s", "reload"], "shadow-report cannot be combined with -s")]
+    #[case::shadow_with_start(&["start", "shadow-report", "a.json"], "shadow-report cannot be combined with start")]
+    #[case::shadow_with_test_request(&["shadow-report", "a.json", "test-request", "r.txt"], "shadow-report cannot be combined with test-request")]
+    #[case::shadow_with_suggest(&["shadow-report", "a.json", "suggest-skip-rules"], "shadow-report cannot be combined with suggest-skip-rules")]
+    #[case::shadow_with_client(&["shadow-report", "a.json", "--client", "127.0.0.1"], "--client can only be used with test-request")]
+    #[case::shadow_word_twice(&["shadow-report", "shadow-report", "a.json"], "shadow-report is given more than once")]
+    #[case::shadow_max_lines_zero(&["shadow-report", "a.json", "--max-lines", "0"], "--max-lines must be a whole number of at least 1, not \"0\"")]
+    #[case::shadow_max_lines_without_value(&["shadow-report", "a.json", "--max-lines"], "--max-lines needs a value")]
+    #[case::shadow_max_lines_twice(&["shadow-report", "a.json", "--max-lines", "2", "--max-lines=3"], "--max-lines is given more than once")]
+    #[case::shadow_price_zero(&["shadow-report", "a.json", "--usd-per-mtok", "0"], "--usd-per-mtok must be a number above 0, not \"0\"")]
+    #[case::shadow_price_nan(&["shadow-report", "a.json", "--usd-per-mtok=NaN"], "--usd-per-mtok must be a number above 0, not \"NaN\"")]
+    #[case::shadow_price_infinite(&["shadow-report", "a.json", "--usd-per-mtok", "inf"], "--usd-per-mtok must be a number above 0, not \"inf\"")]
+    #[case::max_lines_without_word(&["--max-lines", "5"], "--max-lines can only be used with shadow-report")]
+    #[case::full_addresses_without_word(&["--full-addresses"], "--full-addresses can only be used with shadow-report")]
+    #[case::full_addresses_with_suggest(&["suggest-skip-rules", "a.json", "--full-addresses"], "--full-addresses can only be used with shadow-report")]
+    #[case::site_with_shadow(&["shadow-report", "a.json", "--site", "example.test"], "--site can only be used with suggest-skip-rules")]
+    #[case::min_judged_with_shadow(&["shadow-report", "a.json", "--min-judged", "3"], "--min-judged can only be used with suggest-skip-rules")]
+    #[case::url_with_a_file(&["test-request", "--url", "http://example.com/", "req.txt"], "give either --url or a request file, not both")]
+    #[case::url_without_value(&["test-request", "--url"], "--url needs a value")]
+    #[case::url_twice(&["test-request", "--url", "http://a.test/", "--url", "http://b.test/"], "--url is given more than once")]
+    #[case::host_twice(&["test-request", "--url", "/p", "--host", "a.test", "--host=b.test"], "--host is given more than once")]
+    #[case::url_with_test(&["test-request", "--url", "http://example.com/", "-t"], "test-request cannot be combined with -t or -T")]
+    #[case::url_fragment(&["test-request", "--url", "http://example.com/#top"], "--url must not contain a fragment (#): a fragment is never sent to the server")]
+    #[case::url_path_without_host(&["test-request", "--url", "/p"], "a URL that starts with / needs --host <name>")]
+    #[case::url_bad_method(&["test-request", "--url", "http://example.com/", "--method", "G@T"], "--method must be a method name, not \"G@T\"")]
+    #[case::host_with_a_file(&["test-request", "req.txt", "--host", "example.com"], "--host can only be used with --url")]
+    #[case::header_with_a_file(&["test-request", "req.txt", "--header", "X-A: 1"], "--header can only be used with --url")]
+    #[case::url_without_the_word(&["--url", "http://example.com/"], "--url can only be used with test-request")]
+    #[case::method_with_start(&["start", "--method", "GET"], "--method can only be used with test-request")]
+    #[case::url_with_suggest(&["suggest-skip-rules", "log.json", "--url", "http://example.com/"], "--url can only be used with test-request")]
+    #[case::url_with_shadow(&["shadow-report", "a.json", "--url", "http://example.com/"], "--url can only be used with test-request")]
+    #[case::method_with_shadow(&["shadow-report", "a.json", "--method", "GET"], "--method can only be used with test-request")]
+    #[case::shadow_with_test_request_url(&["shadow-report", "a.json", "test-request", "--url", "http://example.com/"], "shadow-report cannot be combined with test-request")]
     fn test_request_rejects_combinations_and_bad_operands(
         #[case] input: &[&str],
         #[case] message: &str,
@@ -718,7 +1061,15 @@ mod tests {
         for option in ["-h", "-v", "-c", "-t", "-T", "-s"] {
             assert!(USAGE.contains(option), "usage does not mention {option}");
         }
-        for long in ["--help", "--version", "--config"] {
+        for long in [
+            "--help",
+            "--version",
+            "--config",
+            "--url",
+            "--host",
+            "--method",
+            "--header",
+        ] {
             assert!(USAGE.contains(long), "usage does not mention {long}");
         }
     }

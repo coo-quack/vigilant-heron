@@ -28,7 +28,10 @@ access_log off;                                  # disables access logs; alone o
 these keys in this order: `time`, `request_id`, `client_ip`, `site`, `host`,
 `method`, `path`, `query_shape`, `status`, `action`, `reason`, `rule_id`,
 `would_have`, `attack`, `ai_instruction`, `category`, `decision_error`,
-`retry_after`, `input_tokens` and `latency_ms`.
+`retry_after`, `input_tokens`, `latency_ms` and `user_agent`. `user_agent` is the
+`User-Agent` request header. It is escaped like the other values, so a quote or a
+backslash in it does not break the line, and it is empty when the request has no
+`User-Agent`.
 
 `main` writes a text line that starts with the time, the client address, the site
 and the request line, followed by `status`, `action`, `reason`, `would_have`,
@@ -65,7 +68,7 @@ written as `$name` or `${name}`.
 | `$time_iso8601` | Time of the request, ISO 8601 with offset |
 | `$time_local` | Time of the request, in the `dd/Mon/yyyy:hh:mm:ss +0000` form. The router uses UTC, since it has no timezone database |
 | `$msec` | Unix time of the request, with milliseconds |
-| `$request_id` | Value of the `request_id_header`, or empty |
+| `$request_id` | Value of the `request_id_header`, or a generated 16-character id when that header is missing or unusable (see [`request_id_header`](/configuration#request-id-header)) |
 | `$rule_id` | Id of the rule that decided the request, or empty |
 | `$client_ip` | Client address after realip selection |
 | `$remote_addr` | TCP peer address |
@@ -74,6 +77,7 @@ written as `$name` or `${name}`.
 | `$method` | Request method |
 | `$path` | Request path |
 | `$query_shape` | Names of the query parameters and the kind of each value, never the value itself: `p=<num>&s=<text>`. See below |
+| `$block_query` | Query string of a blocked request, with sensitive parameters redacted, or empty. Not in the built-in formats; see [`$block_query`](#block-query) |
 | `$status` | Status sent to the client |
 | `$action` | `allow`, `block`, `redirect` or `reject`, the last for a request refused by a limit |
 | `$reason` | Why the decision was made, see below |
@@ -127,6 +131,32 @@ values are left out. The log still shows which kinds of requests a site receives
 At most 16 parameters are shown, and a further parameter adds `<more>`. Parameters
 are separated by `&` as in the request, and `;` is also accepted as a separator.
 The variable is empty when the request has no query.
+
+### `$block_query`
+
+`$block_query` records the query string of a blocked request, so a reviewer can
+see what the request contained. It helps tell an attack from a false positive,
+and find what in a legitimate request the model reacted to.
+
+The variable is set when `$action` is `block`, whatever the reason, and in shadow
+mode when `$would_have` is `block`. For every other request it is empty.
+
+```nginx
+log_format blocked escape=default "$time_iso8601 $client_ip $site \"$method $path\" $status $action $reason block_query=\"$block_query\"";
+access_log /var/log/vigilant-heron/access.log blocked;
+```
+
+The value is redacted by the same rules as the event sent to the decision backend.
+Parameters with sensitive names, such as `password` and `token`, are redacted, and
+so are the names listed in `redact_field`. Redaction works by parameter name only.
+A secret under an ordinary name, such as `code` or `key`, and a bare value with no
+`=` are logged as received. The value is escaped like every other variable, so it
+cannot split a line. The router does not cut it. The request line is already
+limited by `large_client_header_buffers`, so the value cannot grow past that limit.
+
+The variable is not in the built-in `json` and `main` formats. A query can carry
+personal data, and the name rule above lets some of it through, so the router
+writes it only when you add `$block_query` to a `log_format` of your own.
 
 ## Error log
 

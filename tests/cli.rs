@@ -12,6 +12,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use rstest::rstest;
 use rustix::process::{Pid, test_kill_process};
 
 /// The binary under test.
@@ -293,6 +294,8 @@ fn help_lists_every_option_and_exits_zero() -> Result<(), std::io::Error> {
             "start",
             "stop",
             "restart",
+            "--url",
+            "--header",
         ] {
             assert!(stdout.contains(option), "help does not list {option}");
         }
@@ -771,6 +774,58 @@ fn sighup_applies_a_valid_file_and_keeps_the_old_one_for_a_broken_file()
     assert!(stderr.contains("configuration reload failed"), "{stderr}");
     // The broken directive is on line 6 of the file written by `config`.
     assert!(stderr.contains("reload.conf:6:"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn sighup_with_an_unset_token_variable_keeps_the_old_configuration() -> Result<(), std::io::Error> {
+    let dir = test_dir("sighup-token")?;
+    let port = free_port()?;
+    // `default_status 418` tells the old and the new configuration apart by their answers.
+    let with_token = |name: &str| {
+        format!(
+            "listen 127.0.0.1:{port};\ndecision {{\n    backend jev;\n    url http://127.0.0.1:9/v1/systemone;\n    api_token_env {name};\n}}\ndefault_status 418;\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n"
+        )
+    };
+    let path = write_file(&dir, "reload-token.conf", &with_token("VH_RELOAD_TOKEN"))?;
+    let child = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .env("VH_RELOAD_TOKEN", "tok-123")
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = Child(child);
+    assert!(
+        wait_for(port, "unknown.test", "/", 418).is_some(),
+        "the server did not answer 418"
+    );
+
+    // The file now names a variable that is not set: SIGHUP logs the error, and the old
+    // configuration keeps serving.
+    std::fs::write(&path, with_token("VH_RELOAD_ABSENT_TOKEN"))?;
+    let signal = Command::new("kill")
+        .arg("-HUP")
+        .arg(child.0.id().to_string())
+        .status()?;
+    assert!(signal.success());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fetch(port, "unknown.test", "/").map(|(status, _)| status),
+        Some(418)
+    );
+
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.0.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    assert!(stderr.contains("configuration reload failed"), "{stderr}");
+    assert!(
+        stderr.contains("environment variable VH_RELOAD_ABSENT_TOKEN (api_token_env) is not set"),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -1332,27 +1387,118 @@ fn start_with_a_file_that_does_not_exist_fails_and_starts_nothing() -> Result<()
     Ok(())
 }
 
+/// The warning that `-t`, `-T` and `test-request` print for a token variable that is not set.
+fn token_warning(name: &str) -> String {
+    format!("warning: {name} (api_token_env) is not set; the router will not start without it")
+}
+
+/// A configuration whose decision block uses the Jev backend, with the token variable `name`.
+fn jev_config(name: &str) -> String {
+    format!(
+        "listen 127.0.0.1:8080;\ndecision {{\n    backend jev;\n    url http://127.0.0.1:9/v1/systemone;\n    api_token_env {name};\n}}\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n"
+    )
+}
+
+/// Runs the binary with `args`, with the token variable `name` removed from the environment.
+fn run_without_token(args: &[&str], name: &str) -> Result<Output, std::io::Error> {
+    Command::new(BIN)
+        .args(args)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .env_remove(name)
+        .output()
+}
+
 #[test]
-fn a_missing_token_variable_fails_the_test() -> Result<(), std::io::Error> {
+fn a_missing_token_variable_passes_the_test_with_a_warning() -> Result<(), std::io::Error> {
     let dir = test_dir("token-missing")?;
     let main = write_file(
         &dir,
         "token-missing.conf",
-        "listen 127.0.0.1:8080;\ndecision {\n    backend jev;\n    url http://127.0.0.1:9/v1/systemone;\n    api_token_env VH_TEST_ABSENT_TOKEN;\n}\nsite example.com {\n    upstream http://127.0.0.1:9;\n}\n",
+        &jev_config("VH_TEST_ABSENT_TOKEN"),
     )?;
-    let output = Command::new(BIN)
-        .arg("-t")
-        .arg("-c")
-        .arg(&main)
-        .env_remove("VIGILANT_HERON_CONFIG")
-        .env_remove("VH_TEST_ABSENT_TOKEN")
-        .output()?;
-    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let output = run_without_token(
+        &["-t", "-c", main.to_str().unwrap_or_default()],
+        "VH_TEST_ABSENT_TOKEN",
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stderr.contains("test is successful"), "{stderr}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("VH_TEST_ABSENT_TOKEN"),
-        "{}",
-        text(&output)
+        stderr
+            .lines()
+            .any(|line| line == token_warning("VH_TEST_ABSENT_TOKEN")),
+        "{stderr}"
     );
+    Ok(())
+}
+
+#[test]
+fn a_set_token_variable_passes_the_test_without_a_warning() -> Result<(), std::io::Error> {
+    let dir = test_dir("token-set")?;
+    let main = write_file(&dir, "token-set.conf", &jev_config("VH_TEST_SET_TOKEN"))?;
+    let output = run_env(
+        &["-t", "-c", main.to_str().unwrap_or_default()],
+        &[("VH_TEST_SET_TOKEN", "tok-123")],
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(!stderr.contains("warning:"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn dump_with_a_missing_token_variable_prints_the_configuration_and_warns()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("token-missing-dump")?;
+    let main = write_file(
+        &dir,
+        "token-missing-dump.conf",
+        &jev_config("VH_TEST_ABSENT_TOKEN"),
+    )?;
+    let output = run_without_token(
+        &["-T", "-c", main.to_str().unwrap_or_default()],
+        "VH_TEST_ABSENT_TOKEN",
+    )?;
+    let stdout = stdout_of(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("api_token_env VH_TEST_ABSENT_TOKEN;"),
+        "{stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == token_warning("VH_TEST_ABSENT_TOKEN")),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn start_foreground_restart_and_stop_still_fail_on_a_missing_token_variable()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("token-missing-start")?;
+    let main = write_file(
+        &dir,
+        "token-missing-start.conf",
+        &jev_config("VH_TEST_ABSENT_TOKEN"),
+    )?;
+    let path = main.to_str().unwrap_or_default();
+    for args in [
+        vec!["start", "-c", path],
+        vec!["restart", "-c", path],
+        vec!["-c", path],
+    ] {
+        let output = run_without_token(&args, "VH_TEST_ABSENT_TOKEN")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "{args:?}: {}", text(&output));
+        assert!(
+            stderr.contains("environment variable VH_TEST_ABSENT_TOKEN (api_token_env) is not set"),
+            "{args:?}: {stderr}"
+        );
+        assert!(!stderr.contains("warning:"), "{args:?}: {stderr}");
+    }
     Ok(())
 }
 
@@ -1556,6 +1702,51 @@ fn test_request_reports_a_request_that_would_go_to_the_backend() -> Result<(), s
 }
 
 #[test]
+fn test_request_reports_an_encoded_question_mark_in_a_static_path_as_sent_to_the_backend()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-encoded-static")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let encoded = test_request(
+        &dir,
+        "encoded.txt",
+        "GET /x.php%3Fa.js HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&encoded);
+    assert_eq!(encoded.status.code(), Some(0), "{}", text(&encoded));
+    assert!(
+        stdout.contains("static asset skip: does not apply"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "result: would be sent to the decision backend (http); the verdict is not known without calling it"
+        ),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_a_plain_static_path_as_taking_the_static_skip() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("test-request-plain-static")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let plain = test_request(
+        &dir,
+        "plain.txt",
+        "GET /a.js HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&plain);
+    assert_eq!(plain.status.code(), Some(0), "{}", text(&plain));
+    assert!(stdout.contains("static asset skip: applies"), "{stdout}");
+    Ok(())
+}
+
+#[test]
 fn test_request_reports_an_access_list_denial_for_the_given_client() -> Result<(), std::io::Error> {
     let dir = test_dir("test-request-access")?;
     let access = "allow 10.0.0.0/8;\ndeny all;\n";
@@ -1654,6 +1845,255 @@ fn test_request_refuses_a_malformed_request_file_with_exit_one() -> Result<(), s
     assert!(output.stdout.is_empty(), "{}", text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("line 2"), "{stderr}");
+    Ok(())
+}
+
+/// Runs `test-request` with the request built from `url_args`, and the configuration `conf`.
+fn test_url(conf: &Path, url_args: &[&str]) -> Result<Output, std::io::Error> {
+    let mut args = vec!["test-request"];
+    args.extend_from_slice(url_args);
+    args.extend_from_slice(&["-c", conf.to_str().unwrap_or_default()]);
+    run(&args)
+}
+
+#[test]
+fn test_request_url_sets_the_host_and_target_from_the_url() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-host")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_url(&conf, &["--url", "https://example.com:443/products?id=1"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout
+            .contains(r#"request: GET "/products?id=1" (Host: "example.com", client: 127.0.0.1)"#),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_keeps_a_port_other_than_the_default() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-port")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_url(&conf, &["--url", "http://example.com:8080/"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains(r#"(Host: "example.com:8080", client"#),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_reports_the_same_as_the_request_in_a_file() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-same")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let from_url = test_url(
+        &conf,
+        &[
+            "--url",
+            "https://example.com/items?id=1%20UNION%20SELECT%20password%20FROM%20users",
+            "--header",
+            "User-Agent: sqlmap/1.9",
+        ],
+    )?;
+    let file = test_request(
+        &dir,
+        "same.txt",
+        "GET /items?id=1%20UNION%20SELECT%20password%20FROM%20users HTTP/1.1\r\nHost: example.com\r\nUser-Agent: sqlmap/1.9\r\n\r\n",
+        &conf,
+        &[],
+    )?;
+    assert_eq!(from_url.status.code(), Some(0), "{}", text(&from_url));
+    assert_eq!(file.status.code(), Some(0), "{}", text(&file));
+    assert_eq!(
+        from_url.status.code(),
+        file.status.code(),
+        "{}",
+        text(&from_url)
+    );
+    assert_eq!(from_url.stdout, file.stdout, "{}", text(&from_url));
+    assert_eq!(from_url.stderr, file.stderr, "{}", text(&from_url));
+    assert!(
+        stdout_of(&from_url).contains("result: blocked"),
+        "{}",
+        text(&from_url)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_header_is_part_of_the_request() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-header")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let without = test_url(&conf, &["--url", "http://example.com/"])?;
+    let with = test_url(
+        &conf,
+        &[
+            "--url",
+            "http://example.com/",
+            "--header",
+            "User-Agent: sqlmap/1.9",
+        ],
+    )?;
+    assert!(
+        !stdout_of(&without).contains("vh-scanner-001"),
+        "{}",
+        text(&without)
+    );
+    assert!(
+        stdout_of(&with).contains("rules: vh-scanner-001 matched"),
+        "{}",
+        text(&with)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_method_option_sets_the_request_method() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-method")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_url(&conf, &["--url", "http://example.com/", "--method", "put"])?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout_of(&output).contains(r#"request: PUT "/" (Host"#),
+        "{}",
+        text(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_path_takes_the_host_option() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-path")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_url(&conf, &["--url", "/items?id=2", "--host", "example.com"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains(r#"request: GET "/items?id=2" (Host: "example.com""#),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_path_without_host_is_refused_with_exit_one() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-no-host")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = test_url(&conf, &["--url", "/items"])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("a URL that starts with / needs --host <name>"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_url_with_a_fragment_or_a_space_is_refused_with_exit_one()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-bad")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    for (url, reason) in [
+        ("http://example.com/#top", "must not contain a fragment (#)"),
+        ("http://example.com/a b", "must not contain spaces"),
+    ] {
+        let output = test_url(&conf, &["--url", url])?;
+        assert_eq!(output.status.code(), Some(1), "{url}: {}", text(&output));
+        assert!(output.stdout.is_empty(), "{url}: {}", text(&output));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(reason), "{url}: {stderr}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_request_url_and_a_request_file_together_are_refused() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-and-file")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let file = write_file(&dir, "req.txt", "GET / HTTP/1.1\nHost: example.com\n\n")?;
+    let output = run(&[
+        "test-request",
+        "--url",
+        "http://example.com/",
+        file.to_str().unwrap_or_default(),
+        "-c",
+        conf.to_str().unwrap_or_default(),
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("give either --url or a request file, not both"),
+        "{}",
+        text(&output)
+    );
+    Ok(())
+}
+
+/// `test-request` passes with a warning when the token variable is unset, for the same request
+/// given as a file or as a `--url`. The report must name the target `/items?id=1`, so a wrong
+/// URL parse fails the test.
+#[rstest]
+#[case::from_a_file(false)]
+#[case::from_a_url(true)]
+fn test_request_works_without_the_token_variable_and_warns(
+    #[case] from_url: bool,
+) -> Result<(), std::io::Error> {
+    let dir = test_dir(if from_url {
+        "test-request-url-token-missing"
+    } else {
+        "test-request-file-token-missing"
+    })?;
+    let conf = write_file(&dir, "router.conf", &jev_config("VH_TEST_ABSENT_TOKEN"))?;
+    let conf_arg = conf.to_str().unwrap_or_default();
+    let output = if from_url {
+        run_without_token(
+            &[
+                "test-request",
+                "--url",
+                "https://example.com/items?id=1",
+                "-c",
+                conf_arg,
+            ],
+            "VH_TEST_ABSENT_TOKEN",
+        )?
+    } else {
+        let file = write_file(
+            &dir,
+            "plain.txt",
+            "GET /items?id=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )?;
+        run_without_token(
+            &[
+                "test-request",
+                file.to_str().unwrap_or_default(),
+                "-c",
+                conf_arg,
+            ],
+            "VH_TEST_ABSENT_TOKEN",
+        )?
+    };
+    let stdout = stdout_of(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains(r#"request: GET "/items?id=1" (Host: "example.com", client: 127.0.0.1)"#),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("would be sent to the decision backend (jev, model jev-latest)"),
+        "{stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == token_warning("VH_TEST_ABSENT_TOKEN")),
+        "{stderr}"
+    );
     Ok(())
 }
 
@@ -1963,5 +2403,467 @@ fn start_reports_a_router_that_exited_while_starting_without_waiting_out_the_tim
         started.elapsed() < Duration::from_secs(5),
         "the exit was not noticed until the startup timeout passed"
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// shadow-report: summarize json access logs from a shadow trial
+// ---------------------------------------------------------------------------
+
+/// One `json` access log line from client `client` at `time`, with the given fields set.
+/// The other fields are empty strings, as the router writes them.
+fn shadow_line(time: &str, client: &str, fields: &[(&str, &str)]) -> String {
+    let mut object = serde_json::Map::new();
+    for name in [
+        "request_id",
+        "site",
+        "host",
+        "query_shape",
+        "status",
+        "rule_id",
+        "would_have",
+        "attack",
+        "ai_instruction",
+        "category",
+        "decision_error",
+        "retry_after",
+        "input_tokens",
+        "latency_ms",
+    ] {
+        object.insert(name.to_owned(), serde_json::json!(""));
+    }
+    object.insert("time".to_owned(), serde_json::json!(time));
+    object.insert("client_ip".to_owned(), serde_json::json!(client));
+    object.insert("method".to_owned(), serde_json::json!("GET"));
+    object.insert("path".to_owned(), serde_json::json!("/"));
+    object.insert("action".to_owned(), serde_json::json!("allow"));
+    object.insert("reason".to_owned(), serde_json::json!("model"));
+    for (name, value) in fields {
+        object.insert((*name).to_owned(), serde_json::json!(value));
+    }
+    serde_json::Value::Object(object).to_string()
+}
+
+/// A blocked request on `path` at `time` from `client`, as a shadow trial logs it.
+fn blocked_shadow_line(time: &str, client: &str, path: &str) -> String {
+    shadow_line(
+        time,
+        client,
+        &[("action", "block"), ("path", path), ("rule_id", "wp-login")],
+    )
+}
+
+/// Runs `shadow-report` on the given log files, with the environment as the test sets it.
+fn shadow_report_run(paths: &[&Path], extra: &[&str]) -> Result<Output, std::io::Error> {
+    let mut args = vec!["shadow-report"];
+    let names: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    args.extend(names.iter().map(String::as_str));
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+#[test]
+fn shadow_report_prints_a_plain_text_report_for_one_log() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            &[("attack", "0.1")],
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(output.stderr.is_empty(), "{}", text(&output));
+    assert!(stdout.contains("Files read: 1\n"), "{stdout}");
+    assert!(
+        stdout.contains("Per day (UTC):\n  2026-11-02  lines 1  backend calls 1"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_ignores_a_missing_configuration_file() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-env")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/wp-login.php"),
+    )?;
+    let output = run_env(
+        &["shadow-report", log.to_str().unwrap_or_default()],
+        &[("VIGILANT_HERON_CONFIG", "/nonexistent/vigilant-heron.conf")],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout_of(&output).contains("Blocked or redirected lines: 1"),
+        "{}",
+        text(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_contacts_no_backend() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-backend")?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let conf = write_file(
+        &dir,
+        "router.conf",
+        &format!(
+            "listen 127.0.0.1:0;\ndecision {{\n    backend http;\n    url http://127.0.0.1:{port}/decide;\n}}\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n"
+        ),
+    )?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            &[("attack", "0.1")],
+        ),
+    )?;
+    let output = run_env(
+        &["shadow-report", log.to_str().unwrap_or_default()],
+        &[("VIGILANT_HERON_CONFIG", conf.to_str().unwrap_or_default())],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the report connected to the decision backend"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_refuses_the_config_flag() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-config")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[]),
+    )?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = run(&[
+        "shadow-report",
+        log.to_str().unwrap_or_default(),
+        "-c",
+        conf.to_str().unwrap_or_default(),
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shadow-report reads only the access logs; -c is not used"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_needs_at_least_one_log_file() -> Result<(), std::io::Error> {
+    let output = run(&["shadow-report"])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shadow-report needs at least one access log file"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_exits_one_and_names_a_file_it_cannot_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-missing")?;
+    let missing = dir.join("rotated-away.json");
+    let output = shadow_report_run(&[&missing], &[])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot read the access log"), "{stderr}");
+    assert!(stderr.contains("rotated-away.json"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_reads_several_files_in_the_order_given() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-order")?;
+    let older = write_file(
+        &dir,
+        "access.json.1",
+        &blocked_shadow_line("2026-11-01T23:00:00+00:00", "192.0.2.77", "/first"),
+    )?;
+    let newer = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line("2026-11-02T01:00:00+00:00", "192.0.2.77", "/second"),
+    )?;
+    let output = shadow_report_run(&[&older, &newer], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("Files read: 2\n"), "{stdout}");
+    let first = stdout.find(" /first ").unwrap_or(usize::MAX);
+    let second = stdout.find(" /second ").unwrap_or(usize::MAX);
+    assert!(first < second, "{stdout}");
+
+    let reversed = shadow_report_run(&[&newer, &older], &[])?;
+    let stdout = stdout_of(&reversed);
+    let first = stdout.find(" /first ").unwrap_or(usize::MAX);
+    let second = stdout.find(" /second ").unwrap_or(usize::MAX);
+    assert!(second < first, "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_shortens_client_addresses_by_default() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-short")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &format!(
+            "{}\n{}",
+            blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"),
+            blocked_shadow_line("2026-11-02T10:00:01+00:00", "2001:db8:1:2::5", "/b")
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" 192.0.2.x GET /a "), "{stdout}");
+    assert!(stdout.contains(" 2001:db8:1:: GET /b "), "{stdout}");
+    assert!(!stdout.contains("192.0.2.77"), "{stdout}");
+    assert!(!stdout.contains("2001:db8:1:2::5"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_full_addresses_prints_them_in_full() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-full")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"),
+    )?;
+    let output = shadow_report_run(&[&log], &["--full-addresses"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" 192.0.2.77 GET /a "), "{stdout}");
+    assert!(!stdout.contains("192.0.2.x"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_lists_at_most_fifty_lines_by_default() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-default-lines")?;
+    let lines: Vec<String> = (0..51)
+        .map(|_| blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"))
+        .collect();
+    let log = write_file(&dir, "access.json", &lines.join("\n"))?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Blocked or redirected lines: 51 (listing the first 50; 1 more not shown, use --max-lines to list more)"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches(" GET /a ").count(), 50, "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_max_lines_sets_how_many_lines_are_listed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-max-lines")?;
+    let lines: Vec<String> = (0..3)
+        .map(|_| blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"))
+        .collect();
+    let log = write_file(&dir, "access.json", &lines.join("\n"))?;
+    let output = shadow_report_run(&[&log], &["--max-lines", "2"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Blocked or redirected lines: 3 (listing the first 2; 1 more not shown, use --max-lines to list more)"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches(" GET /a ").count(), 2, "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_estimates_the_cost_with_usd_per_mtok() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-price")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            &[("input_tokens", "2000000")],
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &["--usd-per-mtok=3"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("Input tokens: 2000000\n"), "{stdout}");
+    assert!(
+        stdout.contains("Estimated input cost: $6.0000 at $3 per million input tokens"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_counts_a_line_that_is_not_json_as_malformed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-malformed")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &format!(
+            "not json at all\n{}\n",
+            shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[])
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 2 (1 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_does_not_decompress_a_gzip_file() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-gzip")?;
+    let mut bytes = vec![0x1f_u8, 0x8b, 0x08, 0x00];
+    bytes.extend_from_slice(b"\x00\x00\x00\x00\x00\x03compressed body\n");
+    let log = dir.join("access.json.gz");
+    std::fs::write(&log, bytes)?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 1 (0 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_exits_one_and_names_a_directory_it_cannot_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-directory")?;
+    let output = shadow_report_run(&[&dir], &[])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot read the access log"), "{stderr}");
+    assert!(stderr.contains(&dir.display().to_string()), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_prints_paths_as_the_log_has_them() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-path")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            "/reset/tok_8f3a91",
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" GET /reset/tok_8f3a91 "), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_counts_a_line_longer_than_one_mib_as_malformed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-long-line")?;
+    let mut bytes = vec![b'x'; 1024 * 1024 + 1];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[]).as_bytes());
+    bytes.push(b'\n');
+    let log = dir.join("access.json");
+    std::fs::write(&log, bytes)?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 2 (1 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// Runs the binary with `args`, with standard input read from `stdin`.
+fn run_with_stdin(args: &[&str], stdin: std::fs::File) -> Result<Output, std::io::Error> {
+    Command::new(BIN)
+        .args(args)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .stdin(stdin)
+        .output()
+}
+
+#[test]
+fn suggest_skip_rules_counts_a_line_longer_than_one_mib_as_unusable() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("suggest-long-line")?;
+    let mut bytes = vec![b'x'; 1024 * 1024 + 1];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(
+        br#"{"time":"2026-01-01T10:00:00Z","site":"example.com","method":"GET","path":"/","query_shape":"p=<num>"}"#,
+    );
+    bytes.push(b'\n');
+    let log = dir.join("access.json");
+    std::fs::write(&log, bytes)?;
+    let output = run(&["suggest-skip-rules", log.to_str().unwrap_or_default()])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Read 2 lines: 1 with query_shape, 1 without"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn suggest_skip_rules_names_standard_input_when_it_cannot_be_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-stdin-error")?;
+    // A directory opens as standard input, but reading it fails.
+    let output = run_with_stdin(&["suggest-skip-rules", "-"], std::fs::File::open(&dir)?)?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read the access log standard input"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("access log -"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_request_names_standard_input_when_it_cannot_be_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-stdin-error")?;
+    let output = run_with_stdin(&["test-request", "-"], std::fs::File::open(&dir)?)?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read the request file standard input"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("request file -"), "{stderr}");
     Ok(())
 }

@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use http::header::{
     CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION, UPGRADE,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -37,10 +38,7 @@ use crate::access::{self, AccessEntry};
 use crate::accesslog::{AccessRecord, LogFormat};
 use crate::block::{BlockResponse, BlockStatus};
 use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Finish, Sniffed};
-use crate::config::{
-    AccessLogConfig, BackendConfig, Config, ConnectionConfig, MAX_REQUEST_ID_BYTES, Mode,
-    SiteConfig,
-};
+use crate::config::{AccessLogConfig, BackendConfig, Config, ConnectionConfig, Mode, SiteConfig};
 use crate::decision::{Backend, ClientSlots, HttpDecisionBackend, Limits, decision_client};
 use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
@@ -50,9 +48,10 @@ use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
 use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
 use crate::realip::RealIp;
+use crate::request_id;
 use crate::router::{Router, is_valid_host, normalize_host};
 use crate::rules::RuleInput;
-use crate::sanitize::{self, EventInput, truncate_utf8};
+use crate::sanitize::{self, EventInput};
 use crate::system_one::SystemOneBackend;
 use crate::transport::{
     ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Phase, PhaseCell, Rejection, RejectionSlot, lock,
@@ -87,6 +86,8 @@ pub(crate) struct AppState {
     backend_redact: Vec<String>,
     /// Body field names redacted before the event is sent to the backend (`redact_field`).
     backend_redact_fields: Vec<String>,
+    /// Whether multipart file content is replaced before the event is sent (`redact_file_parts`).
+    backend_redact_file_parts: bool,
     /// The decision slots shared by all calls, and the `max_concurrency` they were built with.
     slots: Arc<Semaphore>,
     slots_limit: usize,
@@ -185,6 +186,7 @@ impl AppState {
             inspect_body_bytes: config.decision.inspect_body_bytes,
             backend_redact,
             backend_redact_fields: config.decision.redact_fields.clone(),
+            backend_redact_file_parts: config.decision.redact_file_parts,
             slots,
             slots_limit: config.decision.max_concurrency,
             client_slots,
@@ -562,7 +564,7 @@ struct Trace<'a> {
     client_addr: IpAddr,
     client_ip: &'a str,
     remote_addr: &'a str,
-    request_id: Option<&'a str>,
+    request_id: &'a str,
     started: Instant,
     /// `$limit_req_status`, set once the limits have run.
     limit_req: Mutex<Option<&'static str>>,
@@ -593,7 +595,7 @@ async fn handle(
         .saturating_add(1);
     let client_addr = client_addr(state, request.headers(), peer);
     let client = client_addr.to_string();
-    let request_id = request_id(state, request.headers());
+    let request_id = request_id_for(state, request.headers());
     let remote = peer.ip().to_string();
     let client_upgrade = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
@@ -603,7 +605,7 @@ async fn handle(
         client_addr,
         client_ip: &client,
         remote_addr: &remote,
-        request_id: request_id.as_deref(),
+        request_id: &request_id,
         started,
         limit_req: Mutex::new(None),
         limit_conn: Mutex::new(None),
@@ -739,10 +741,10 @@ async fn pipeline(
         );
     };
     let Some(site) = state.sites.get(index) else {
-        return status_response(state.default_status, "");
+        return empty_answer(state.default_status, trace.request_id);
     };
     let Some(proxy) = state.proxies.get(index) else {
-        return status_response(state.default_status, "");
+        return empty_answer(state.default_status, trace.request_id);
     };
     let sinks = state
         .site_sinks
@@ -845,7 +847,7 @@ async fn pipeline(
         site: site_name(site),
         method: parts.method.as_str(),
         path: parts.uri.path(),
-        request_id: trace.request_id.unwrap_or_default(),
+        request_id: trace.request_id,
         headers: &parts.headers,
     };
     let delivery = Delivery {
@@ -869,9 +871,14 @@ async fn pipeline(
         Some(reason) => ("reject", reason),
         None => (decision.action.name(), decision.reason.name()),
     };
+    // `$block_query` is logged when the decision blocked the request (a request that a limit or
+    // the body refused is logged as `reject`, so it is not counted), or when shadow mode
+    // recorded a block that it did not enforce.
+    let log_block_query = (outcome.rejected.is_none() && decision.action == Action::Block)
+        || decision.would_have == Some(Action::Block);
     let record = AccessRecord {
         time: SystemTime::now(),
-        request_id: trace.request_id,
+        request_id: Some(trace.request_id),
         client_ip: trace.client_ip,
         remote_addr: trace.remote_addr,
         site: site_name(site),
@@ -879,6 +886,9 @@ async fn pipeline(
         method: parts.method.as_str(),
         path: raw_path,
         query: parts.uri.query(),
+        block_query: log_block_query
+            .then(|| sanitize::block_query(parts.uri.query(), &state.backend_redact_fields))
+            .flatten(),
         status: response.status().as_u16(),
         action,
         reason,
@@ -1042,33 +1052,23 @@ async fn respond(
                         rejected: None,
                     }
                 }
-                Err(error) => failure(&error, complete),
-            }
-        }
-        Action::Block => {
-            let mut response = match block.status {
-                BlockStatus::Respond(status) => block_response(status, block.page.as_ref()),
-                BlockStatus::Close => {
-                    // The status is only logged: the connection closes without writing it.
-                    let mut response = status_response(close_status(), "");
-                    response.extensions_mut().insert(CloseWithoutResponse);
-                    response
+                Err(error) => {
+                    let mut outcome = failure(&error, complete);
+                    outcome.response = with_request_id(outcome.response, delivery.ctx.request_id);
+                    outcome
                 }
-            };
-            if !complete {
-                close(&mut response);
             }
-            Outcome::answered(response)
         }
+        Action::Block => block_outcome(block, delivery.ctx.request_id, complete),
         Action::Reject(status) => {
-            let mut response = status_response(*status, "");
+            let mut response = empty_answer(*status, delivery.ctx.request_id);
             if !complete {
                 close(&mut response);
             }
             Outcome::answered(response)
         }
         Action::Redirect(location) => {
-            let mut response = status_response(StatusCode::FOUND, "");
+            let mut response = empty_answer(StatusCode::FOUND, delivery.ctx.request_id);
             response.headers_mut().insert(LOCATION, location.clone());
             if !complete {
                 close(&mut response);
@@ -1076,6 +1076,23 @@ async fn respond(
             Outcome::answered(response)
         }
     }
+}
+
+/// The answer to a block: the block response, or a 444 that closes the connection without one.
+fn block_outcome(block: &BlockResponse, request_id: &str, complete: bool) -> Outcome {
+    let mut response = match block.status {
+        BlockStatus::Respond(status) => block_response(status, block.page.as_ref(), request_id),
+        BlockStatus::Close => {
+            // The status is only logged: the connection closes without writing it.
+            let mut response = status_response(close_status(), "");
+            response.extensions_mut().insert(CloseWithoutResponse);
+            response
+        }
+    };
+    if !complete {
+        close(&mut response);
+    }
+    Outcome::answered(response)
 }
 
 /// Maps a failed forward to the status nginx would send. Upstream timeouts are 504,
@@ -1161,6 +1178,7 @@ async fn assess(
                 client_ip,
                 redact_headers: &state.backend_redact,
                 redact_fields: &state.backend_redact_fields,
+                redact_file_parts: state.backend_redact_file_parts,
                 inspect_body_bytes: state.inspect_body_bytes,
             });
             match state.backend.decide(&event).await {
@@ -1206,12 +1224,29 @@ fn host_name(parts: &Parts) -> String {
         .unwrap_or_default()
 }
 
-/// Reads the configured request-id header, lossily decoded and cut to 128 bytes.
-fn request_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
-    let name = state.request_id_header.as_ref()?;
-    let value = String::from_utf8_lossy(headers.get(name)?.as_bytes()).into_owned();
-    let (value, _cut) = truncate_utf8(value, MAX_REQUEST_ID_BYTES);
-    (!value.is_empty()).then_some(value)
+/// The request id: the configured request-id header when its value is usable, else a generated id.
+fn request_id_for(state: &AppState, headers: &HeaderMap) -> String {
+    state
+        .request_id_header
+        .as_ref()
+        .and_then(|name| headers.get(name))
+        .and_then(|value| request_id::from_header(value.as_bytes()))
+        .unwrap_or_else(request_id::generate)
+}
+
+/// An answer without a body, with the given status and the request id.
+fn empty_answer(status: StatusCode, request_id: &str) -> Response<ResponseBody> {
+    with_request_id(status_response(status, ""), request_id)
+}
+
+/// Adds the `X-Request-ID` header to a response the router generated itself.
+fn with_request_id(mut response: Response<ResponseBody>, id: &str) -> Response<ResponseBody> {
+    if let Ok(value) = HeaderValue::from_str(id) {
+        response
+            .headers_mut()
+            .insert(request_id::RESPONSE_HEADER, value);
+    }
+    response
 }
 
 /// The value of a valid `Content-Length` header.
@@ -1279,6 +1314,7 @@ fn rejection_record(status: u16, reason: &str, started: Instant) -> AccessRecord
         method: "",
         path: "",
         query: None,
+        block_query: None,
         status,
         action: "reject",
         reason,
@@ -1320,7 +1356,7 @@ fn reject(
     closing: bool,
 ) -> Response<ResponseBody> {
     let record = AccessRecord {
-        request_id: trace.request_id,
+        request_id: Some(trace.request_id),
         client_ip: trace.client_ip,
         remote_addr: trace.remote_addr,
         site,
@@ -1333,7 +1369,7 @@ fn reject(
         ..rejection_record(status.as_u16(), reason, trace.started)
     };
     write_access(sinks, &record, &parts.headers);
-    let mut response = status_response(status, "");
+    let mut response = empty_answer(status, trace.request_id);
     if closing {
         close(&mut response);
     }
@@ -1368,25 +1404,42 @@ fn close_status() -> StatusCode {
     StatusCode::from_u16(444).unwrap_or(StatusCode::FORBIDDEN)
 }
 
-/// A block response: the configured page as HTML when there is one, else the short text of nginx's 403.
-fn block_response(status: StatusCode, page: Option<&Bytes>) -> Response<ResponseBody> {
-    match page {
-        Some(page) => {
-            let mut response = Response::new(
-                Full::new(page.clone())
-                    .map_err(|never: Infallible| match never {})
-                    .boxed(),
-            );
-            *response.status_mut() = status;
-            response.headers_mut().insert(
-                CONTENT_TYPE,
-                HeaderValue::from_static("text/html; charset=utf-8"),
-            );
-            response
-        }
-        None if status == StatusCode::FORBIDDEN => status_response(status, "Forbidden\n"),
-        None => status_response(status, ""),
-    }
+/// A block response: the configured page as HTML when there is one, else a plain-text line
+/// with the request id, so that the client can report the request.
+fn block_response(
+    status: StatusCode,
+    page: Option<&Bytes>,
+    request_id: &str,
+) -> Response<ResponseBody> {
+    let response = match page {
+        Some(page) => typed_response(status, page.clone(), "text/html; charset=utf-8"),
+        None => typed_response(
+            status,
+            Bytes::from(format!("Request blocked. Request ID: {request_id}\n")),
+            "text/plain; charset=utf-8",
+        ),
+    };
+    with_request_id(response, request_id)
+}
+
+fn typed_response(
+    status: StatusCode,
+    body: Bytes,
+    content_type: &'static str,
+) -> Response<ResponseBody> {
+    let mut response = Response::new(
+        Full::new(body)
+            .map_err(|never: Infallible| match never {})
+            .boxed(),
+    );
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
 }
 
 fn status_response(status: StatusCode, body: &'static str) -> Response<ResponseBody> {

@@ -74,6 +74,10 @@ async fn wait_for_line(path: &Path, request_id: &str) -> Result<Value, BoxError>
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the table lists one sample request per row; splitting it would hide the table"
+)]
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -164,10 +168,230 @@ fn cases() -> Vec<Case> {
             reason: Some("body_too_large"),
             rule: "",
         },
+        Case {
+            label: "enforce site without static_query_token, bare token goes to the backend",
+            method: Method::GET,
+            target: "/wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "static_query_token site, bare token takes the static skip",
+            method: Method::GET,
+            target: "/wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317",
+            host: "token.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::Forwarded,
+            reason: Some("skip"),
+            rule: "",
+        },
+        Case {
+            label: "plain static asset takes the static skip",
+            method: Method::GET,
+            target: "/a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::Forwarded,
+            reason: Some("skip"),
+            rule: "",
+        },
+        Case {
+            label: "encoded question mark in a static-looking path goes to the backend",
+            method: Method::GET,
+            target: "/x.php%3Fa.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "lowercase encoded question mark goes to the backend",
+            method: Method::GET,
+            target: "/x.php%3fa.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "encoded hash in a static-looking path goes to the backend",
+            method: Method::GET,
+            target: "/x.php%23a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "encoded NUL in a static-looking path goes to the backend",
+            method: Method::GET,
+            target: "/x.php%00.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "double-encoded question mark goes to the backend",
+            method: Method::GET,
+            target: "/x.php%253Fa.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "encoded hash in a static-looking path goes to the backend",
+            method: Method::GET,
+            target: "/x.php%23a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "encoded question mark before dot-dot goes to the backend",
+            method: Method::GET,
+            target: "/x.php%3F/../a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "encoded hash before dot-dot goes to the backend",
+            method: Method::GET,
+            target: "/x.php%23/../a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "double-encoded hash goes to the backend",
+            method: Method::GET,
+            target: "/x.php%2523a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "double-encoded NUL goes to the backend",
+            method: Method::GET,
+            target: "/x.php%2500.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "double-encoded slash goes to the backend",
+            method: Method::GET,
+            target: "/a%252Fb.css",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "triple-encoded question mark goes to the backend",
+            method: Method::GET,
+            target: "/x.php%25253Fa.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "IIS unicode escape goes to the backend",
+            method: Method::GET,
+            target: "/a%u002fb.css",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "overlong slash goes to the backend",
+            method: Method::GET,
+            target: "/a%c0%afb.css",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "overlong backslash goes to the backend",
+            method: Method::GET,
+            target: "/a%c1%9cb.css",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "script extension before the static one goes to the backend",
+            method: Method::GET,
+            target: "/x.php.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "script extension in a directory name goes to the backend",
+            method: Method::GET,
+            target: "/x.phar/a.js",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
     ]
 }
 
-/// The configuration of both the check and the proxy: four sites and one top-level skip rule.
+/// The configuration of both the check and the proxy: five sites and one top-level skip rule.
 fn config_text(log: &str, decide_url: &str, upstream_url: &str) -> String {
     format!(
         r#"
@@ -213,6 +437,15 @@ site denied.test {{
     block_threshold 0.9;
     instruction_threshold 0.5;
     deny 127.0.0.1;
+}}
+
+site token.test {{
+    upstream "{upstream_url}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    static_query_token on;
 }}
 "#
     )

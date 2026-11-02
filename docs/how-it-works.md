@@ -30,10 +30,14 @@ decides the request ends the evaluation.
 6. **Static assets.** A plain GET or HEAD for a path with a static extension and
    no query and no body is forwarded without calling the backend (reason `skip`).
    It is skipped only when every [path reading](#path-readings) ends in a static
-   extension with no earlier script extension, the raw path has no `;`, `\`, `%2F`,
-   `%5C` or `%3B`, and no `fail_closed_path` matches. A `static_location` restricts
+   extension with no script extension in any dot-separated part of a segment, the
+   raw path has none of the markers in [`static_extensions`](/configuration#static-extensions)
+   (encoded separators, `?`, `#`, NUL, `%25`, `%u`, `%c0` and `%c1`), and no
+   `fail_closed_path` matches. A `static_location` restricts
    it to some prefixes. A query made only of `static_query_params` parameters with
-   plain values, such as `?ver=6.8.3`, counts as no query.
+   plain values, such as `?ver=6.8.3`, counts as no query. With
+   `static_query_token on`, a query that is one bare token, such as
+   `?wp-mce-49110-20250317`, counts as no query too.
 7. **Decision model.** The request is sent to the backend, and the policy
    compares the returned scores with `block_threshold` and
    `instruction_threshold`. The outcome is `model` when a threshold is reached and
@@ -79,6 +83,12 @@ default, with the `block_page` if one is set) or `redirect <url>` (302 to the
 given location). An allowed request is forwarded to the upstream. The upstream
 receives the whole body; the router reads only the first `inspect_body` bytes
 for the decision and streams the rest as the upstream reads it.
+
+A block response carries the request id in an `X-Request-ID` header. Without a
+`block_page`, its body is one line of text with the same id, such as
+`Request blocked. Request ID: 3f9a0c17b2d4e8a1`. A site owner who was blocked by
+mistake can quote that id to the operator, who finds the request in the access log
+by it. A `block_status 444` closes the connection and sends nothing.
 
 ## Failure behavior
 
@@ -205,11 +215,28 @@ sent:
   `author`, `shipping`, `passenger`, `class_name`, `business_name` and `postcard` are
   not. The value is replaced by `[REDACTED]`. A field named in `redact_field` is also
   replaced, when its name equals that name, case-insensitively.
-- Multipart bodies (`multipart/form-data`) are split into parts. A part is redacted
-  when its `Content-Disposition` `name` is sensitive. Its value is replaced, and its
-  boundary and part headers are sent as they were. A file part is redacted by its
-  field name only, and its content is not scanned. A multipart body without the
-  expected framing is scanned as text, as below.
+- Multipart bodies (`multipart/form-data`) are split into parts at their delimiter
+  lines, `--boundary` on a line of its own.
+  A part is redacted when its `Content-Disposition` `name` is sensitive or named in
+  `redact_field`. Its value is replaced, and its boundary and part headers are sent as
+  they were.
+  A `Content-Disposition` line that continues on the next line, one that starts with a
+  space or a tab, is read as one line.
+  A file part, one whose `Content-Disposition` has a `filename` or `filename*`
+  parameter, has its content replaced by `[REDACTED]` too, so the bytes of an upload,
+  such as image metadata, are not sent. Its part headers (the field name, the file
+  name and the content type) are kept. `redact_file_parts off;` sends file content
+  like any other part.
+  Text that is not inside a part, before the first delimiter or after the `--boundary--`
+  line, is scanned as text, as below.
+  Parts that follow a `--boundary--` line are still read as parts.
+  When the body is longer than `inspect_body`, the sent bytes can end inside a part.
+  The parts before the cut are redacted as above. The cut part is judged by its headers
+  when they are complete: its content is replaced when the part is redacted, and
+  scanned as text otherwise, since its end is not known.
+  When the cut falls inside the part headers, the text from the delimiter on is scanned
+  as text, which leaves ordinary header lines as they were.
+  A multipart body whose framing is broken is scanned as text, as below.
 - XML and SOAP elements whose local name is sensitive have their text replaced, so
   `<password>` and `<wsse:Password Type="...">` are redacted and `<username>` is
   kept. Attributes are not scanned.

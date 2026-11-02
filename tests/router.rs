@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    StubBehavior, StubDecider, TestResult, Upstream, closed_port_url, config_text, send,
-    start_proxy,
+    StubBehavior, StubDecider, TestResult, Upstream, assert_plain_block, closed_port_url,
+    config_text, request_id_header, send, start_proxy,
 };
 use http::{Method, StatusCode};
 
@@ -72,7 +72,7 @@ async fn attack_is_blocked_with_403_and_no_detail() -> TestResult {
     .await?;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    assert_eq!(reply.text(), "Forbidden\n");
+    assert_plain_block(&reply);
     proxy.stop().await
 }
 
@@ -233,6 +233,123 @@ async fn static_asset_is_forwarded_without_calling_the_backend() -> TestResult {
     proxy.stop().await
 }
 
+/// Adds `static_query_token on;` to the first site of `config_text`.
+fn with_static_query_token(text: &str) -> String {
+    text.replacen(
+        "    debug_headers on;\n",
+        "    debug_headers on;\n    static_query_token on;\n",
+        1,
+    )
+}
+
+#[tokio::test]
+async fn bare_cache_busting_token_skips_the_backend_only_when_static_query_token_is_on()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS);
+    let path = "/wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317";
+
+    let off = start_proxy(&text).await?;
+    let reply = send(
+        &off.base(),
+        Method::GET,
+        path,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 1, "off: the backend decides");
+    off.stop().await?;
+
+    let on = start_proxy(&with_static_query_token(&text)).await?;
+    let reply = send(
+        &on.base(),
+        Method::GET,
+        path,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 1, "on: the backend is not called again");
+    on.stop().await
+}
+
+#[tokio::test]
+async fn a_question_mark_with_an_empty_query_is_sent_to_the_backend_with_static_query_token_on()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = with_static_query_token(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ));
+    let proxy = start_proxy(&text).await?;
+
+    // Control: a bare token takes the static skip on this site.
+    let token = send(
+        &proxy.base(),
+        Method::GET,
+        "/app.js?wp-mce-1",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(token.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 0, "a bare token skips the backend");
+
+    // A `?` with nothing after it has an empty query, which is not a bare token.
+    let empty = send(
+        &proxy.base(),
+        Method::GET,
+        "/app.js?",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 1, "an empty query goes to the backend");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_encoded_separator_in_a_static_looking_path_is_sent_to_the_backend() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    // Each encoded `?`, NUL and double-encoded `?` gets one backend call, in turn.
+    for (index, target) in ["/x.php%3Fa.js", "/x.php%00.js", "/x.php%253Fa.js"]
+        .into_iter()
+        .enumerate()
+    {
+        let reply = send(
+            &proxy.base(),
+            Method::GET,
+            target,
+            "example.com",
+            &[],
+            Bytes::new(),
+        )
+        .await?;
+        assert_eq!(reply.status, StatusCode::OK, "{target}");
+        assert_eq!(stub.calls(), index + 1, "{target} goes to the backend");
+    }
+    proxy.stop().await
+}
+
 /// Adds `on_rate_limit allow` and `on_decision_error allow` to the first site of `config_text`.
 fn fail_open(text: &str) -> String {
     text.replacen(
@@ -299,6 +416,36 @@ async fn backend_timeout_fails_closed_on_a_fail_closed_path() -> TestResult {
     .await?;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_backend_server_error_is_forwarded_with_the_default_failure_settings() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(StubBehavior {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        ..StubBehavior::default()
+    });
+    // No on_decision_error line: the default must forward the request.
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/articles",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
     proxy.stop().await
 }
 
@@ -872,5 +1019,169 @@ async fn malformed_json_with_an_attack_is_blocked() -> TestResult {
     .await?;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_redirect_carries_the_request_id_header() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(attack_behavior());
+    let text = format!(
+        "request_id_header x-request-id;\n{}",
+        config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS)
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "redirect.test",
+        &[("x-request-id", "redirect-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FOUND);
+    assert_eq!(request_id_header(&reply), "redirect-id-1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_forwarded_response_has_no_request_id_header_added() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = format!(
+        "request_id_header x-request-id;\n{}",
+        config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS)
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/articles",
+        "example.com",
+        &[("x-request-id", "forward-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply.headers.get("x-request-id").is_none(),
+        "a forwarded response is passed unchanged, without X-Request-ID"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_upstream_failure_carries_the_request_id_header() -> TestResult {
+    let stub = StubDecider::start().await?;
+    let dead_upstream = closed_port_url().await?;
+    let text = format!(
+        "request_id_header x-request-id;\n{}",
+        config_text(&stub.decide_url(), &dead_upstream, GENEROUS_TIMEOUT_MS)
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "example.com",
+        &[("x-request-id", "failure-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(request_id_header(&reply), "failure-id-1");
+    proxy.stop().await
+}
+
+/// A multipart body of about 880 bytes with a `password` part, then a file part whose
+/// content starts past the first 512 bytes that are inspected.
+fn multipart_body_longer_than_inspect_body() -> Bytes {
+    let file_content = "EXIFGPS".repeat(100);
+    Bytes::from(format!(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2-zq\r\n\
+         --BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"pic.jpg\"\r\n\
+         Content-Type: image/jpeg\r\n\r\n{file_content}\r\n--BB--\r\n"
+    ))
+}
+
+#[tokio::test]
+async fn a_multipart_body_longer_than_inspect_body_sends_neither_the_file_bytes_nor_the_password()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    let body = multipart_body_longer_than_inspect_body();
+    assert!(body.len() > 512 && body.len() <= 1024, "{}", body.len());
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[("content-type", "multipart/form-data; boundary=BB")],
+        body,
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    let forwarded_body = event["event"]["untrusted"]["body"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!forwarded_body.contains("hunter2"), "{forwarded_body}");
+    assert!(!forwarded_body.contains("EXIFGPS"), "{forwarded_body}");
+    assert!(
+        forwarded_body.contains("name=\"password\""),
+        "{forwarded_body}"
+    );
+    assert!(
+        forwarded_body.contains("filename=\"pic.jpg\""),
+        "{forwarded_body}"
+    );
+    assert_eq!(event["event"]["meta"]["body_truncated"], true);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn redact_file_parts_off_sends_the_start_of_the_file_but_not_the_password() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let config = config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS).replacen(
+        "    inspect_body 512;\n",
+        "    inspect_body 512;\n    redact_file_parts off;\n",
+        1,
+    );
+    let proxy = start_proxy(&config).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[("content-type", "multipart/form-data; boundary=BB")],
+        multipart_body_longer_than_inspect_body(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let event = stub.last_event().unwrap_or_default();
+    let forwarded_body = event["event"]["untrusted"]["body"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(!forwarded_body.contains("hunter2"), "{forwarded_body}");
+    assert!(forwarded_body.contains("EXIFGPS"), "{forwarded_body}");
     proxy.stop().await
 }

@@ -7,8 +7,9 @@ behaviour against a local stub backend. The full reports are in the repository's
 directory. This page summarizes them and states their limits.
 
 ::: warning Limits of these numbers
-The dataset is synthetic and small, with about 85 scored attacks and 110 allowed
-requests per split. Thresholds were chosen on the dev split, so only the holdout
+The dataset is synthetic and small. The figures on this page were measured with
+about 85 scored attacks and 110 allowed requests per split, before 11 Japanese
+rows were added to each split. Thresholds were chosen on the dev split, so only the holdout
 figures are out of sample. Credential-attack rows are excluded, because one login
 request cannot be told apart from a legitimate login. None of this shows how a
 model or a rule behaves on your traffic. Run a site in shadow mode first.

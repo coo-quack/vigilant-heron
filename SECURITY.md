@@ -28,8 +28,10 @@ and of names with a whole word such as `pass`, `pin`, `otp`, `session`, `card`,
 `cvv` or `ssn`, and of the fields named in `redact_field`, with `[REDACTED]`
 before sending. Those short words match only as whole words, so `class_name`
 and `business_name` are sent. Multipart
-(`multipart/form-data`) bodies are only lexically redacted, so a sensitive field
-inside one can still reach the backend in some layouts. Everything else, which
+(`multipart/form-data`) bodies are split into parts and redacted by part name, and
+the content of a file part (a part with a `filename`) is replaced unless
+`redact_file_parts off;` is set. A multipart body whose framing is broken is
+scanned as text instead, so the part-name rule does not apply to it. Text outside the parts, such as a preamble before the first delimiter, is scanned as text too. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the
 router at a backend you may disclose that data to, or run the decision model
 yourself.
@@ -115,8 +117,21 @@ decision model, in the order the README gives. They never send data anywhere.
   are removed. A third level of encoding is not decoded, so an input encoded three
   times is not seen as the attack it encodes. The request is forwarded unchanged.
   A block matches when any reading matches, so the reading an upstream uses cannot
-  escape a `deny_path`. A static skip needs every reading to be static, so a
-  path such as `/index.php/x.css` or `/x;.css` is always inspected.
+  escape a `deny_path`. A static skip needs every reading to be static. A
+  static-looking path is still inspected, and goes to the backend, when any of
+  these holds:
+  - the raw path has `;`, `\`, `%2F`, `%5C` or `%3B`, or a `?`, `#` or NUL written
+    as `%3F`, `%23` or `%00`, in any letter case;
+  - the raw path has `%25` (an encoded `%`, so the path may be encoded more than
+    once), `%u`, `%c0` or `%c1` (escapes some decoders accept);
+  - a dot-separated part of a segment after its name is a script extension, as in
+    `/index.php/x.css`, `/x.php.js` or `/x.phar/a.js`;
+  - the request is not a plain GET or HEAD with no body and no unlisted query, or
+    the last segment has no static extension;
+  - a `static_location` prefix is set and a reading is outside it, or a
+    `fail_closed_path` matches a reading.
+
+  The same list is in the `static_extensions` entry of the configuration reference.
 - A body rule sees only the first `inspect_body` bytes. Anything later in the
   body is not matched, and a multipart body is not parsed.
 - Regexes use the `regex` crate, which matches in time linear in the input and
@@ -226,10 +241,10 @@ failure and on the site settings:
   `success: false`, and malformed or out-of-range answers.
 - A client that already holds its `max_concurrency_per_client` share is in a
   group of its own, `client_busy`. It follows `on_client_busy`, which defaults to
-  `"block"`: the client gets 429 with an empty body, and the backend is not called.
+  `"block"`: the client gets 429 with an empty body and an `X-Request-ID` header, and the backend is not called.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
-  `"block"` (the default) applies the site's `action`, `"allow"` forwards the
-  request.
+  `"allow"` (the default) forwards the request, and `"block"` applies the site's
+  `action`.
 - `fail_closed_path` always blocks a failure on a matching path, whatever the
   group or setting.
 - Deterministic rules (the access list, `deny_path` and block rules) are decided

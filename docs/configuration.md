@@ -111,7 +111,13 @@ Status for a request whose `Host` matches no site. Must be a 4xx or 5xx code.
 - **Default:** none.
 - **Context:** top level.
 
-Request header whose value is logged as `$request_id`. The value is not sent to the decision backend.
+Request header whose value is logged as `$request_id`. The header is removed from the request that the decision backend receives, so the client's id does not reach the backend.
+
+The router uses the header's value as the id when the header is present and usable. A value is unusable when it is empty, longer than 64 bytes, or contains any byte outside visible ASCII (0x21 to 0x7E): a space, a tab, a control character, DEL, or any non-ASCII byte. When the header is missing or unusable, the router makes a 16-character id for the request instead, such as `3f9a0c17b2d4e8a1`. That id is logged in the same way.
+
+Each response that the router writes itself, after it has read the request, carries the id in an `X-Request-ID` header, so a client can quote it. A forwarded upstream response does not get the header.
+
+Name a header that the proxy in front of the router sets or overwrites. Otherwise a client can choose its own id.
 
 ### `real_ip_from`
 
@@ -287,7 +293,7 @@ Status for a blocked request: any 4xx or 5xx code, or `444`, which closes the co
 ### `block_page`
 
 - **Syntax:** `block_page <file>;`
-- **Default:** none. The body is `Forbidden`.
+- **Default:** none. The body is one line of plain text with the request id, such as `Request blocked. Request ID: 3f9a0c17b2d4e8a1`.
 - **Context:** top level, site, location.
 
 HTML served for blocked requests, with `Content-Type: text/html; charset=utf-8`. The file is read when the configuration loads and must be at most 64 KiB. A relative path is relative to the file that holds the directive.
@@ -501,10 +507,21 @@ Name of the environment variable that holds the bearer token. The token itself i
 ### `timeout`
 
 - **Syntax:** `timeout <time>;`
-- **Default:** `300ms`.
+- **Default:** `2000ms`.
 - **Context:** decision.
 
 Time allowed for one decision, including any wait for a slot. Must be greater than 0.
+
+The timeout is a ceiling. A backend that answers at once is judged at once, not after the timeout. A visitor can wait up to `timeout` for a request that goes to the model, and a call that is still waiting when the timeout ends it becomes a decision error, so `on_decision_error` decides that request.
+
+A longer timeout has a cost. Each call holds one of the `max_concurrency` slots until it is answered or the timeout ends it. With a slow backend, fewer new calls get a slot. A call also uses up its client's `max_concurrency_per_client` share while it waits, so a second request from that client gets 429 by default (`on_client_busy`).
+
+A fast backend can use a shorter value, so its visitors wait less and its slots free up sooner. The default of 2000 ms is the value that gave no timeouts for Clef-flash in a shadow trial. The figures below were measured from a server in Tokyo:
+
+- Clef-flash, 864 calls in a shadow trial with `timeout 2000ms`: p99 1,780 ms, maximum 1,985 ms, no timeouts. With `timeout 1000ms`, 84 calls timed out in 25.7 hours.
+- Jev (`jev-latest`), 300 calls: p50 133 ms, p99 185 ms, maximum 307 ms.
+
+Measure the slowest answers of your own backend from your server before you shorten the value.
 
 ### `queue_timeout`
 
@@ -521,6 +538,10 @@ Longest wait for a free concurrency slot. A request that finds no slot in that t
 - **Context:** decision.
 
 Most backend calls in flight at the same time. At least 1.
+
+A call holds its slot while it waits for the backend, and the [`timeout`](#timeout) ends that wait. So with a backend that does not answer, at most about `max_concurrency / timeout` new calls start per second. With the defaults, 64 slots and a 2000 ms timeout give about 32 new calls per second.
+
+A request that finds no free slot is decided by [`on_rate_limit`](#on-rate-limit). By default it is allowed, so it is forwarded without a model verdict. With `block` it is refused instead. A few slow clients can fill the slots, so with `block` their calls refuse requests from other clients too, not only their own.
 
 ### `max_concurrency_per_client`
 
@@ -562,6 +583,14 @@ Extra header names removed before the event is sent to the backend. Repeatable. 
 - **Context:** decision.
 
 Extra field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. This applies to form, JSON, multipart and XML bodies, and to the query string. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. For a multipart part, the name is the `name` in its `Content-Disposition`. For an XML element, it is the local name without the prefix, so `ticket_ref` also redacts `<ns:ticket_ref>`. Repeatable.
+
+### `redact_file_parts`
+
+- **Syntax:** `redact_file_parts on | off;`
+- **Default:** `on`.
+- **Context:** decision.
+
+Whether the content of a file part in a `multipart/form-data` body is replaced by `[REDACTED]` before the event is sent to the backend. A file part is a part whose `Content-Disposition` has a `filename` or `filename*` parameter. Its part headers, with the field name, the file name and the content type, are always sent, so the model still sees the file name and the content type, for example a `.php` file sent as `image/jpeg`. With `off`, the content is sent like any other part, up to `inspect_body`. A file part whose field name is sensitive or named in `redact_field` is redacted either way.
 
 ## Site block
 
@@ -659,7 +688,18 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params)) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params) or, when [`static_query_token`](#static-query-token) `on` is set, only one bare token) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. An empty list (`static_extensions;`) turns the static skip off for the site.
+
+A static-looking path is inspected, and goes to the backend, when any of these holds:
+
+- the request is not a GET or HEAD, has a body, or has a query other than the ones above;
+- the last segment does not end in one of these extensions;
+- the raw path has `;`, `\`, `%2F`, `%5C` or `%3B`, in any letter case, so `/x;.css` is inspected;
+- the raw path has `?`, `#` or a NUL, written as `%3F`, `%23` or `%00`, in any letter case, so `/x.php%3Fa.js` and `/x.php%00.js` are inspected;
+- the raw path has `%25`, which is an encoded `%`, so the path may be encoded more than once; this covers `/x.php%253Fa.js` and `/x.php%25253Fa.js`. It also has `%u`, `%c0` or `%c1`, escapes that some decoders accept, such as `/a%u002fb.css` and `/a%c0%afb.css`;
+- a dot-separated part of any segment after the segment's name is a script extension (`php`, `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`, `phtml`, `shtml`, `shtm`, `jsp`, `jspx`, `asp`, `aspx`, `ashx`, `asmx`, `axd`, `cgi`, `cfm`, `cfc`, `pl`, `py`, `rb`), so `/index.php/x.css`, `/x.php.js` and `/x.phar/a.js` are inspected;
+- a [`static_location`](#static-location) prefix is set and a [path reading](/how-it-works#path-readings) is not under one of them;
+- a [`fail_closed_path`](#fail-closed-path) matches a path reading.
 
 ### `static_location`
 
@@ -683,6 +723,23 @@ A page view loads many such assets at once. Without this directive each of them 
 site example.com {
     upstream http://127.0.0.1:8081;
     static_query_params ver;    # WordPress: /wp-includes/js/jquery/jquery.min.js?ver=3.7.1
+}
+```
+
+### `static_query_token`
+
+- **Syntax:** `static_query_token on | off;`
+- **Default:** `off`.
+- **Context:** site.
+
+With `on`, a static asset request whose whole query is one bare token, a value with no `=` or `&`, can skip the backend. The token must be 1 to 64 ASCII letters, digits, `.`, `_` or `-`, and it is checked as received, so an escape (`%`), a `+` or an empty query sends the request to the backend. The other conditions of the static skip still apply, and block rules run before it. A query of `name=value` pairs is handled by [`static_query_params`](#static-query-params) instead.
+
+WordPress's TinyMCE editor requests its files with a query such as `?wp-mce-49110-20250317`.
+
+```nginx
+site example.com {
+    upstream http://127.0.0.1:8081;
+    static_query_token on;    # WordPress: /wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317
 }
 ```
 

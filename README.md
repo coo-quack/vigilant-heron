@@ -156,6 +156,7 @@ In shadow mode, steps 1 to 6 still run and are logged, but every request is forw
 The full documentation is published at <https://coo-quack.github.io/vigilant-heron/>. The links below open its sources in [`docs/`](docs/).
 
 - [Getting started](docs/getting-started.md): a minimal configuration, a test attack, shadow mode, enforce mode
+- [From shadow mode to enforce](docs/rollout.md): a guide to running a real site in shadow mode, then in the request path, then in enforce mode
 - [Installation](docs/install.md): release binaries, Docker, building from source, nginx or Cloudflare in front, updates
 - [Command line](docs/cli.md): every option, `-T`, and `-s` signals
 - [Troubleshooting](docs/troubleshooting.md): common symptoms and their fixes
@@ -168,6 +169,8 @@ The full documentation is published at <https://coo-quack.github.io/vigilant-her
 - [Security](docs/security.md): what leaves the router, and what the router can and cannot stop
 - [Evaluation](docs/evaluation.md): measurements of the models and the built-in rules
 - [Changelog](docs/changelog.md)
+
+**Agent skill.** [`skills/vigilant-heron-rollout/`](skills/vigilant-heron-rollout/SKILL.md) is a skill that drives the rollout guide with an AI agent on your server, with the operator deciding every change to live traffic. Install it with `npx skills add coo-quack/vigilant-heron`.
 
 ## Security
 

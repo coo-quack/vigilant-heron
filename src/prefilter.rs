@@ -29,14 +29,28 @@ pub(crate) enum Screening {
 }
 
 /// Extensions of scripts that run for a path. A static skip never applies when one
-/// of them is in an earlier segment, as in `/index.php/x.css`.
-const DYNAMIC_EXTENSIONS: [&str; 10] = [
-    "php", "phtml", "jsp", "jspx", "asp", "aspx", "cgi", "pl", "py", "rb",
+/// of them is a dot-separated part of any segment after the segment's name, as in
+/// `/index.php/x.css`, `/x.php.js` or `/x.phar/a.js`. See [`has_dynamic_extension`].
+const DYNAMIC_EXTENSIONS: [&str; 25] = [
+    "php", "php3", "php4", "php5", "php7", "php8", "phar", "phps", "pht", "phtml", "shtml", "shtm",
+    "jsp", "jspx", "asp", "aspx", "ashx", "asmx", "axd", "cgi", "cfm", "cfc", "pl", "py", "rb",
 ];
 
-/// Raw path text that makes a path unsafe for a static skip: a parameter separator,
-/// a backslash, or an encoded `/`, `\` or `;`. Compared in lowercase.
-const UNSAFE_RAW_MARKERS: [&str; 5] = [";", "\\", "%2f", "%5c", "%3b"];
+/// Raw path text that makes a path unsafe for a static skip. Compared in lowercase.
+///
+/// - `;`, `\`, and `%2F`, `%5C`, `%3B`: parameters, and separators that an upstream may read.
+/// - `?`, `#`, NUL, and `%3F`, `%23`, `%00`: an upstream may end the path at them.
+///   A literal `?` or `#` cannot reach a path reading over HTTP, since the `http` crate
+///   ends the path there, so those two entries are defense in depth.
+/// - `%25`: an encoded `%`. A path with it may be encoded two or more times, so one decode
+///   does not show what the upstream sees. Every decoded `?`, `#`, NUL or separator that
+///   the readings can show comes from one of the escapes above, and only a `%25` lets
+///   such an escape survive a decode, so this entry covers the double and triple forms.
+/// - `%u`, `%c0`, `%c1`: escapes that some decoders accept (`%uXXXX`, and overlong UTF-8
+///   lead bytes that decode to `/` or `\`).
+const UNSAFE_RAW_MARKERS: [&str; 15] = [
+    ";", "\\", "%2f", "%5c", "%3b", "?", "#", "\0", "%3f", "%23", "%00", "%25", "%u", "%c0", "%c1",
+];
 
 /// The ways the request path is read by the security checks.
 ///
@@ -210,13 +224,14 @@ pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
 ///
 /// Every condition must hold:
 ///
-/// - a GET or HEAD with no body and the raw path free of `;`, `\`, `%2F`, `%5C` and
-///   `%3B` (case-insensitive);
+/// - a GET or HEAD with no body and the raw path free of every entry of
+///   [`UNSAFE_RAW_MARKERS`] (case-insensitive);
 /// - no query, or one made only of `static_query_params` parameters, see
-///   [`cache_busters_only`];
+///   [`cache_busters_only`], or, with `static_query_token on`, one bare token, see
+///   [`query_keeps_static_skip`];
 /// - under a `static_location` prefix, when the site sets any: every view starts with one;
-/// - in every view, the last segment has a static extension and no earlier segment
-///   has a script extension;
+/// - in every view, the last segment has a static extension and no segment has a script
+///   extension, see [`is_static_view`];
 /// - no `fail_closed_path` matches any view.
 ///
 /// `views` must be the lowercase views of the request path.
@@ -232,7 +247,7 @@ pub(crate) fn static_skip(
     }
     if input
         .raw_query()
-        .is_some_and(|query| !cache_busters_only(site, query))
+        .is_some_and(|query| !query_keeps_static_skip(site, query))
     {
         return false;
     }
@@ -252,44 +267,65 @@ pub(crate) fn static_skip(
     views.iter().all(|view| is_static_view(site, view)) && !fails_closed(site, views)
 }
 
-/// Longest value of a `static_query_params` parameter that keeps the static skip.
+/// Longest value of a `static_query_params` parameter, or bare query token, that keeps the static skip.
 const MAX_CACHE_BUSTER_LEN: usize = 64;
+
+/// Returns true when a raw query may keep the static skip: the `static_query_params` form,
+/// or, when the site sets `static_query_token on`, one bare token.
+fn query_keeps_static_skip(site: &SiteConfig, query: &str) -> bool {
+    cache_busters_only(site, query) || (site.static_query_token && is_cache_buster_value(query))
+}
 
 /// Returns true when a raw query is made only of the site's `static_query_params`,
 /// such as the `?ver=6.8.3` that `WordPress` adds.
 ///
 /// Each `&`-separated part must be `name=value` with a listed name, compared as
-/// received, and a value of 1 to 64 ASCII letters, digits, `.`, `_` or `-`. The value
-/// is checked raw, so an escape (`%`) or a `+` makes the request inspected. An empty
-/// query, an empty part and any other parameter do too.
+/// received, and a value that [`is_cache_buster_value`] accepts. An empty query, an
+/// empty part and any other parameter make the request inspected.
 fn cache_busters_only(site: &SiteConfig, query: &str) -> bool {
     query.split('&').all(|part| {
         part.split_once('=').is_some_and(|(name, value)| {
             site.static_query_params
                 .iter()
                 .any(|allowed| allowed == name)
-                && (1..=MAX_CACHE_BUSTER_LEN).contains(&value.len())
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                && is_cache_buster_value(value)
         })
     })
 }
 
-/// Returns true when a lowercase view ends in a static extension and no earlier segment
-/// ends in a script extension.
+/// Returns true when a raw value is 1 to 64 ASCII letters, digits, `.`, `_` or `-`.
+///
+/// The value is checked raw, so an escape (`%`), a `+`, an `=` or an `&` makes it
+/// fail, and so does an empty value. It is used for a `static_query_params` value and
+/// for a whole query that is one bare token, such as `wp-mce-49110-20250317`.
+fn is_cache_buster_value(value: &str) -> bool {
+    (1..=MAX_CACHE_BUSTER_LEN).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Returns true when a lowercase view ends in a static extension and no segment of it
+/// has a script extension, see [`has_dynamic_extension`].
 fn is_static_view(site: &SiteConfig, path: &str) -> bool {
-    let mut segments = path.split('/').rev();
-    let last = segments.next().unwrap_or_default();
+    let last = path.rsplit('/').next().unwrap_or_default();
     let static_last = extension(last).is_some_and(|extension| {
         site.static_extensions
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(extension))
     });
-    let dynamic_earlier = segments.any(|segment| {
-        extension(segment).is_some_and(|extension| DYNAMIC_EXTENSIONS.contains(&extension))
-    });
-    static_last && !dynamic_earlier
+    static_last && !path.split('/').any(has_dynamic_extension)
+}
+
+/// Returns true when a dot-separated part of a segment, after its first part, is a script
+/// extension. The first part is the name, so `php.js` is not dynamic, while `x.php.js`,
+/// `x.phar` and `.php` are. Every part is checked, not only the last, because an upstream
+/// may run a script for any of them.
+fn has_dynamic_extension(segment: &str) -> bool {
+    segment
+        .split('.')
+        .skip(1)
+        .any(|part| DYNAMIC_EXTENSIONS.contains(&part))
 }
 
 /// The text after the last `.` of a segment.
@@ -504,6 +540,85 @@ mod tests {
     #[case::encoded_slash(Method::GET, "/a%2Fb.css", false, true, Screening::Inspect)]
     #[case::encoded_backslash(Method::GET, "/a%5cb.css", false, true, Screening::Inspect)]
     #[case::encoded_semicolon(Method::GET, "/a%3Bb.css", false, true, Screening::Inspect)]
+    // An encoded `?`, `#` or NUL can hide a script name from the extension check, as in
+    // `/x.php?a.js`, which an upstream may read as a script named `x.php`.
+    #[case::encoded_question_mark(Method::GET, "/x.php%3Fa.js", false, true, Screening::Inspect)]
+    #[case::encoded_question_mark_lowercase(
+        Method::GET,
+        "/x.php%3fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::encoded_hash(Method::GET, "/x.php%23a.js", false, true, Screening::Inspect)]
+    #[case::encoded_nul(Method::GET, "/x.php%00.js", false, true, Screening::Inspect)]
+    // Encoded twice: the first decode leaves `%3F`, `%23` or `%00` in the view.
+    #[case::double_encoded_question_mark(
+        Method::GET,
+        "/x.php%253Fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::double_encoded_hash(Method::GET, "/x.php%2523a.js", false, true, Screening::Inspect)]
+    #[case::double_encoded_nul(Method::GET, "/x.php%2500.js", false, true, Screening::Inspect)]
+    // A literal `?` or `#` in a reading is inspected too, even though the HTTP layer normally splits it off.
+    #[case::literal_question_mark_in_a_reading(
+        Method::GET,
+        "/x.php?a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::literal_hash_in_a_reading(Method::GET, "/x.php#a.js", false, true, Screening::Inspect)]
+    // Only the raw markers catch these: the `..` removes the escape in every reading.
+    #[case::encoded_question_mark_before_dot_dot(
+        Method::GET,
+        "/x.php%3F/../a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::encoded_hash_before_dot_dot(
+        Method::GET,
+        "/x.php%23/../a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    // Any encoded percent sign makes the path inspected, so every multiple encoding is caught.
+    #[case::double_encoded_slash(Method::GET, "/a%252Fb.css", false, true, Screening::Inspect)]
+    #[case::triple_encoded_question_mark(
+        Method::GET,
+        "/x.php%25253Fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    // Escapes that some decoders accept.
+    #[case::iis_unicode_escape(Method::GET, "/a%u002fb.css", false, true, Screening::Inspect)]
+    #[case::overlong_slash(Method::GET, "/a%c0%afb.css", false, true, Screening::Inspect)]
+    #[case::overlong_backslash(Method::GET, "/a%c1%9cb.css", false, true, Screening::Inspect)]
+    // A script extension in any part of the file name, or of a segment before it.
+    #[case::script_extension_before_static_one(
+        Method::GET,
+        "/x.php.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::phar_directory(Method::GET, "/x.phar/a.js", false, true, Screening::Inspect)]
+    #[case::dynamic_extension_in_a_dotfile(
+        Method::GET,
+        "/.php/a.css",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    // A name whose first part is `php` is not a script extension.
+    #[case::php_as_the_name_is_static(Method::GET, "/php.js", false, true, Screening::Skip)]
+    // A plain static path with none of these still skips.
+    #[case::plain_static_path_still_skips(Method::GET, "/a.js", false, true, Screening::Skip)]
     // A script earlier in the path serves the request as PATH_INFO.
     #[case::path_info_of_a_script(Method::GET, "/index.php/x.css", false, true, Screening::Inspect)]
     #[case::path_info_of_an_aspx_page(
@@ -525,6 +640,33 @@ mod tests {
             screen_path(&config, &method, raw_path, has_query, body_is_empty),
             expected,
             "{raw_path}"
+        );
+        Ok(())
+    }
+
+    /// Every script extension in the list makes a static-looking path inspected, as the last
+    /// part of a file name and as a directory name. The docs list the same extensions.
+    #[test]
+    fn every_dynamic_extension_makes_a_static_looking_path_inspected() -> Result<(), ConfigError> {
+        let config = site("")?;
+        for extension in DYNAMIC_EXTENSIONS {
+            for raw_path in [format!("/x.{extension}.js"), format!("/x.{extension}/a.js")] {
+                assert_eq!(
+                    screen_path(&config, &Method::GET, &raw_path, false, true),
+                    Screening::Inspect,
+                    "{raw_path}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_static_extensions_list_skips_no_path() -> Result<(), ConfigError> {
+        let config = site("static_extensions;")?;
+        assert_eq!(
+            screen_path(&config, &Method::GET, "/style.css", false, true),
+            Screening::Inspect
         );
         Ok(())
     }
@@ -601,6 +743,106 @@ mod tests {
             screen_query(&config, raw_path, query),
             Screening::Inspect,
             "{raw_path}?{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::wordpress_tinymce("wp-mce-49110-20250317", Screening::Skip)]
+    #[case::one_letter("a", Screening::Skip)]
+    #[case::longest(&"a".repeat(64), Screening::Skip)]
+    #[case::every_allowed_mark("A.b_c-9", Screening::Skip)]
+    #[case::too_long(&"a".repeat(65), Screening::Inspect)]
+    #[case::empty("", Screening::Inspect)]
+    #[case::percent_escape("a%20b", Screening::Inspect)]
+    #[case::plus("a+b", Screening::Inspect)]
+    #[case::equals("a=1", Screening::Inspect)]
+    #[case::ampersand("a&b", Screening::Inspect)]
+    #[case::slash("a/b", Screening::Inspect)]
+    #[case::space("a b", Screening::Inspect)]
+    fn static_query_token_lets_only_a_bare_token_skip(
+        #[case] query: &str,
+        #[case] expected: Screening,
+    ) -> Result<(), ConfigError> {
+        // Built-in rules would catch some of these first; this checks the static skip alone.
+        let config = site("static_query_token on;\n    builtin_rules off;")?;
+        assert_eq!(
+            screen_query(&config, "/wp-includes/js/tinymce/wp-tinymce.js", query),
+            expected,
+            "{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::off_by_default("", "/wp-tinymce.js", "wp-mce-49110-20250317")]
+    #[case::not_static("static_query_token on;", "/index.php", "wp-mce-1")]
+    #[case::script_earlier("static_query_token on;", "/index.php/x.js", "wp-mce-1")]
+    #[case::outside_static_location(
+        "static_query_token on;\n    static_location /static/;",
+        "/img/a.js",
+        "wp-mce-1"
+    )]
+    fn static_query_token_does_not_widen_the_rest_of_the_static_skip(
+        #[case] fields: &str,
+        #[case] raw_path: &str,
+        #[case] query: &str,
+    ) -> Result<(), ConfigError> {
+        let config = site(fields)?;
+        assert_eq!(
+            screen_query(&config, raw_path, query),
+            Screening::Inspect,
+            "{raw_path}?{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::plain_get_is_skipped(Method::GET, true, Screening::Skip)]
+    #[case::head_is_skipped(Method::HEAD, true, Screening::Skip)]
+    #[case::post_is_inspected(Method::POST, true, Screening::Inspect)]
+    #[case::body_is_inspected(Method::GET, false, Screening::Inspect)]
+    fn static_query_token_keeps_the_method_and_body_conditions(
+        #[case] method: Method,
+        #[case] body_is_empty: bool,
+        #[case] expected: Screening,
+    ) -> Result<(), ConfigError> {
+        let config = site("static_query_token on;\n    builtin_rules off;")?;
+        let headers = HeaderMap::new();
+        let client = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let input = RuleInput::new(
+            &method,
+            "/wp-tinymce.js",
+            Some("wp-mce-1"),
+            &headers,
+            &[],
+            client,
+        );
+        assert_eq!(
+            screen(
+                &config,
+                &input,
+                &lower_views("/wp-tinymce.js"),
+                body_is_empty
+            ),
+            expected,
+            "{method} with body_is_empty={body_is_empty}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_block_rule_still_runs_before_a_static_skip_with_a_bare_token() -> Result<(), ConfigError> {
+        let config = site(
+            "static_query_token on;\n    rule block-tinymce {\n        description \"blocked\";\n        action block;\n        path /wp-tinymce.js;\n    }",
+        )?;
+        assert_eq!(
+            screen_query(&config, "/wp-tinymce.js", "wp-mce-1"),
+            Screening::Rule(Some(Arc::from("block-tinymce")))
+        );
+        assert_eq!(
+            screen_query(&config, "/app.js", "wp-mce-1"),
+            Screening::Skip
         );
         Ok(())
     }

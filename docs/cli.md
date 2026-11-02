@@ -18,9 +18,12 @@ follow nginx's, so `-t`, `-T` and `-s` do what they do in nginx.
 | `stop` | Stop the background router and wait until it has exited. |
 | `restart` | Check the configuration, then stop and start the background router. |
 | `test-request <file>` | Report what the router would do with one raw HTTP request, without calling the decision backend. See [Check a request with test-request](#check-a-request-with-test-request). |
+| `test-request --url <url>` | The same, for a request built from a URL, with `--host`, `--method` and `--header`. See [Check a URL with test-request](#check-a-url-with-test-request). |
 | `--client <address>` | The client address that `test-request` uses for the access list. The default is `127.0.0.1`. |
 | `suggest-skip-rules <file>` | Suggest skip rules from a `json` access log, for review. Nothing is applied. See [Learn skip rules from the access log](#learn-skip-rules-from-the-access-log). |
 | `--site`, `--min-judged`, `--min-clients`, `--min-days`, `--max-attack`, `--max-ai-instruction` | Filter and thresholds of `suggest-skip-rules`. |
+| `shadow-report <file>...` | Summarize json access logs from a shadow trial, to read before you switch to enforce. Nothing is applied. See [Summarize a shadow log](#summarize-a-shadow-log). |
+| `--max-lines`, `--usd-per-mtok`, `--full-addresses` | Options of `shadow-report`. |
 
 An unknown option, a missing value, or an invalid `-s` word prints the reason and
 the usage to stderr, and exits 1. `-h` and `-v` win over the other options. `-s`
@@ -131,7 +134,12 @@ $ echo $?
 
 A failure prints the file and line of the error, then `test failed`, and exits 1.
 The check reads the includes, rules, block pages and token variables. A token
-variable that is not set fails the check.
+variable that is not set does not fail the check. A warning names it on stderr,
+because the router will not start without it. Starting the router still needs the
+variable, as `start` and a foreground run do.
+
+So `-t` exits 0 when the token variable is missing. A deploy check that must catch a
+missing token should look for the warning on stderr, or start the router.
 
 ## Print the configuration with -T
 
@@ -168,8 +176,9 @@ deploy a rule or a configuration change. It reads the configuration the same way
 `-t` does, and reports the decision. Nothing is bound or forwarded, and neither the
 upstream nor the decision backend is contacted.
 
-Because the configuration is checked as `-t` checks it, the variable named by
-`api_token_env` must be set. Any value works, since the backend is not called.
+A token variable that is not set does not stop `test-request`. It prints the same
+warning as `-t`, then the report. The backend is not called, so the token is not
+needed for the report.
 
 ```console
 $ vigilant-heron -c examples/vigilant-heron.conf test-request examples/requests/sqli-get.http
@@ -237,6 +246,44 @@ cannot be read, a request that is not valid HTTP/1.1, or an invalid configuratio
 prints the reason to stderr and exits 1. `test-request` cannot be combined with `-t`,
 `-T`, `-s`, `start`, `stop` or `restart`.
 
+## Check a URL with test-request
+
+`test-request --url <url>` checks one request given as a URL, so no file is needed.
+The report is the one that `test-request <file>` prints for the same request, and the
+exit codes are the same.
+
+```console
+$ vigilant-heron -c examples/vigilant-heron.conf test-request --url 'https://www.example.com/products?id=1%20UNION%20SELECT%20password%20FROM%20users'
+warning: TYPESAFE_API_KEY (api_token_env) is not set; the router will not start without it
+request: GET "/products?id=1%20UNION%20SELECT%20password%20FROM%20users" (Host: "www.example.com", client: 127.0.0.1)
+site: example.com (shadow off)
+limits: not simulated (counts depend on earlier requests); limit_req zones: none; limit_conn zones: none
+access list: allowed
+deny_path: no match
+rules: vh-sqli-001 matched (block): UNION SELECT in a query string
+result: blocked with 403 by rule vh-sqli-001
+$ echo $?
+0
+```
+
+The warning appears because the example configuration names the Jev token variable,
+and it is not set in this shell. The check does not need it.
+
+- A `http://` or `https://` URL sets the Host header from its host name. A port is
+  kept when it is not the default for the scheme (80 for `http`, 443 for `https`);
+  the default port is left out.
+- The path and query of the URL are the request target. An empty path is `/`.
+- A URL that starts with `/` is a path. It needs `--host <name>`, which sets the
+  Host header: `test-request --url /items?id=2 --host www.example.com`.
+- `--method <m>` sets the request method. It is GET when the option is not given,
+  and it is written in uppercase.
+- `--header 'Name: value'` adds a request header. Repeat the option for more headers.
+- `--host`, `--method` and `--header` are only for `test-request --url`. `--host`
+  is refused with an absolute URL, because the URL already gives the Host.
+- A URL with a `#` fragment, a space, or user information (the part before `@`) is
+  refused with the reason, and the command exits 1.
+- `--url` cannot be combined with a request file.
+
 ## Learn skip rules from the access log
 
 A skip rule forwards a request without calling the decision model, which saves
@@ -250,7 +297,8 @@ Follow these steps.
 1. **Check the log format.** The command needs the access log in the built-in
    `json` format, written by a version that includes the
    [`query_shape`](/logging#query-shape) field.
-   Lines written by an older version are counted as unusable and ignored.
+   Lines written by an older version are counted as unusable and ignored. A line
+   longer than 1 MiB is counted as unusable too, and its rest is skipped.
 2. **Run the command.** Give the log file, or `-` to read standard input:
 
    ```console
@@ -298,6 +346,67 @@ into rules, because a rule for them would let any value through.
 
 Use `--site <name>` to keep the groups of one site. The thresholds take a count of
 at least 1, or a score from 0 to 1.
+
+## Summarize a shadow log
+
+Before you switch from shadow mode to enforce, read the shadow log. `shadow-report`
+prints a summary of it as plain text, for a person to read or to paste into an
+issue.
+
+```console
+$ vigilant-heron shadow-report /var/log/vigilant-heron/access.json.1 /var/log/vigilant-heron/access.json
+```
+
+Give the rotated log and the current log together. Several files are read in the
+order given. The files must be plain files: a compressed file is not decompressed,
+and each of its lines counts as malformed.
+
+`shadow-report` never calls a backend and never reads the configuration file, so
+`-c` is refused and no configuration is needed.
+
+A line that is not a JSON object is counted as malformed and skipped. A line longer
+than 1 MiB is counted as malformed too, and its rest is skipped. The report says how
+many lines were read, how many were JSON objects, and how many were skipped.
+
+A file that cannot be read stops the command with exit code 1. The message names
+the file.
+
+The report has six parts, in this order.
+
+- **Overview**: the files and lines read, the time range, and the counts of lines
+  by `reason` and of decision errors by cause.
+- **Per day**: one line for each UTC day, with the lines, the backend calls, the
+  skips, the blocked or redirected lines, the decision errors and the timeouts.
+- **Blocked or redirected lines**: one line each, with the time, the client, the
+  method, the path, the query shape, the rule or the category, and the attack
+  score. At most 50 are listed. The count of the rest is given.
+- **client_busy bursts**: a minute in which one client has 5 or more `client_busy`
+  lines, with its three most used paths.
+- **Backend per hour**: each UTC hour with backend calls, with the calls, the
+  timeouts, and the p50 and p99 of `latency_ms`.
+- **Input tokens**: the total, and an estimated cost when a price is given.
+
+A backend call is a line with an `attack` score, or with a `decision_error` that
+comes from a call to the backend: `timeout`, `rate_limited`, `connection`,
+`http_status`, `body`, `parse`, `rejected`, `invalid_response` or `invalid_score`.
+A line with `client_busy`, `backend_busy` or `request` never reached the backend,
+so it is not a call. A `parse` error can also come from encoding the request, before
+any call, and it still counts as a call. A timeout is a line whose `decision_error`
+is `timeout`. A line is blocked or redirected when `action` or `would_have` is
+`block` or `redirect`. A skip is a line whose `reason` is `skip` or `skip_rule`.
+
+Paths in the report come from the log. They can contain tokens that appeared in
+URLs, so read the report before you paste it into an issue.
+
+The latency percentiles use only the calls that got an `attack` score. A timeout
+has no score, so its `latency_ms` is not counted.
+
+- `--max-lines <n>` sets how many blocked or redirected lines are listed. The default is 50.
+- `--usd-per-mtok <price>` sets the price in USD per million input tokens. The cost is
+  estimated from the input tokens alone, because the log has no output tokens.
+- Client addresses are shortened by default. An IPv4 address keeps its first three
+  octets, as in `192.0.2.x`. An IPv6 address keeps its first three groups, as in
+  `2001:db8:1::`. `--full-addresses` prints each address in full.
 
 ## Signal the running router with -s
 

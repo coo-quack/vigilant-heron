@@ -1,5 +1,5 @@
 //! Integration tests for the access log: the fields of each line, the request id,
-//! the truncation of a long id, the formats, and `access_log off`.
+//! the generated ids, the user agent, the formats, and `access_log off`.
 
 mod common;
 
@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
-use common::{BoxError, Reply, StubDecider, TestResult, Upstream, send, start_proxy_config};
+use common::{
+    BoxError, Reply, StubBehavior, StubDecider, TestResult, Upstream, assert_plain_block, send,
+    start_proxy_config,
+};
 use http::{Method, StatusCode};
 use serde_json::Value;
 use vigilant_heron::Config;
@@ -95,6 +98,16 @@ async fn start_jev_fake() -> Result<FakeSystemOne, BoxError> {
     .await
 }
 
+/// A decision stub that judges every request an attack, so that the router blocks it.
+async fn attacking_decider() -> Result<StubDecider, BoxError> {
+    let decider = StubDecider::start().await?;
+    decider.set_behavior(StubBehavior {
+        attack: 0.95,
+        ..StubBehavior::default()
+    });
+    Ok(decider)
+}
+
 async fn get_with_id(base: &str, path: &str, id: &str) -> Result<Reply, BoxError> {
     send(
         base,
@@ -169,9 +182,305 @@ async fn query_shape_is_empty_when_the_request_has_no_query() -> TestResult {
     proxy.stop().await
 }
 
+/// A rule that blocks any query containing `forbidden`.
+const PROBE_RULE: &str = r#"
+    rule query-probe {
+        description "probe in the query";
+        action block;
+        query ~* "forbidden";
+    }"#;
+
+/// A configuration whose access log writes `request_id|action|reason|would_have|block_query`
+/// lines, so a test can check the block query next to the decision.
+fn block_query_config(
+    decide_url: &str,
+    upstream: &str,
+    path: &Path,
+    mode: &str,
+    site_extra: &str,
+) -> Result<Config, BoxError> {
+    block_query_config_with_decision(decide_url, upstream, path, mode, "", site_extra)
+}
+
+/// Like [`block_query_config`], with `decision_extra` lines added to the `decision` block.
+fn block_query_config_with_decision(
+    decide_url: &str,
+    upstream: &str,
+    path: &Path,
+    mode: &str,
+    decision_extra: &str,
+    site_extra: &str,
+) -> Result<Config, BoxError> {
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+request_id_header x-request-id;
+log_format blocked "$request_id|$action|$reason|$would_have|$block_query";
+access_log "{log}" blocked;
+client_max_body_size 1024;
+decision {{
+    backend http;
+    url "{decide_url}";
+    timeout 300ms;
+    inspect_body 512;
+    {decision_extra}
+}}
+
+site example.com {{
+    upstream "{upstream}";
+    mode {mode};
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    {site_extra}
+}}
+"#,
+        log = path.display(),
+    );
+    Ok(Config::parse_str(&text, "logging.conf")?)
+}
+
 #[tokio::test]
-async fn long_request_id_is_cut_to_128_bytes_and_not_sent_to_the_backend() -> TestResult {
+async fn block_query_is_logged_when_a_rule_blocks() -> TestResult {
     let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-rule");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=forbidden&p=1", "bq-rule").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-rule|").await?;
+    assert_eq!(line, "bq-rule|block|rule|-|q=forbidden&p=1");
+    assert_eq!(decider.calls(), 0, "the rule blocks before the backend");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_the_model_blocks() -> TestResult {
+    let decider = StubDecider::start().await?;
+    decider.set_behavior(common::StubBehavior {
+        attack: 0.95,
+        ..common::StubBehavior::default()
+    });
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-model");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(&decider.decide_url(), &upstream.url(), &path, "enforce", "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=1", "bq-model").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-model|").await?;
+    assert_eq!(line, "bq-model|block|model|-|q=1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_a_shadow_decision_would_have_blocked() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-shadow");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "shadow",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=forbidden", "bq-shadow").await?;
+
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "shadow mode forwards the request"
+    );
+    let line = wait_for_field_line(&path, "bq-shadow|").await?;
+    assert_eq!(line, "bq-shadow|allow|rule|block|q=forbidden");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_empty_when_the_request_is_allowed() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-allowed");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=1", "bq-allow").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_field_line(&path, "bq-allow|").await?;
+    assert_eq!(line, "bq-allow|allow|below_threshold|-|-");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_redacts_sensitive_parameters_in_the_log() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-redact");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(
+        &proxy.base(),
+        "/search?password=hunter2&token=abc&q=forbidden",
+        "bq-redact",
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-redact|").await?;
+    assert_eq!(
+        line,
+        "bq-redact|block|rule|-|password=[REDACTED]&token=[REDACTED]&q=forbidden"
+    );
+    let text = std::fs::read_to_string(&path)?;
+    assert!(
+        !text.contains("hunter2") && !text.contains("=abc"),
+        "a sensitive value leaked into the log: {text}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_applies_the_redact_field_names_of_the_decision_block() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-redact-field");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config_with_decision(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        "redact_field ticket_ref;",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(
+        &proxy.base(),
+        "/search?ticket_ref=T-1&q=forbidden",
+        "bq-ticket",
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-ticket|").await?;
+    assert_eq!(
+        line,
+        "bq-ticket|block|rule|-|ticket_ref=[REDACTED]&q=forbidden"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_matches_the_query_the_backend_received() -> TestResult {
+    let decider = StubDecider::start().await?;
+    decider.set_behavior(common::StubBehavior {
+        attack: 0.95,
+        ..common::StubBehavior::default()
+    });
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-backend");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(&decider.decide_url(), &upstream.url(), &path, "enforce", "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?token=abc&q=1", "bq-match").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let sent = decider.last_event().and_then(|event| {
+        event["event"]["untrusted"]["query"]
+            .as_str()
+            .map(str::to_owned)
+    });
+    assert_eq!(sent.as_deref(), Some("token=[REDACTED]&q=1"));
+    let line = wait_for_field_line(&path, "bq-match|").await?;
+    assert_eq!(line, "bq-match|block|model|-|token=[REDACTED]&q=1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_keeps_a_long_query_whole() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-long");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+    let query = format!("q=forbidden{}", "a".repeat(3000));
+
+    let reply = get_with_id(&proxy.base(), &format!("/search?{query}"), "bq-long").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-long|").await?;
+    assert_eq!(line, format!("bq-long|block|rule|-|{query}"));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_a_decision_failure_blocks() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decide_url = common::closed_port_url().await?;
+    let path = log_path("block-query-failure");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decide_url,
+        &upstream.url(),
+        &path,
+        "enforce",
+        "on_decision_error block;",
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=1", "bq-fail").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-fail|").await?;
+    assert_eq!(line, "bq-fail|block|decision_error_blocked|-|q=1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_request_id_header_longer_than_64_characters_is_replaced_by_a_generated_id() -> TestResult
+{
+    let decider = attacking_decider().await?;
     let upstream = Upstream::start().await?;
     let path = log_path("truncation");
     let _ = std::fs::remove_file(&path);
@@ -179,13 +488,30 @@ async fn long_request_id_is_cut_to_128_bytes_and_not_sent_to_the_backend() -> Te
     let proxy = start_proxy_config(config).await?;
     let long_id = format!("rid-truncation-{}", "x".repeat(200));
 
-    let reply = get_with_id(&proxy.base(), "/articles", &long_id).await?;
+    let reply = get_with_id(&proxy.base(), "/?q=x", &long_id).await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let generated = assert_plain_block(&reply);
+    assert_eq!(generated.len(), 16, "{generated}");
+    let line = wait_for_line(&path, &generated).await?;
+    assert_eq!(line["request_id"].as_str(), Some(generated.as_str()));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_request_id_header_is_not_sent_to_the_decision_backend() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("not-sent");
+    let _ = std::fs::remove_file(&path);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/articles", "backend-1").await?;
 
     assert_eq!(reply.status, StatusCode::OK);
-    let expected = long_id.get(..128).unwrap_or(&long_id);
-    let line = wait_for_line(&path, expected).await?;
-    assert_eq!(line["request_id"].as_str().map(str::len), Some(128));
     let event = decider.last_event().unwrap_or_default();
+    assert!(!event.is_null(), "the decision backend was not called");
     let names: Vec<&str> = event["event"]["untrusted"]["headers"]
         .as_array()
         .map(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect())
@@ -630,5 +956,238 @@ async fn the_access_log_keeps_writing_to_a_moved_file_until_sigusr1() -> TestRes
         !at_path.contains("moved-2"),
         "the access log reopened its file without a signal"
     );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_request_without_the_id_header_gets_a_generated_id_in_the_log_and_the_response()
+-> TestResult {
+    let decider = attacking_decider().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("generated-id");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let id = assert_plain_block(&reply);
+    assert!(
+        id.len() == 16
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "not 16 lowercase hex digits: {id}"
+    );
+    let line = wait_for_line(&path, &id).await?;
+    assert_eq!(line["request_id"].as_str(), Some(id.as_str()));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_request_id_header_is_echoed_on_a_blocked_response() -> TestResult {
+    let decider = attacking_decider().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("echoed-id");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/?q=x", "echo-1").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(assert_plain_block(&reply), "echo-1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_access_log_line_of_a_blocked_request_has_its_request_id() -> TestResult {
+    let decider = attacking_decider().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("logged-id");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/?q=x", "logged-1").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_line(&path, "logged-1").await?;
+    assert_eq!(line["request_id"].as_str(), Some("logged-1"));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_request_id_header_with_a_space_is_replaced_by_a_generated_id() -> TestResult {
+    let decider = attacking_decider().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("invalid-id");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/?q=x", "bad id 1").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let id = assert_plain_block(&reply);
+    assert_ne!(id, "bad id 1");
+    assert_eq!(id.len(), 16, "{id}");
+    let line = wait_for_line(&path, &id).await?;
+    assert_eq!(line["request_id"].as_str(), Some(id.as_str()));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_json_line_has_the_user_agent() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("user-agent");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/articles",
+        "example.com",
+        &[
+            ("x-request-id", "ua-1"),
+            ("user-agent", "Mozilla/5.0 (test browser)"),
+        ],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "ua-1").await?;
+    assert_eq!(
+        line["user_agent"].as_str(),
+        Some("Mozilla/5.0 (test browser)")
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_json_user_agent_is_empty_when_the_header_is_absent() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("user-agent-absent");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/articles", "ua-absent-1").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "ua-absent-1").await?;
+    assert_eq!(line["user_agent"].as_str(), Some(""));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_json_user_agent_is_escaped_so_the_line_stays_valid_json() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("user-agent-escaped");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/articles",
+        "example.com",
+        &[
+            ("x-request-id", "ua-escaped-1"),
+            ("user-agent", r#"Agent "quoted" \ back"#),
+        ],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_line(&path, "ua-escaped-1").await?;
+    assert_eq!(
+        line["user_agent"].as_str(),
+        Some(r#"Agent "quoted" \ back"#)
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_empty_request_id_header_gets_a_generated_id() -> TestResult {
+    let decider = attacking_decider().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("empty-id");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/?q=x", "").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let id = assert_plain_block(&reply);
+    assert_eq!(id.len(), 16, "{id}");
+    let line = wait_for_line(&path, &id).await?;
+    assert_eq!(line["request_id"].as_str(), Some(id.as_str()));
     proxy.stop().await
 }
