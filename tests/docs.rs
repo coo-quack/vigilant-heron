@@ -134,7 +134,7 @@ fn every_directive_the_parser_accepts_is_documented() -> TestResult {
 #[test]
 fn the_wordpress_section_names_every_rule_and_the_include_line() -> TestResult {
     let doc = read("docs/rules.md")?;
-    let text = section(&doc, "WordPress rules")
+    let text = section(&doc, 2, "WordPress rules")
         .ok_or("docs/rules.md has no \"## WordPress rules\" section")?;
     let shipped = read("examples/rules.d/wordpress.conf")?;
     let ids: Vec<&str> = shipped
