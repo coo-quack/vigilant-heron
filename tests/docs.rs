@@ -300,7 +300,7 @@ fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResul
 #[test]
 fn the_systemd_unit_in_the_install_guide_is_the_packaged_file() -> TestResult {
     let doc = read("docs/install.md")?;
-    let body = section(&doc, "Run as a service with systemd")
+    let body = section(&doc, 2, "Run as a service with systemd")
         .ok_or("docs/install.md has no \"## Run as a service with systemd\" section")?;
     let block = body
         .split("```ini\n")
