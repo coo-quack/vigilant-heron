@@ -4,8 +4,10 @@
 
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
-  instructions to a reader, a comment form and search queries) and three `block`
-  rows of prompt injection aimed at an AI. The router itself is unchanged.
+  instructions to a reader, comment form submissions and search queries) and three
+  `block` rows of prompt injection aimed at an AI. The router itself is unchanged.
+  `eval/rules.py` reports them as rows without model results until the providers
+  are measured again.
 
 - Added: the `$block_query` log variable. It holds the query string of a blocked
   request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted

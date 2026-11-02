@@ -142,6 +142,8 @@ row's `$rule_id` and `reason` from the access log and reports:
 - the combined pipeline, rule block OR model score at or above 0.87 (attack) or
   0.8 (ai_instruction), against the saved real-model results named by
   `--model-results` (Jev, then Clef). `credential_attack` rows are excluded.
+  Rows added after those results were saved, such as the Japanese rows, are
+  left out of this table and counted as rows without model results.
 
 ```bash
 cargo build --release --workspace
