@@ -15,6 +15,7 @@ use rustix::process::{Pid, Signal, kill_process};
 use vigilant_heron::SuggestOptions;
 
 use crate::pidfile;
+use crate::request_url::UrlRequest;
 
 /// What `-s` asks the running router to do, as nginx's `-s` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +80,14 @@ pub(crate) enum Command {
         /// The client address the access list sees.
         client: IpAddr,
     },
+    /// `test-request --url <url>`: screen the request that a URL describes, and print the report,
+    /// without calling the backend.
+    TestUrl {
+        /// The request built from the URL and its options.
+        request: UrlRequest,
+        /// The client address the access list sees.
+        client: IpAddr,
+    },
     /// `suggest-skip-rules <file>`: suggest skip rules from a `json` access log and print them.
     /// Nothing is applied, and the configuration is not read.
     SuggestSkipRules {
@@ -107,6 +116,8 @@ pub(crate) const USAGE: &str = "\
 Usage: vigilant-heron [-h] [-v] [-t] [-T] [-c <path>] [-s <signal>]
        vigilant-heron start|stop|restart [-c <path>]
        vigilant-heron test-request <file> [-c <path>] [--client <address>]
+       vigilant-heron test-request --url <url> [--host <name>] [--method <m>]
+                             [--header 'Name: value'] [-c <path>] [--client <address>]
        vigilant-heron suggest-skip-rules <file> [--site <name>] [--min-judged <n>] [--min-clients <n>]
                              [--min-days <n>] [--max-attack <x>] [--max-ai-instruction <x>]
 
@@ -125,6 +136,13 @@ Options:
                         use -s reload for configuration changes: it keeps connections
   test-request <file>   report what the router would do with a raw HTTP/1.1 request
                         in <file> (- reads stdin), without calling the decision backend
+  test-request --url <url>
+                        the same, with the request built from a URL: http:// or https://
+                        sets the Host header, and a path (starting with /) needs --host
+  --host <name>         test-request --url: the Host header for a path
+  --method <m>          test-request --url: the request method (default GET)
+  --header 'Name: value'
+                        test-request --url: a request header; repeat it for more
   --client <address>    client address for the access list with test-request
                         (default 127.0.0.1; real_ip settings are not applied)
   suggest-skip-rules <file>
@@ -150,6 +168,51 @@ const SUGGEST_FLAGS: [&str; 6] = [
     "--max-ai-instruction",
 ];
 
+/// The options of `test-request --url`, as written. `--header` may repeat.
+#[derive(Default)]
+struct RequestWords {
+    url: Option<String>,
+    host: Option<String>,
+    method: Option<String>,
+    headers: Vec<String>,
+}
+
+/// The options of `test-request --url`, with their names as the command line writes them.
+const REQUEST_FLAGS: [&str; 4] = ["--url", "--host", "--method", "--header"];
+
+impl RequestWords {
+    /// Stores the value of one option. Each option may be given once, except `--header`.
+    fn set(&mut self, flag: &str, value: &str) -> Result<(), String> {
+        let slot = match flag {
+            "--url" => &mut self.url,
+            "--host" => &mut self.host,
+            "--method" => &mut self.method,
+            _ => {
+                self.headers.push(value.to_owned());
+                return Ok(());
+            }
+        };
+        if slot.is_some() {
+            return Err(format!("{flag} is given more than once"));
+        }
+        *slot = Some(value.to_owned());
+        Ok(())
+    }
+
+    /// The first of the `test-request --url` options that is given, by its name.
+    fn first(&self) -> Option<&'static str> {
+        [
+            ("--url", self.url.is_some()),
+            ("--host", self.host.is_some()),
+            ("--method", self.method.is_some()),
+            ("--header", !self.headers.is_empty()),
+        ]
+        .into_iter()
+        .find(|(_, given)| *given)
+        .map(|(flag, _)| flag)
+    }
+}
+
 /// The words and options of a command line, read before the action is chosen.
 #[derive(Default)]
 #[expect(
@@ -167,6 +230,8 @@ struct Words<'a> {
     lifecycle: Option<&'a str>,
     config: Option<PathBuf>,
     client: Option<IpAddr>,
+    /// The `test-request --url` options.
+    request: RequestWords,
     /// Bare arguments: the request file of test-request or suggest-skip-rules. Any other use is an error.
     operands: Vec<&'a str>,
     /// The `suggest-skip-rules` options, as written, with the value of each.
@@ -211,6 +276,10 @@ fn read_words(args: &[String]) -> Result<Words<'_>, String> {
             }
             "-c" | "--config" => words.config = Some(path_value(arg, rest.next())?),
             "--client" => words.client = Some(address_value(arg, rest.next())?),
+            "--url" | "--host" | "--method" | "--header" => {
+                let value = rest.next().ok_or_else(|| format!("{arg} needs a value"))?;
+                words.request.set(arg, value)?;
+            }
             "-s" => {
                 if words.signal.is_some() {
                     return Err("-s is given more than once".to_owned());
@@ -230,14 +299,18 @@ fn read_words(args: &[String]) -> Result<Words<'_>, String> {
                 other.strip_prefix("--config="),
                 other.strip_prefix("--client="),
                 suggest_flag_value(other),
+                request_flag_value(other),
             ) {
-                (Some(value), _, _) => {
+                (Some(value), _, _, _) => {
                     words.config = Some(path_value("--config", Some(&value.to_owned()))?);
                 }
-                (_, Some(value), _) => {
+                (_, Some(value), _, _) => {
                     words.client = Some(address_value("--client", Some(&value.to_owned()))?);
                 }
-                (_, _, Some((flag, value))) => words.suggest_values.push((flag, value.to_owned())),
+                (_, _, Some((flag, value)), _) => {
+                    words.suggest_values.push((flag, value.to_owned()));
+                }
+                (_, _, _, Some((flag, value))) => words.request.set(flag, value)?,
                 _ if other.starts_with('-') => return Err(format!("unknown option \"{other}\"")),
                 _ => words.operands.push(other),
             },
@@ -259,6 +332,7 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
         lifecycle,
         config,
         client,
+        request,
         operands,
         suggest_values,
     } = words;
@@ -268,6 +342,9 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
         }
         if client.is_some() {
             return Err("--client can only be used with test-request".to_owned());
+        }
+        if let Some(flag) = request.first() {
+            return Err(format!("{flag} can only be used with test-request"));
         }
     }
     if !help
@@ -285,7 +362,14 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
     } else if version {
         Command::Version
     } else if request_check {
-        test_request_command(&operands, client, lifecycle, test, signal.is_some())?
+        test_request_command(
+            &operands,
+            client,
+            lifecycle,
+            test,
+            signal.is_some(),
+            &request,
+        )?
     } else if suggest {
         suggest_command(
             &operands,
@@ -320,14 +404,15 @@ fn choose_command(words: Words<'_>) -> Result<Options, String> {
     Ok(Options { config, command })
 }
 
-/// The command of `test-request <file>`. The file is the one bare operand, and the
-/// word may not be combined with the other actions.
+/// The command of `test-request <file>` or `test-request --url <url>`. The file is the one
+/// bare operand, and the word may not be combined with the other actions.
 fn test_request_command(
     operands: &[&str],
     client: Option<IpAddr>,
     lifecycle: Option<&str>,
     test: bool,
     signal: bool,
+    request: &RequestWords,
 ) -> Result<Command, String> {
     if let Some(word) = lifecycle {
         return Err(format!("test-request cannot be combined with {word}"));
@@ -338,15 +423,31 @@ fn test_request_command(
     if signal {
         return Err("test-request cannot be combined with -s".to_owned());
     }
+    let client = client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    if let Some(url) = &request.url {
+        if !operands.is_empty() {
+            return Err("give either --url or a request file, not both".to_owned());
+        }
+        let built = UrlRequest::new(
+            url,
+            request.host.as_deref(),
+            request.method.as_deref(),
+            &request.headers,
+        )?;
+        return Ok(Command::TestUrl {
+            request: built,
+            client,
+        });
+    }
+    if let Some(flag) = request.first() {
+        return Err(format!("{flag} can only be used with --url"));
+    }
     let file = match operands {
         [only] => PathBuf::from(only),
         [] => return Err("test-request needs a request file (or - for stdin)".to_owned()),
         _ => return Err("give only one request file".to_owned()),
     };
-    Ok(Command::TestRequest {
-        file,
-        client: client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-    })
+    Ok(Command::TestRequest { file, client })
 }
 
 /// The command of `suggest-skip-rules <file>`. The file is the one bare operand. The word
@@ -430,6 +531,13 @@ fn score_value(option: &str, value: &str) -> Result<f64, String> {
             "{option} must be a number from 0 to 1, not \"{value}\""
         )),
     }
+}
+
+/// Splits `--name=value` for a `test-request --url` option. The name is one of [`REQUEST_FLAGS`].
+fn request_flag_value(arg: &str) -> Option<(&'static str, &str)> {
+    let (name, value) = arg.split_once('=')?;
+    let flag = REQUEST_FLAGS.into_iter().find(|flag| *flag == name)?;
+    Some((flag, value))
 }
 
 /// Splits `--name=value` for a `suggest-skip-rules` option. The name is one of [`SUGGEST_FLAGS`].
@@ -561,6 +669,11 @@ mod tests {
     #[case::suggest_score_one(&["suggest-skip-rules", "log.json", "--max-attack", "1"], Options { config: None, command: Command::SuggestSkipRules { file: PathBuf::from("log.json"), options: SuggestOptions { max_attack: 1.0, ..SuggestOptions::default() } } })]
     #[case::suggest_help_wins(&["suggest-skip-rules", "-h"], Options { config: None, command: Command::Help })]
     #[case::help_wins_over_test_request(&["test-request", "-h"], Options { config: None, command: Command::Help })]
+    #[case::test_url_absolute(&["test-request", "--url", "http://example.com/a?b=1"], Options { config: None, command: url_request("example.com", "/a?b=1", "GET", &[], LOCALHOST) })]
+    #[case::test_url_with_config(&["-c", "/a.conf", "test-request", "--url", "https://example.com"], Options { config: Some(PathBuf::from("/a.conf")), command: url_request("example.com", "/", "GET", &[], LOCALHOST) })]
+    #[case::test_url_path_with_host(&["test-request", "--url", "/p?q=1", "--host", "example.com"], Options { config: None, command: url_request("example.com", "/p?q=1", "GET", &[], LOCALHOST) })]
+    #[case::test_url_method_and_headers(&["test-request", "--url=http://example.com/", "--method", "post", "--header", "X-A: 1", "--header=X-B: 2"], Options { config: None, command: url_request("example.com", "/", "POST", &["X-A: 1", "X-B: 2"], LOCALHOST) })]
+    #[case::test_url_with_client(&["test-request", "--url", "http://example.com/", "--client", "203.0.113.7"], Options { config: None, command: url_request("example.com", "/", "GET", &[], "203.0.113.7".parse().unwrap_or(LOCALHOST)) })]
     fn a_valid_command_line_parses(#[case] input: &[&str], #[case] expected: Options) {
         assert_eq!(parse_args(&args(input)), Ok(expected));
     }
@@ -619,7 +732,35 @@ mod tests {
         }
     }
 
+    /// The command of `test-request --url` for the request with this host, target, method and headers.
+    fn url_request(
+        host: &str,
+        target: &str,
+        method: &str,
+        headers: &[&str],
+        client: IpAddr,
+    ) -> Command {
+        Command::TestUrl {
+            request: UrlRequest {
+                method: method.to_owned(),
+                host: host.to_owned(),
+                target: target.to_owned(),
+                headers: headers.iter().map(|line| (*line).to_owned()).collect(),
+            },
+            client,
+        }
+    }
+
     const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    #[test]
+    fn test_url_defaults_the_client_to_the_loopback_address() {
+        assert_eq!(
+            parse_args(&args(&["test-request", "--url", "http://example.com/"]))
+                .map(|options| options.command),
+            Ok(url_request("example.com", "/", "GET", &[], LOCALHOST))
+        );
+    }
 
     #[test]
     fn test_request_defaults_the_client_to_the_loopback_address() {
@@ -662,6 +803,19 @@ mod tests {
     #[case::suggest_score_nan(&["suggest-skip-rules", "a.json", "--max-ai-instruction", "NaN"], "--max-ai-instruction must be a number from 0 to 1, not \"NaN\"")]
     #[case::suggest_option_without_word(&["--min-judged", "60"], "--min-judged can only be used with suggest-skip-rules")]
     #[case::site_with_test_request(&["test-request", "req.txt", "--site", "example.test"], "--site can only be used with suggest-skip-rules")]
+    #[case::url_with_a_file(&["test-request", "--url", "http://example.com/", "req.txt"], "give either --url or a request file, not both")]
+    #[case::url_without_value(&["test-request", "--url"], "--url needs a value")]
+    #[case::url_twice(&["test-request", "--url", "http://a.test/", "--url", "http://b.test/"], "--url is given more than once")]
+    #[case::host_twice(&["test-request", "--url", "/p", "--host", "a.test", "--host=b.test"], "--host is given more than once")]
+    #[case::url_with_test(&["test-request", "--url", "http://example.com/", "-t"], "test-request cannot be combined with -t or -T")]
+    #[case::url_fragment(&["test-request", "--url", "http://example.com/#top"], "--url must not contain a fragment (#): a fragment is never sent to the server")]
+    #[case::url_path_without_host(&["test-request", "--url", "/p"], "a URL that starts with / needs --host <name>")]
+    #[case::url_bad_method(&["test-request", "--url", "http://example.com/", "--method", "G@T"], "--method must be a method name, not \"G@T\"")]
+    #[case::host_with_a_file(&["test-request", "req.txt", "--host", "example.com"], "--host can only be used with --url")]
+    #[case::header_with_a_file(&["test-request", "req.txt", "--header", "X-A: 1"], "--header can only be used with --url")]
+    #[case::url_without_the_word(&["--url", "http://example.com/"], "--url can only be used with test-request")]
+    #[case::method_with_start(&["start", "--method", "GET"], "--method can only be used with test-request")]
+    #[case::url_with_suggest(&["suggest-skip-rules", "log.json", "--url", "http://example.com/"], "--url can only be used with test-request")]
     fn test_request_rejects_combinations_and_bad_operands(
         #[case] input: &[&str],
         #[case] message: &str,
@@ -718,7 +872,15 @@ mod tests {
         for option in ["-h", "-v", "-c", "-t", "-T", "-s"] {
             assert!(USAGE.contains(option), "usage does not mention {option}");
         }
-        for long in ["--help", "--version", "--config"] {
+        for long in [
+            "--help",
+            "--version",
+            "--config",
+            "--url",
+            "--host",
+            "--method",
+            "--header",
+        ] {
             assert!(USAGE.contains(long), "usage does not mention {long}");
         }
     }
