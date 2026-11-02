@@ -200,8 +200,8 @@ jobs:
   mutants-diff-shard:
     runs-on: ubuntu-latest
     # The whole tree has 2242 mutants (cargo mutants --list), so a release PR gives a
-    # shard of at most 71 of 32. At about 0.8 minute per mutant (the rate the issue's
-    # timings imply), that is about 57 minutes, so 120 leaves room.
+    # shard at most 71. #108's 78 mutants took 63 minutes with --jobs 2 (0.8 minute
+    # each); at that rate 71 take about 57 minutes, so 120 leaves room.
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -246,8 +246,10 @@ jobs:
       # A non-zero exit code is recorded, not raised here, so the upload step still runs.
       # A shard with no mutants exits 0 and writes empty result files, so it passes.
       - id: run
+        env:
+          SHARD: ${{ matrix.shard }}
         run: |
-          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --shard "${{ matrix.shard }}/$SHARD_TOTAL" \
+          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --shard "$SHARD/$SHARD_TOTAL" \
             --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked \
             --output "$RUNNER_TEMP/mutants" || echo "status=$?" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -255,7 +257,8 @@ jobs:
         with:
           name: mutants-diff-${{ matrix.shard }}
           path: ${{ runner.temp }}/mutants/mutants.out
-          if-no-files-found: warn
+          # Every shard writes mutants.out, even with no mutants, so a missing one is an error.
+          if-no-files-found: error
       - name: Fail when cargo-mutants found a problem
         if: steps.run.outputs.status != ''
         env:
@@ -290,8 +293,10 @@ jobs:
           for kind in missed timeout caught unviable; do
             find mutant-results -name "$kind.txt" -exec cat {} + > "$RUNNER_TEMP/report/$kind.txt" 2>/dev/null || true
           done
+          shards=$(find mutant-results -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
           {
             echo "## Mutation testing of this PR's changes"
+            echo "- shards with results: $shards"
             for kind in missed timeout caught unviable; do
               n=$(wc -l < "$RUNNER_TEMP/report/$kind.txt" | tr -d ' ')
               echo "- $kind: $n"

@@ -192,7 +192,8 @@ both platforms, checks the binaries, and pushes, tags and releases nothing.
 
 Branch protection on `develop` and `main` is managed in coo-quack/iac. It
 requires these CI jobs to pass before a PR can be merged: `audit`, `lint`, `fmt`,
-`test`, `e2e`, `deadcode`, `duplication`, `bench` and `release-build`. Rulesets
+`test`, `e2e`, `deadcode`, `duplication`, `bench` and `release-build`. On `main`
+it also requires `mutants-diff` (see Mutation testing). Rulesets
 add reviews: a change to a path listed in `.github/CODEOWNERS` needs its owner's
 approval on both branches, and a PR to `main` needs one approving review.
 
