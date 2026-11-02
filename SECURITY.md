@@ -31,7 +31,7 @@ and `business_name` are sent. Multipart
 (`multipart/form-data`) bodies are split into parts and redacted by part name, and
 the content of a file part (a part with a `filename`) is replaced unless
 `redact_file_parts off;` is set. A multipart body whose framing is broken is
-scanned as text instead, so the part-name rule does not apply to it. Everything else, which
+scanned as text instead, so the part-name rule does not apply to it. Text outside the parts, such as a preamble before the first delimiter, is scanned as text too. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the
 router at a backend you may disclose that data to, or run the decision model
 yourself.
