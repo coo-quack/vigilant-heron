@@ -215,11 +215,28 @@ sent:
   `author`, `shipping`, `passenger`, `class_name`, `business_name` and `postcard` are
   not. The value is replaced by `[REDACTED]`. A field named in `redact_field` is also
   replaced, when its name equals that name, case-insensitively.
-- Multipart bodies (`multipart/form-data`) are split into parts. A part is redacted
-  when its `Content-Disposition` `name` is sensitive. Its value is replaced, and its
-  boundary and part headers are sent as they were. A file part is redacted by its
-  field name only, and its content is not scanned. A multipart body without the
-  expected framing is scanned as text, as below.
+- Multipart bodies (`multipart/form-data`) are split into parts at their delimiter
+  lines, `--boundary` on a line of its own.
+  A part is redacted when its `Content-Disposition` `name` is sensitive or named in
+  `redact_field`. Its value is replaced, and its boundary and part headers are sent as
+  they were.
+  A `Content-Disposition` line that continues on the next line, one that starts with a
+  space or a tab, is read as one line.
+  A file part, one whose `Content-Disposition` has a `filename` or `filename*`
+  parameter, has its content replaced by `[REDACTED]` too, so the bytes of an upload,
+  such as image metadata, are not sent. Its part headers (the field name, the file
+  name and the content type) are kept. `redact_file_parts off;` sends file content
+  like any other part.
+  Text that is not inside a part, before the first delimiter or after the `--boundary--`
+  line, is scanned as text, as below.
+  Parts that follow a `--boundary--` line are still read as parts.
+  When the body is longer than `inspect_body`, the sent bytes can end inside a part.
+  The parts before the cut are redacted as above. The cut part is judged by its headers
+  when they are complete: its content is replaced when the part is redacted, and
+  scanned as text otherwise, since its end is not known.
+  When the cut falls inside the part headers, the text from the delimiter on is scanned
+  as text, which leaves ordinary header lines as they were.
+  A multipart body whose framing is broken is scanned as text, as below.
 - XML and SOAP elements whose local name is sensitive have their text replaced, so
   `<password>` and `<wsse:Password Type="...">` are redacted and `<username>` is
   kept. Attributes are not scanned.

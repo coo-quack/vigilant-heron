@@ -86,6 +86,8 @@ pub(crate) struct AppState {
     backend_redact: Vec<String>,
     /// Body field names redacted before the event is sent to the backend (`redact_field`).
     backend_redact_fields: Vec<String>,
+    /// Whether multipart file content is replaced before the event is sent (`redact_file_parts`).
+    backend_redact_file_parts: bool,
     /// The decision slots shared by all calls, and the `max_concurrency` they were built with.
     slots: Arc<Semaphore>,
     slots_limit: usize,
@@ -184,6 +186,7 @@ impl AppState {
             inspect_body_bytes: config.decision.inspect_body_bytes,
             backend_redact,
             backend_redact_fields: config.decision.redact_fields.clone(),
+            backend_redact_file_parts: config.decision.redact_file_parts,
             slots,
             slots_limit: config.decision.max_concurrency,
             client_slots,
@@ -1175,6 +1178,7 @@ async fn assess(
                 client_ip,
                 redact_headers: &state.backend_redact,
                 redact_fields: &state.backend_redact_fields,
+                redact_file_parts: state.backend_redact_file_parts,
                 inspect_body_bytes: state.inspect_body_bytes,
             });
             match state.backend.decide(&event).await {
