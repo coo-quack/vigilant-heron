@@ -18,6 +18,13 @@
   without it, and the check goes on. Starting the router, in the foreground or with
   `start` or `restart`, still fails when the variable is not set.
 
+- Added: the `$block_query` log variable. It holds the query string of a blocked
+  request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted
+  by the same rules as the event sent to the decision backend. It is empty for every other
+  request, and it is not in the built-in `json` and `main` formats, since a query can
+  carry personal data. Add it to your own `log_format` to use it. See
+  [Logging](/logging#block-query).
+
 - Added: `examples/rules.d/wordpress.conf`, an optional rule file with four skip
   rules for WordPress sites: `wp-public-pages`, `wp-login-page`, `wp-admin-assets`
   and `wp-robots`. Copy it to `rules.d/` and include it to spare the decision model
