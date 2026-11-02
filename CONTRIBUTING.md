@@ -80,14 +80,19 @@ it opens or updates the issue "Weekly mutation testing: findings". When a later
 run is clean, it closes that issue. The full output is in the `mutants-*`
 artifacts of the run. The settings are in `.cargo/mutants.toml`.
 
-Every PR to `develop` also runs the `mutants-diff` job, which mutates only the
-lines the PR changes (`cargo mutants --in-diff`). A PR from `develop` to `main`
-skips it, since the job already checked each change in its own PR. It fails when a
-test misses one of those mutants, and the job summary lists them. A PR that changes
-no Rust code passes at once. To run the same check before you push:
+Every PR also runs the `mutants-diff` check. It mutates only the lines the PR
+changes (`cargo mutants --in-diff`), split over parallel shards: 8 shards for a PR
+to `develop`, and 32 shards for a PR to `main`, which is a release PR and covers
+everything since the last release. The check fails when a test misses one of
+those mutants, and the job summary lists them. A PR that changes no Rust code
+passes at once.
+
+On a PR to `develop` the check is not required, so it does not block the merge.
+On a PR to `main` it is a required check, so a missed mutant blocks the merge. To
+run the same check before you push:
 
 ```bash
-git diff origin/develop...HEAD > pr.diff
+git diff origin/develop...HEAD > pr.diff   # origin/main...HEAD for a PR to main
 cargo mutants --in-diff pr.diff
 ```
 
@@ -187,7 +192,8 @@ both platforms, checks the binaries, and pushes, tags and releases nothing.
 
 Branch protection on `develop` and `main` is managed in coo-quack/iac. It
 requires these CI jobs to pass before a PR can be merged: `audit`, `lint`, `fmt`,
-`test`, `e2e`, `deadcode`, `duplication`, `bench` and `release-build`. Rulesets
+`test`, `e2e`, `deadcode`, `duplication`, `bench` and `release-build`. On `main`
+it also requires `mutants-diff` (see Mutation testing). Rulesets
 add reviews: a change to a path listed in `.github/CODEOWNERS` needs its owner's
 approval on both branches, and a PR to `main` needs one approving review.
 
