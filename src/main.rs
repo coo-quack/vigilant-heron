@@ -4,6 +4,7 @@ mod cli;
 mod lifecycle;
 mod pidfile;
 
+use std::fmt::Display;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::IpAddr;
@@ -14,7 +15,9 @@ use anyhow::{Context, anyhow};
 use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
 use pidfile::PidFile;
 use tokio::signal::unix::{SignalKind, signal};
-use vigilant_heron::{Config, ErrorLogHandle, SuggestOptions, install_error_log, serve_reloadable};
+use vigilant_heron::{
+    Config, ErrorLogHandle, ShadowOptions, SuggestOptions, install_error_log, serve_reloadable,
+};
 
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
 
@@ -64,6 +67,7 @@ fn run_cli(options: Options) -> anyhow::Result<ExitCode> {
             Ok(test_request(&resolve_config(config), &file, client))
         }
         Command::SuggestSkipRules { file, options } => Ok(suggest_skip_rules(&file, &options)),
+        Command::ShadowReport { files, options } => Ok(shadow_report(&files, &options)),
         Command::Start => lifecycle::start(&resolve_config(config)),
         Command::Stop => lifecycle::stop(&resolve_config(config)),
         Command::Restart => lifecycle::restart(&resolve_config(config)),
@@ -180,6 +184,42 @@ fn suggest_skip_rules(file: &Path, options: &SuggestOptions) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    print_report(&report)
+}
+
+/// Runs `shadow-report`: reads each access log in `files`, in the order given, prints the
+/// report to stdout, and never reads the configuration. Errors go to stderr, exit 1.
+fn shadow_report(files: &[PathBuf], options: &ShadowOptions) -> ExitCode {
+    let mut stderr = std::io::stderr();
+    let mut inputs = Vec::with_capacity(files.len());
+    for file in files {
+        match std::fs::File::open(file) {
+            Ok(opened) => inputs.push(std::io::BufReader::new(opened)),
+            Err(error) => {
+                let _ = writeln!(
+                    stderr,
+                    "vigilant-heron: cannot read the access log {}: {error}",
+                    file.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let report = match vigilant_heron::shadow_report(inputs, options) {
+        Ok(report) => report,
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "vigilant-heron: cannot read the access logs: {error}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    print_report(&report)
+}
+
+/// Writes a report to stdout. A write that fails gives exit 1.
+fn print_report(report: &impl Display) -> ExitCode {
     let mut stdout = std::io::stdout();
     if stdout
         .write_all(report.to_string().as_bytes())

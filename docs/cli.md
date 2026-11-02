@@ -21,6 +21,8 @@ follow nginx's, so `-t`, `-T` and `-s` do what they do in nginx.
 | `--client <address>` | The client address that `test-request` uses for the access list. The default is `127.0.0.1`. |
 | `suggest-skip-rules <file>` | Suggest skip rules from a `json` access log, for review. Nothing is applied. See [Learn skip rules from the access log](#learn-skip-rules-from-the-access-log). |
 | `--site`, `--min-judged`, `--min-clients`, `--min-days`, `--max-attack`, `--max-ai-instruction` | Filter and thresholds of `suggest-skip-rules`. |
+| `shadow-report <file>...` | Summarize json access logs from a shadow trial, to read before you switch to enforce. Nothing is applied. See [Summarize a shadow log](#summarize-a-shadow-log). |
+| `--max-lines`, `--usd-per-mtok`, `--full-addresses` | Options of `shadow-report`. |
 
 An unknown option, a missing value, or an invalid `-s` word prints the reason and
 the usage to stderr, and exits 1. `-h` and `-v` win over the other options. `-s`
@@ -298,6 +300,59 @@ into rules, because a rule for them would let any value through.
 
 Use `--site <name>` to keep the groups of one site. The thresholds take a count of
 at least 1, or a score from 0 to 1.
+
+## Summarize a shadow log
+
+Before you switch from shadow mode to enforce, read the shadow log. `shadow-report`
+prints a summary of it as plain text, for a person to read or to paste into an
+issue.
+
+```console
+$ vigilant-heron shadow-report /var/log/vigilant-heron/access.json.1 /var/log/vigilant-heron/access.json
+```
+
+Give the rotated log and the current log together. Several files are read in the
+order given. The files must be plain files: a compressed file is not decompressed,
+and each of its lines counts as malformed.
+
+`shadow-report` never calls a backend and never reads the configuration file, so
+`-c` is refused and no configuration is needed.
+
+A line that is not a JSON object is counted as malformed and skipped. The report
+says how many lines were read, how many were JSON objects, and how many were skipped.
+
+A file that cannot be read stops the command with exit code 1. The message names
+the file.
+
+The report has six parts, in this order.
+
+- **Overview**: the files and lines read, the time range, and the counts of lines
+  by `reason` and of decision errors by cause.
+- **Per day**: one line for each UTC day, with the lines, the backend calls, the
+  skips, the blocked or redirected lines, the decision errors and the timeouts.
+- **Blocked or redirected lines**: one line each, with the time, the client, the
+  method, the path, the query shape, the rule or the category, and the attack
+  score. At most 50 are listed. The count of the rest is given.
+- **client_busy bursts**: a minute in which one client has 5 or more `client_busy`
+  lines, with its three most used paths.
+- **Backend per hour**: each UTC hour with backend calls, with the calls, the
+  timeouts, and the p50 and p99 of `latency_ms`.
+- **Input tokens**: the total, and an estimated cost when a price is given.
+
+A backend call is a line with an `attack` score or with a `decision_error`. A
+timeout is a line whose `decision_error` is `timeout`. A line is blocked or
+redirected when `action` or `would_have` is `block` or `redirect`. A skip is a line
+whose `reason` is `skip` or `skip_rule`.
+
+The latency percentiles use only the calls that got an `attack` score. A timeout
+has no score, so its `latency_ms` is not counted.
+
+- `--max-lines <n>` sets how many blocked or redirected lines are listed. The default is 50.
+- `--usd-per-mtok <price>` sets the price in USD per million input tokens. The cost is
+  estimated from the input tokens alone, because the log has no output tokens.
+- Client addresses are shortened by default. An IPv4 address keeps its first three
+  octets, as in `192.0.2.x`. An IPv6 address keeps its first three groups, as in
+  `2001:db8:1::`. `--full-addresses` prints each address in full.
 
 ## Signal the running router with -s
 

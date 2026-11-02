@@ -107,7 +107,8 @@ the tests did not catch.
 `check_request_with` for four kinds of request (a plain page, a page a skip rule
 forwards, a long request that goes through every built-in rule, and a request a
 built-in rule blocks) against a configuration loaded once, `suggest_skip_rules`
-over 10,000 access log lines, and loading the sample configuration.
+over 10,000 access log lines, `shadow_report` over the same lines, and loading the
+sample configuration.
 
 Timings on a laptop or a shared runner are noisy, so compare runs on the same
 machine. Save a baseline before a change, then compare after it:

@@ -7,6 +7,15 @@
   instructions to a reader, a comment form and search queries) and three `block`
   rows of prompt injection aimed at an AI. The router itself is unchanged.
 
+- Added: `vigilant-heron shadow-report <access-log>...` summarizes one or more `json`
+  access logs from a shadow trial as plain text, before a switch to enforce. The
+  report gives the counts by `reason` and by decision error cause, the counts per UTC
+  day, the would-block and block lines, the `client_busy` bursts, the backend latency
+  and timeouts per hour, and the input tokens, with a cost estimate when
+  `--usd-per-mtok <price>` is given. Client addresses are shortened unless
+  `--full-addresses` is given. It never calls a backend and never reads the
+  configuration. See [Summarize a shadow log](/cli#summarize-a-shadow-log).
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more
