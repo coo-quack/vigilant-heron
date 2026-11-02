@@ -143,16 +143,17 @@ log_format blocked escape=default "$time_iso8601 $client_ip $site \"$method $pat
 access_log /var/log/vigilant-heron/access.log blocked;
 ```
 
-The value is the query as the decision backend received it. Parameters with
-sensitive names, such as `password` and `token`, are redacted the same way, and so
-are the names listed in `redact_field`. The value is escaped like every other
-variable, so it cannot split a line. The router does not cut it. The request line
-is already limited by `large_client_header_buffers`, so the value cannot grow past
-that limit.
+The value is redacted by the same rules as the event sent to the decision backend.
+Parameters with sensitive names, such as `password` and `token`, are redacted, and
+so are the names listed in `redact_field`. Redaction works by parameter name only.
+A secret under an ordinary name, such as `code` or `key`, and a bare value with no
+`=` are logged as received. The value is escaped like every other variable, so it
+cannot split a line. The router does not cut it. The request line is already
+limited by `large_client_header_buffers`, so the value cannot grow past that limit.
 
 The variable is not in the built-in `json` and `main` formats. A query can carry
-personal data, so the router writes it only when you add `$block_query` to a
-`log_format` of your own.
+personal data, and the name rule above lets some of it through, so the router
+writes it only when you add `$block_query` to a `log_format` of your own.
 
 ## Error log
 

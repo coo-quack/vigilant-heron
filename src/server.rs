@@ -869,9 +869,11 @@ async fn pipeline(
         Some(reason) => ("reject", reason),
         None => (decision.action.name(), decision.reason.name()),
     };
-    let would_have = decision.would_have.as_ref().map(Action::name);
-    // `$block_query` is set for a block, and for a shadow decision that would have blocked.
-    let blocked = action == "block" || would_have == Some("block");
+    // `$block_query` is logged when the decision blocked the request (a request that a limit or
+    // the body refused is logged as `reject`, so it is not counted), or when shadow mode
+    // recorded a block that it did not enforce.
+    let log_block_query = (outcome.rejected.is_none() && decision.action == Action::Block)
+        || decision.would_have == Some(Action::Block);
     let record = AccessRecord {
         time: SystemTime::now(),
         request_id: trace.request_id,
@@ -882,14 +884,14 @@ async fn pipeline(
         method: parts.method.as_str(),
         path: raw_path,
         query: parts.uri.query(),
-        block_query: blocked
+        block_query: log_block_query
             .then(|| sanitize::block_query(parts.uri.query(), &state.backend_redact_fields))
             .flatten(),
         status: response.status().as_u16(),
         action,
         reason,
         rule_id: rule_id.as_deref().unwrap_or(""),
-        would_have,
+        would_have: decision.would_have.as_ref().map(Action::name),
         attack: fields.attack,
         ai_instruction: fields.ai_instruction,
         category: fields.category,

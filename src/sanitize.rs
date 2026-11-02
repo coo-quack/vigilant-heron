@@ -1014,6 +1014,14 @@ mod tests {
     }
 
     #[test]
+    fn block_query_keeps_ordinary_names_and_bare_values_as_received() {
+        // Redaction works by parameter name, so a secret under an ordinary name or with no
+        // `=` is logged as it was sent.
+        let query = "code=123456&key=abc&s3cr3tbare";
+        assert_eq!(block_query(Some(query), &[]).as_deref(), Some(query));
+    }
+
+    #[test]
     fn extra_redact_headers_are_dropped_case_insensitively()
     -> Result<(), http::header::InvalidHeaderValue> {
         let mut headers = HeaderMap::new();

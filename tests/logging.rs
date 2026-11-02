@@ -186,6 +186,18 @@ fn block_query_config(
     mode: &str,
     site_extra: &str,
 ) -> Result<Config, BoxError> {
+    block_query_config_with_decision(decide_url, upstream, path, mode, "", site_extra)
+}
+
+/// Like [`block_query_config`], with `decision_extra` lines added to the `decision` block.
+fn block_query_config_with_decision(
+    decide_url: &str,
+    upstream: &str,
+    path: &Path,
+    mode: &str,
+    decision_extra: &str,
+    site_extra: &str,
+) -> Result<Config, BoxError> {
     let text = format!(
         r#"
 listen 127.0.0.1:0;
@@ -198,6 +210,7 @@ decision {{
     url "{decide_url}";
     timeout 300ms;
     inspect_body 512;
+    {decision_extra}
 }}
 
 site example.com {{
@@ -341,6 +354,38 @@ async fn block_query_redacts_sensitive_parameters_in_the_log() -> TestResult {
     assert!(
         !text.contains("hunter2") && !text.contains("=abc"),
         "a sensitive value leaked into the log: {text}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_applies_the_redact_field_names_of_the_decision_block() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-redact-field");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config_with_decision(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        "redact_field ticket_ref;",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(
+        &proxy.base(),
+        "/search?ticket_ref=T-1&q=forbidden",
+        "bq-ticket",
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-ticket|").await?;
+    assert_eq!(
+        line,
+        "bq-ticket|block|rule|-|ticket_ref=[REDACTED]&q=forbidden"
     );
     proxy.stop().await
 }
