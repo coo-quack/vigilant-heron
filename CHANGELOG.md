@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added: the guide [From shadow mode to enforce](docs/rollout.md), which walks through a
+  rollout in seven phases: the checks before a first install, a shadow trial beside the
+  site, reading the shadow log, skip rules, putting the router in the request path,
+  switching to enforce, and running it safely. It is linked from the sidebar, the README
+  and Getting started. The router itself is unchanged.
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
   instructions to a reader, comment form submissions and search queries) and three
