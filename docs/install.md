@@ -431,7 +431,7 @@ The script copies the sample configuration and the token template only when thos
 The script does not start the service. It prints the next steps. Two of them are easy to miss:
 
 - Add `pid /run/vigilant-heron/vigilant-heron.pid;` to the configuration. The unit creates `/run/vigilant-heron`, and the router writes its pid file there.
-- Add `access_log /var/log/vigilant-heron/access.log main;` to the configuration. The logrotate file rotates the files in `/var/log/vigilant-heron`, so point the access log at that directory.
+- Add `access_log /var/log/vigilant-heron/access.json json;` to the configuration. The guide's tools, `shadow-report` and `suggest-skip-rules`, read the json format, and only that format has `user_agent` and `request_id`.
 
 The unit that the script installs is shown here, and the repository has the same file at `packaging/systemd/vigilant-heron.service`:
 

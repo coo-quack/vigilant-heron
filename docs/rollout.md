@@ -107,7 +107,7 @@ Look at these things:
 
 Tell your own traffic from attacks by what the requests do, not by IP address. Your browsers send recognizable User-Agent values, and an admin workflow has a recognizable order: a login, an edit, then an upload. IP addresses change, and a cloud provider's address shows no partner, since anyone can rent one. The built-in `json` format has a `user_agent` key, so the JSON log shows the User-Agent beside each request. Keep that log, because `suggest-skip-rules` reads the JSON format.
 
-By default the log keeps only `query_shape`, such as `id=<num>&s=<text>`, never the values. The `$path` field is different: the router logs the path as the client sent it, so a token in a path, such as a password-reset link, appears in the log. Keep the logs private. The log directory should be `750` and owned by the router's user and the `adm` group, and the files `640`, as the `packaging/` install script and logrotate file set them:
+By default the log keeps only `query_shape`, such as `id=<num>&s=<text>`, never the values. The `$path` field is different: the router logs the path as the client sent it, so a token in a path, such as a password-reset link, appears in the log. Keep the logs private. The `packaging/` install script sets the log directory to `750`, owned by the router's user and the `adm` group. The files get `640` from the unit's `UMask=0027` and from logrotate's `create 640`:
 
 ```console
 $ sudo install -d -m 750 -o vigilant-heron -g adm /var/log/vigilant-heron
@@ -148,7 +148,7 @@ The `site` line limits the rule to `example.com`. A rule without a `site` line a
 
 For a WordPress site, start from [`examples/rules.d/wordpress.conf`](https://github.com/coo-quack/vigilant-heron/blob/develop/examples/rules.d/wordpress.conf), whose [four rules](/rules#wordpress-rules) apply to every site until you add a `site` line to each. Copy the file, narrow each rule to the request shapes your site sends, and test each one as below.
 
-Put the rule in a file under `rules.d/`, include that file, and check the configuration with `vigilant-heron -t`. It reports the file and line of any error. `-t` and [`test-request`](/cli#check-a-request-with-test-request), which reports what the router would do with a saved request, print a warning when `TYPESAFE_API_KEY` is not set, and do not fail. The router itself does not start without the variable, so set it before you start the router. See [Rules](/rules#write-your-own-rule).
+Put the rule in a file under `rules.d/`, include that file, and check the configuration with `vigilant-heron -t`. It reports the file and line of any error. See [Rules](/rules#write-your-own-rule).
 
 Keep these facts in mind. A skip rule never overrides a block rule, because the built-in block rules run first. A skipped request is not seen by the model at all, headers and cookies included.
 
@@ -341,7 +341,7 @@ The way back is rehearsed before enforce, while the router is still in shadow mo
 ## 7. Principles for running it safely
 
 - **Layers.** Put a CDN or an edge web application firewall (WAF, a filter of attack patterns) first, then the web server's deny rules, the router's rules and the model. The model only adds blocks, and no model answer can turn a rule block into an allow.
-- **What the backend receives.** The router removes credential headers, redacts sensitive fields, and sends only the first `inspect_body` bytes of a body. A file upload's content is replaced by `[REDACTED]` by default (`redact_file_parts`), so the metadata in a photo, such as its location, is not sent; the part's headers, including the file name and content type, still are. A personal field that is not sensitive by name, such as a location typed into a form, must be listed in `redact_field` in the `decision` block, for example `redact_field gps_position;`.
+- **What the backend receives.** The router removes credential headers, redacts sensitive fields, and sends only the first `inspect_body` bytes of a body. In a multipart body longer than that, the parts before the cut, and the part the cut falls in, are still redacted by name, so a `password` value is not sent. A file upload's content is replaced by `[REDACTED]` by default (`redact_file_parts`), so the metadata in a photo, such as its location, is not sent; the part's headers, including the file name and content type, still are. A personal field that is not sensitive by name, such as a location typed into a form, must be listed in `redact_field` in the `decision` block, for example `redact_field gps_position;`.
 - **Defaults that favor availability.** A failed decision forwards the request, and a client over its share is refused, as phase 1 explains. For the few paths where a missed attack costs more than a refused visitor, such as a login page, set `fail_closed_path`. A request on those paths is blocked whenever the decision fails:
 
   ```nginx

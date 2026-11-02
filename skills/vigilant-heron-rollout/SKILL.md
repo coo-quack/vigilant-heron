@@ -35,7 +35,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - **Goal:** the site, its clients, the proxies, the backend's latency, `timeout`, the cost and the evaluation are known.
 - **Guide:** [1. Before you start](../../docs/rollout.md#1-before-you-start), and [`real_ip_from`](../../docs/install.md#putting-it-behind-nginx-or-cloudflare).
 - **Run:** once a first draft of the file exists, `vigilant-heron -t -c <file>`.
-- **Look for:** `test is successful`. With `TYPESAFE_API_KEY` unset, `-t` still exits 0, but the router refuses to start. Measure latency on the router's server.
+- **Look for:** `test is successful`. With `TYPESAFE_API_KEY` unset, `-t` still exits 0, but the router refuses to start.
 - **Gate:** every item in the guide's step 1 checklist is true.
 
 ### Phase 2: Shadow beside the site
@@ -49,9 +49,9 @@ Move on only when the gate is met and the operator has agreed to any change in t
 ### Phase 3: Reading the shadow log
 
 - **Goal:** find what the router would block, and whether the backend keeps up.
-- **Guide:** [3. Reading the shadow log](../../docs/rollout.md#3-reading-the-shadow-log), [Summarize a shadow log](../../docs/cli.md#summarize-a-shadow-log), and [the built-in formats](../../docs/logging.md#the-built-in-formats) for the fields.
+- **Guide:** [3. Reading the shadow log](../../docs/rollout.md#3-reading-the-shadow-log), [Summarize a shadow log](../../docs/cli.md#summarize-a-shadow-log), and [the built-in formats](../../docs/logging.md#the-built-in-formats).
 - **Run:** `vigilant-heron shadow-report <access.json.1> <access.json>` (no `-c`). Its overview counts `reason` and `decision_error`; its per-hour part gives the p99 of `latency_ms`. List the blocks with `grep '"would_have":"block"' <access.json>`, count them, and read each line; the report lists only the first 50. If your `log_format` has `$block_query`, read it for each block, masking personal data you quote.
-- **Look for:** one reason that dominates; decision timeouts clustered in an hour with little load; `client_busy` bursts from one client; a p99 above `timeout`. Do not pass `--full-addresses`, and mask any client address you quote, such as `203.0.113.x`.
+- **Look for:** one reason that dominates; decision timeouts clustered in an hour with little load; `client_busy` bursts from one client; a p99 above `timeout`. `shadow-report` prints paths from the log, which can carry tokens, such as a password-reset link. Read a line before you paste it, and mask such values and client addresses such as `203.0.113.x`. Do not pass `--full-addresses`.
 - **Gate:** every `"would_have":"block"` line has been read, and the counts and p99 are recorded.
 
 ### Phase 4: Writing skip rules
@@ -65,7 +65,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
   4. Test the guide's example rule (`GET /products?id=<digits>`): `vigilant-heron -c <file> test-request --url 'https://example.com/products?id=42'`.
   5. Test these near misses: a quote (`id=42%27`), a script tag (`id=%3Cscript%3E`), an extra parameter (`id=42&x=1`), an encoded newline (`id=42%0A`), a `POST` (`--method POST`), and a longer path (`/products/extra`).
   6. Ask the operator to approve the reload. Then run `vigilant-heron -s reload -c <file>`, or `sudo systemctl reload vigilant-heron` under systemd.
-- **Look for:** the `rules:` line reads `matched (skip)` with the rule's description only on the request the rule must skip. A near miss that matches `(skip)` is too wide. In the JSON access log, `reason` is `skip_rule` for a skipped request.
+- **Look for:** the `rules:` line reads `matched (skip)` with the rule's description only on the request the rule must skip. A near miss that matches `(skip)` is too wide.
 - **Gate:** every rule has a method, exact path and narrow query regex; no skip rule matches a credential-carrying `POST`; every near miss was tested; the file passes `-t`; the operator approved the reload.
 
 ### Phase 5: Putting the router in the request path
@@ -78,7 +78,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 
 ### Phase 6: Switching to enforce
 
-- **Goal:** enforce only after the upload limit and the way back are tested.
+- **Goal:** switch to `mode enforce;` only after the upload limit and the way back are tested.
 - **Guide:** [6. Switching to enforce](../../docs/rollout.md#6-switching-to-enforce).
 - **Run:**
   1. Ask the operator for an explicit yes before changing the mode. Then run `vigilant-heron -t -c <file>`.
@@ -101,7 +101,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - `vigilant-heron -t -c <file>`: check the file without starting anything; exit 1 on error.
 - `vigilant-heron -T -c <file>`: print the file with each include expanded.
 - `vigilant-heron -c <file> test-request <request.http>`: report what the router would do with a saved request; `-` reads standard input.
-- `vigilant-heron -c <file> test-request --url <url>`: the same, for a URL. `--host <name>` is needed for a path such as `/items?id=2`. `--method <m>` defaults to GET. `--header 'Name: value'` may repeat.
+- `vigilant-heron -c <file> test-request --url <url>`: the same, for a URL. `--host <name>` is needed for a path such as `/items?id=2`. `--header 'Name: value'` may repeat.
 - `vigilant-heron suggest-skip-rules <access.json>`: candidates from the JSON access log. `--site <name>` narrows the report. It takes no `-c`.
 - `vigilant-heron shadow-report <access.json>...`: summary of json access logs from a shadow trial. It takes no `-c`.
 - `vigilant-heron -s reload -c <file>`: re-read the file; use the running router's `-c`. `-s` also takes `reopen`, `stop` and `quit`, each returning at once.

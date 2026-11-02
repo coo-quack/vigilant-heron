@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Changed: the install script's next steps and the install guide now suggest
+  `access_log /var/log/vigilant-heron/access.json json;` instead of a `main` access log at
+  `access.log`, because the guide's tools, `shadow-report` and `suggest-skip-rules`, read the
+  json format. The router itself is unchanged.
+
 - Changed: the guide [From shadow mode to enforce](docs/rollout.md) and the rollout skill now
   point to the features added since they were written: the packaged `install.sh` and systemd
   unit, the WordPress skip rules, `test-request --url` and checks without the API token,

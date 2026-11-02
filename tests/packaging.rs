@@ -247,7 +247,7 @@ fn install_does_not_run_systemctl_and_prints_the_next_steps() -> TestResult {
         "{out}"
     );
     assert!(
-        out.contains("access_log /var/log/vigilant-heron/access.log main;"),
+        out.contains("access_log /var/log/vigilant-heron/access.json json;"),
         "{out}"
     );
     assert!(
