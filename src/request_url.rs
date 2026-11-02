@@ -1,8 +1,14 @@
 //! Builds the request of `test-request --url`, from a URL and the options given with it.
 //!
 //! The request is written as a raw HTTP/1.1 file would hold it, so the report is the same
-//! as for the same request in a file. The URL is split by hand: the binary does not
-//! depend on a URL parser.
+//! as for the same request in a file. The URL is split by hand, and the host is checked
+//! with `http::uri::Authority`, the parser the router's own requests go through.
+
+use http::Uri;
+use http::uri::Authority;
+
+/// The refusal of a path or query that a request target may not hold.
+const TARGET_MESSAGE: &str = "--url path or query has a character that a request target may not hold; percent-encode it, for example é as %C3%A9 or < as %3C";
 
 /// The request that `--url` describes, checked by the same code as a request file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,8 +57,11 @@ impl UrlRequest {
             (None, url.to_owned())
         } else {
             match url.split_once("://") {
-                Some((scheme @ ("http" | "https"), rest)) => {
-                    let (host, target) = authority_and_target(scheme, rest)?;
+                Some((scheme, rest))
+                    if scheme.eq_ignore_ascii_case("http")
+                        || scheme.eq_ignore_ascii_case("https") =>
+                {
+                    let (host, target) = authority_and_target(&scheme.to_ascii_lowercase(), rest)?;
                     (Some(host), target)
                 }
                 Some((scheme, _)) if scheme.chars().all(|c| c.is_ascii_alphanumeric()) => {
@@ -68,6 +77,7 @@ impl UrlRequest {
                 }
             }
         };
+        check_target(&target)?;
         let host = match (host_from_url, host) {
             (Some(host), None) => host,
             (Some(_), Some(_)) => {
@@ -113,16 +123,35 @@ impl UrlRequest {
 
 /// Splits the part of an absolute URL after `scheme://` into the Host header and the
 /// request target. The target is the path and query, and `/` when the path is empty.
+/// `scheme` is `http` or `https`, in lowercase.
 fn authority_and_target(scheme: &str, rest: &str) -> Result<(String, String), String> {
     let split = rest.find(['/', '?']).unwrap_or(rest.len());
-    let (authority, path) = rest.split_at_checked(split).unwrap_or((rest, ""));
-    if authority.contains('@') {
+    let (authority_text, path) = rest.split_at_checked(split).unwrap_or((rest, ""));
+    if authority_text.contains('@') {
         return Err("--url must not contain user information (the part before @)".to_owned());
     }
-    let (name, port) = split_port(authority)?;
+    if authority_text.is_empty() {
+        return Err("--url has no host name".to_owned());
+    }
+    let invalid_host = || format!("invalid host \"{authority_text}\" in --url");
+    // A backslash or a percent sign is refused here, so the message names the reason.
+    if authority_text.contains(['\\', '%']) {
+        return Err(invalid_host());
+    }
+    let authority = authority_text
+        .parse::<Authority>()
+        .map_err(|_| invalid_host())?;
+    let name = authority.host();
     if name.is_empty() {
         return Err("--url has no host name".to_owned());
     }
+    let port = match authority_text.strip_prefix(name).ok_or_else(invalid_host)? {
+        "" => None,
+        after_host => match after_host.strip_prefix(':') {
+            Some(text) => Some(parse_port(text)?),
+            None => return Err(invalid_host()),
+        },
+    };
     let default_port = if scheme == "https" { 443 } else { 80 };
     let host = match port {
         Some(number) if number != default_port => format!("{name}:{number}"),
@@ -138,36 +167,22 @@ fn authority_and_target(scheme: &str, rest: &str) -> Result<(String, String), St
     Ok((host, target))
 }
 
-/// Splits `name:port` into the name and the port number. An IPv6 literal keeps its brackets.
-fn split_port(authority: &str) -> Result<(&str, Option<u16>), String> {
-    let invalid = || format!("invalid host \"{authority}\" in --url");
-    let (name, port_text) = if authority.starts_with('[') {
-        // An IPv6 literal ends at its closing bracket, which stays part of the name.
-        let end = authority
-            .find(']')
-            .map(|index| index + 1)
-            .ok_or_else(invalid)?;
-        let (name, rest) = authority.split_at_checked(end).ok_or_else(invalid)?;
-        match rest.strip_prefix(':') {
-            Some(port) => (name, Some(port)),
-            None if rest.is_empty() => (name, None),
-            None => return Err(invalid()),
-        }
-    } else {
-        match authority.split_once(':') {
-            None => (authority, None),
-            Some((name, port)) if !port.contains(':') => (name, Some(port)),
-            Some(_) => return Err(invalid()),
-        }
-    };
-    let port = match port_text {
-        Some(text) => Some(
-            text.parse::<u16>()
-                .map_err(|_| format!("invalid port \"{text}\" in --url"))?,
-        ),
-        None => None,
-    };
-    Ok((name, port))
+/// Reads the digits of a port. Only ASCII digits are accepted, so a sign or a space is refused.
+fn parse_port(text: &str) -> Result<u16, String> {
+    let digits = !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit());
+    match text.parse::<u16>() {
+        Ok(port) if digits => Ok(port),
+        _ => Err(format!("invalid port \"{text}\" in --url")),
+    }
+}
+
+/// Refuses a request target that the request parser would reject, or that is not ASCII.
+/// The message says how to write the character instead.
+fn check_target(target: &str) -> Result<(), String> {
+    if target.is_ascii() && target.parse::<Uri>().is_ok() {
+        return Ok(());
+    }
+    Err(TARGET_MESSAGE.to_owned())
 }
 
 /// Reads the `--host` name, which must not be empty and must not hold spaces.
@@ -220,6 +235,17 @@ mod tests {
     #[case::http_port_on_https_is_kept("https://example.com:80/", "example.com:80", "/")]
     #[case::ipv6_literal_keeps_brackets("http://[::1]:8080/", "[::1]:8080", "/")]
     #[case::ipv6_literal_without_port("http://[::1]/", "[::1]", "/")]
+    #[case::uppercase_scheme_keeps_the_host_as_written(
+        "HTTP://Example.com:80/x",
+        "Example.com",
+        "/x"
+    )]
+    #[case::mixed_case_https_drops_its_default_port("Https://example.com:443/", "example.com", "/")]
+    #[case::leading_zeros_in_the_port_are_digits(
+        "http://example.com:08080/",
+        "example.com:8080",
+        "/"
+    )]
     fn an_absolute_url_gives_the_host_and_target(
         #[case] url: &str,
         #[case] host: &str,
@@ -293,6 +319,22 @@ mod tests {
         "a URL that starts with / needs --host <name>"
     )]
     #[case::text_after_ipv6("http://[::1]x/", None, "invalid host \"[::1]x\" in --url")]
+    #[case::backslash_in_host(
+        "http://exa\\mple.com/",
+        None,
+        "invalid host \"exa\\mple.com\" in --url"
+    )]
+    #[case::percent_in_host(
+        "http://example.com%2e/",
+        None,
+        "invalid host \"example.com%2e\" in --url"
+    )]
+    #[case::plus_in_port("http://example.com:+80/", None, "invalid port \"+80\" in --url")]
+    #[case::empty_port("http://example.com:/", None, "invalid port \"\" in --url")]
+    #[case::non_ascii_path("http://example.com/café", None, TARGET_MESSAGE)]
+    #[case::non_ascii_relative_path("/café", Some("example.com"), TARGET_MESSAGE)]
+    #[case::angle_bracket_in_query("http://example.com/?q=<x>", None, TARGET_MESSAGE)]
+    #[case::backtick_in_path("http://example.com/a`b", None, TARGET_MESSAGE)]
     #[case::host_with_space(
         "/p",
         Some("exa mple.com"),

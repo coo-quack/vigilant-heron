@@ -513,6 +513,9 @@ pub enum FailureAction {
 }
 
 /// A configuration read for a check that calls no backend: `-t`, `-T` and `test-request`.
+///
+/// It is for checks only. Do not serve from it: a token that is not set holds a
+/// placeholder, and the router would start without a real token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckedConfig {
     /// The configuration. A token that is not set holds a placeholder, which is never sent.
@@ -543,6 +546,9 @@ impl Config {
     /// error here: its name is returned in [`CheckedConfig::unset_token`], and the
     /// check passes on the rest of the file. A variable that is set but blank is still
     /// an error. [`Config::load`] is unchanged, so starting the router still needs it.
+    ///
+    /// This is for checks only. Never serve from the returned configuration: the token
+    /// may be a placeholder, and [`Config::load`] is the one to start the router with.
     ///
     /// # Errors
     ///

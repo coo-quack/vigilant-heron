@@ -777,6 +777,58 @@ fn sighup_applies_a_valid_file_and_keeps_the_old_one_for_a_broken_file()
 }
 
 #[test]
+fn sighup_with_an_unset_token_variable_keeps_the_old_configuration() -> Result<(), std::io::Error> {
+    let dir = test_dir("sighup-token")?;
+    let port = free_port()?;
+    // `default_status 418` tells the old and the new configuration apart by their answers.
+    let with_token = |name: &str| {
+        format!(
+            "listen 127.0.0.1:{port};\ndecision {{\n    backend jev;\n    url http://127.0.0.1:9/v1/systemone;\n    api_token_env {name};\n}}\ndefault_status 418;\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n"
+        )
+    };
+    let path = write_file(&dir, "reload-token.conf", &with_token("VH_RELOAD_TOKEN"))?;
+    let child = Command::new(BIN)
+        .arg("--config")
+        .arg(&path)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .env("VH_RELOAD_TOKEN", "tok-123")
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut child = Child(child);
+    assert!(
+        wait_for(port, "unknown.test", "/", 418).is_some(),
+        "the server did not answer 418"
+    );
+
+    // The file now names a variable that is not set: SIGHUP logs the error, and the old
+    // configuration keeps serving.
+    std::fs::write(&path, with_token("VH_RELOAD_ABSENT_TOKEN"))?;
+    let signal = Command::new("kill")
+        .arg("-HUP")
+        .arg(child.0.id().to_string())
+        .status()?;
+    assert!(signal.success());
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fetch(port, "unknown.test", "/").map(|(status, _)| status),
+        Some(418)
+    );
+
+    let _ = child.0.kill();
+    let _ = child.0.wait();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.0.stderr.take() {
+        pipe.read_to_string(&mut stderr)?;
+    }
+    assert!(stderr.contains("configuration reload failed"), "{stderr}");
+    assert!(
+        stderr.contains("environment variable VH_RELOAD_ABSENT_TOKEN (api_token_env) is not set"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
 fn signal_reopen_keeps_serving_and_writes_to_a_new_access_log_file() -> Result<(), std::io::Error> {
     let fixture = Fixture::new("signal-reopen")?;
     let upstream = spawn_upstream()?;
@@ -1809,7 +1861,14 @@ fn test_request_url_reports_the_same_as_the_request_in_a_file() -> Result<(), st
     )?;
     assert_eq!(from_url.status.code(), Some(0), "{}", text(&from_url));
     assert_eq!(file.status.code(), Some(0), "{}", text(&file));
+    assert_eq!(
+        from_url.status.code(),
+        file.status.code(),
+        "{}",
+        text(&from_url)
+    );
     assert_eq!(from_url.stdout, file.stdout, "{}", text(&from_url));
+    assert_eq!(from_url.stderr, file.stderr, "{}", text(&from_url));
     assert!(
         stdout_of(&from_url).contains("result: blocked"),
         "{}",

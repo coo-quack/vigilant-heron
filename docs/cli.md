@@ -136,6 +136,9 @@ variable that is not set does not fail the check. A warning names it on stderr,
 because the router will not start without it. Starting the router still needs the
 variable, as `start` and a foreground run do.
 
+So `-t` exits 0 when the token variable is missing. A deploy check that must catch a
+missing token should look for the warning on stderr, or start the router.
+
 ## Print the configuration with -T
 
 `-T` runs the same check. If the check passes, it prints the configuration to
