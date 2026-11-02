@@ -68,6 +68,26 @@
   each such request went to the backend, and a post editor page could exceed
   `max_concurrency_per_client`. The other conditions of the static skip still apply.
 
+- Added: every request has a request id. When `request_id_header` is not set, or
+  its value is missing, empty, longer than 64 characters, or contains a space or a
+  non-ASCII character, the router makes a 16-character id for the request. Each
+  response that the router writes itself after reading the request carries the id
+  in an `X-Request-ID` header: blocks, redirects, 429 answers and limit rejections,
+  and failures such as a 502 from an unreachable upstream. A forwarded upstream
+  response does not get the header. A `block_status 444` still sends nothing.
+- Added: the built-in `json` log format has a `user_agent` key, the `User-Agent`
+  request header, escaped like the other values. The `main` format is unchanged.
+- Changed: a block without a `block_page` answers a plain-text body,
+  `Request blocked. Request ID: <id>`, instead of an empty body (a 403 used to answer
+  `Forbidden`). The id is the one in the `X-Request-ID` header and in the access log.
+  A `block_page` is sent as before. Both kinds of block body also carry
+  `X-Content-Type-Options: nosniff`.
+- Changed: `$request_id` is never empty, so the `main` format's `request_id="..."` is
+  always filled, and a `proxy_set_header` that uses it sends the generated id to the
+  upstream. A request-id header that is longer than 64 characters, or contains a
+  space or a non-ASCII character, is no longer logged as sent: the router logs its
+  generated id instead. Before, a longer value was logged cut to 128 bytes.
+
 - Added: a "WordPress behind nginx" example in the installation guide. It puts the
   router in the request path of a PHP site, with a second nginx server that runs PHP
   behind the router and a `backup` server that keeps the site up while the router is
