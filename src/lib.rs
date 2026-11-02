@@ -39,9 +39,9 @@ mod tunnel;
 pub use accesslog::LogFormat;
 pub use block::{BlockResponse, BlockStatus};
 pub use config::{
-    AccessLogConfig, BackendConfig, Config, ConnectionConfig, DecisionConfig, ErrorLogConfig,
-    FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, ProcessSettings, SiteAction,
-    SiteConfig, SiteTimeouts, dump_configuration, process_settings,
+    AccessLogConfig, BackendConfig, CheckedConfig, Config, ConnectionConfig, DecisionConfig,
+    ErrorLogConfig, FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, ProcessSettings,
+    SiteAction, SiteConfig, SiteTimeouts, dump_configuration, process_settings,
 };
 pub use error::{ConfigError, ServeError};
 pub use logsink::{Destination, ErrorLogHandle, install_error_log};

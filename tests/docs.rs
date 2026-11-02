@@ -58,6 +58,35 @@ fn every_directive_the_parser_accepts_is_documented() -> TestResult {
 }
 
 #[test]
+fn the_wordpress_section_names_every_rule_and_the_include_line() -> TestResult {
+    let doc = read("docs/rules.md")?;
+    let text = section(&doc, "WordPress rules")
+        .ok_or("docs/rules.md has no \"## WordPress rules\" section")?;
+    let shipped = read("examples/rules.d/wordpress.conf")?;
+    let ids: Vec<&str> = shipped
+        .lines()
+        .filter_map(|line| line.strip_prefix("rule ")?.strip_suffix(" {"))
+        .collect();
+    assert!(
+        !ids.is_empty(),
+        "no rules found in examples/rules.d/wordpress.conf"
+    );
+    let missing: Vec<&&str> = ids
+        .iter()
+        .filter(|id| !text.contains(&format!("`{id}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "rules in examples/rules.d/wordpress.conf missing from the WordPress section: {missing:?}"
+    );
+    assert!(
+        text.contains("include rules.d/wordpress.conf;"),
+        "the WordPress section does not show the include line"
+    );
+    Ok(())
+}
+
+#[test]
 fn builtin_rule_table_lists_exactly_the_built_in_rules() -> TestResult {
     let conf_ids: BTreeSet<String> = read("src/rules/builtin.conf")?
         .lines()
@@ -191,5 +220,39 @@ fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResul
         .filter(|id| !table.contains_key(*id))
         .collect();
     assert!(missing.is_empty(), "no Default cell for {missing:?}");
+    Ok(())
+}
+
+#[test]
+fn the_systemd_unit_in_the_install_guide_is_the_packaged_file() -> TestResult {
+    let doc = read("docs/install.md")?;
+    let body = section(&doc, "Run as a service with systemd")
+        .ok_or("docs/install.md has no \"## Run as a service with systemd\" section")?;
+    let block = body
+        .split("```ini\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .ok_or("docs/install.md has no ini block in the systemd section")?;
+    assert_eq!(
+        block,
+        read("packaging/systemd/vigilant-heron.service")?,
+        "the unit in docs/install.md differs from packaging/systemd/vigilant-heron.service"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_block_query_example_in_the_logging_docs_loads() -> TestResult {
+    let doc = read("docs/logging.md")?;
+    let format = doc
+        .lines()
+        .find(|line| line.starts_with("log_format blocked "))
+        .ok_or("docs/logging.md has no log_format blocked example")?;
+    let text = format!(
+        "listen 127.0.0.1:0;\n{format}\naccess_log stdout blocked;\n\
+         decision {{ backend http; url \"http://127.0.0.1:9/decide\"; }}\n\
+         site example.com {{ upstream \"http://127.0.0.1:9\"; }}\n"
+    );
+    vigilant_heron::Config::parse_str(&text, "docs/logging.md")?;
     Ok(())
 }
