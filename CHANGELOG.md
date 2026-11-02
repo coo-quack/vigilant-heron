@@ -9,6 +9,34 @@
   `eval/rules.py` reports them as rows without model results until the providers
   are measured again.
 
+- Added: each release archive holds `packaging/install.sh`, a systemd unit and a
+  logrotate file under `packaging/`, and the sample configuration in
+  `examples/vigilant-heron.conf`. Run `sudo sh packaging/install.sh` from the
+  extracted archive to install the binary, the unit, the logrotate file and the
+  configuration and token files, instead of copying each one by hand. The script
+  never overwrites an existing configuration or token file, and it does not start
+  the service. The install guide's "Run as a service with systemd" section has the
+  details. The unit runs the router with systemd's hardening options. The token file
+  is readable by root only, because systemd reads it as root. The script stops, before
+  it writes anything, when one of its target paths is a symbolic link, when the group
+  `adm` is missing, or when the user `vigilant-heron` has another primary group.
+
+- Added: `test-request --url <url>` checks one request given as a URL, so no file is
+  needed. `http://` and `https://` URLs set the Host header from the host name, and a
+  path (starting with `/`) needs `--host <name>`. `--method <m>` (GET by default) and
+  `--header 'Name: value'` (repeatable) complete the request.
+- Changed: `-t`, `-T` and `test-request` no longer fail when the token variable named
+  by `api_token_env` is not set. They print a warning that the router will not start
+  without it, and the check goes on. Starting the router, in the foreground or with
+  `start` or `restart`, still fails when the variable is not set.
+
+- Added: the `$block_query` log variable. It holds the query string of a blocked
+  request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted
+  by the same rules as the event sent to the decision backend. It is empty for every other
+  request, and it is not in the built-in `json` and `main` formats, since a query can
+  carry personal data. Add it to your own `log_format` to use it. See
+  [Logging](/logging#block-query).
+
 - Added: `examples/rules.d/wordpress.conf`, an optional rule file with four skip
   rules for WordPress sites: `wp-public-pages`, `wp-login-page`, `wp-admin-assets`
   and `wp-robots`. Copy it to `rules.d/` and include it to spare the decision model

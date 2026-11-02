@@ -296,3 +296,37 @@ fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResul
     assert!(missing.is_empty(), "no Default cell for {missing:?}");
     Ok(())
 }
+
+#[test]
+fn the_systemd_unit_in_the_install_guide_is_the_packaged_file() -> TestResult {
+    let doc = read("docs/install.md")?;
+    let body = section(&doc, "Run as a service with systemd")
+        .ok_or("docs/install.md has no \"## Run as a service with systemd\" section")?;
+    let block = body
+        .split("```ini\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .ok_or("docs/install.md has no ini block in the systemd section")?;
+    assert_eq!(
+        block,
+        read("packaging/systemd/vigilant-heron.service")?,
+        "the unit in docs/install.md differs from packaging/systemd/vigilant-heron.service"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_block_query_example_in_the_logging_docs_loads() -> TestResult {
+    let doc = read("docs/logging.md")?;
+    let format = doc
+        .lines()
+        .find(|line| line.starts_with("log_format blocked "))
+        .ok_or("docs/logging.md has no log_format blocked example")?;
+    let text = format!(
+        "listen 127.0.0.1:0;\n{format}\naccess_log stdout blocked;\n\
+         decision {{ backend http; url \"http://127.0.0.1:9/decide\"; }}\n\
+         site example.com {{ upstream \"http://127.0.0.1:9\"; }}\n"
+    );
+    vigilant_heron::Config::parse_str(&text, "docs/logging.md")?;
+    Ok(())
+}
