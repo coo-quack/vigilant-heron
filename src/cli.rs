@@ -494,10 +494,7 @@ fn shadow_options(
     };
     let mut seen: Vec<&str> = Vec::new();
     for (flag, value) in values {
-        if seen.contains(flag) {
-            return Err(format!("{flag} is given more than once"));
-        }
-        seen.push(flag);
+        note_option(&mut seen, flag)?;
         match *flag {
             "--max-lines" => options.max_lines = count_value(flag, value)?,
             "--usd-per-mtok" => options.usd_per_mtok = Some(price_value(flag, value)?),
@@ -517,16 +514,22 @@ fn price_value(option: &str, value: &str) -> Result<f64, String> {
     }
 }
 
+/// Records one option of an action. An option that the action already has is refused.
+fn note_option<'a>(seen: &mut Vec<&'a str>, flag: &'a str) -> Result<(), String> {
+    if seen.contains(&flag) {
+        return Err(format!("{flag} is given more than once"));
+    }
+    seen.push(flag);
+    Ok(())
+}
+
 /// The site filter and thresholds from the `suggest-skip-rules` options. Each option may
 /// be given once. The defaults are the thresholds of the documentation.
 fn suggest_options(values: &[(&str, String)]) -> Result<SuggestOptions, String> {
     let mut options = SuggestOptions::default();
     let mut seen: Vec<&str> = Vec::new();
     for (flag, value) in values {
-        if seen.contains(flag) {
-            return Err(format!("{flag} is given more than once"));
-        }
-        seen.push(flag);
+        note_option(&mut seen, flag)?;
         match *flag {
             "--site" => {
                 if value.is_empty() {

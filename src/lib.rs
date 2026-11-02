@@ -50,7 +50,7 @@ pub use logsink::{Destination, ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
 pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_request_with};
 pub use server::{serve, serve_reloadable};
-pub use shadow_report::{ShadowOptions, ShadowReport, shadow_report};
+pub use shadow_report::{ShadowOptions, ShadowReport};
 pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
 pub use system_one::{ApiToken, ClefModel};
 

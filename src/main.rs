@@ -16,7 +16,8 @@ use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
 use pidfile::PidFile;
 use tokio::signal::unix::{SignalKind, signal};
 use vigilant_heron::{
-    Config, ErrorLogHandle, ShadowOptions, SuggestOptions, install_error_log, serve_reloadable,
+    Config, ErrorLogHandle, ShadowOptions, ShadowReport, SuggestOptions, install_error_log,
+    serve_reloadable,
 };
 
 const CONFIG_ENV: &str = "VIGILANT_HERON_CONFIG";
@@ -188,33 +189,23 @@ fn suggest_skip_rules(file: &Path, options: &SuggestOptions) -> ExitCode {
 }
 
 /// Runs `shadow-report`: reads each access log in `files`, in the order given, prints the
-/// report to stdout, and never reads the configuration. Errors go to stderr, exit 1.
+/// report to stdout, and never reads the configuration. A file that cannot be opened or
+/// read stops the command: the error names the file, goes to stderr, and exits 1.
 fn shadow_report(files: &[PathBuf], options: &ShadowOptions) -> ExitCode {
     let mut stderr = std::io::stderr();
-    let mut inputs = Vec::with_capacity(files.len());
+    let mut report = ShadowReport::new(options);
     for file in files {
-        match std::fs::File::open(file) {
-            Ok(opened) => inputs.push(std::io::BufReader::new(opened)),
-            Err(error) => {
-                let _ = writeln!(
-                    stderr,
-                    "vigilant-heron: cannot read the access log {}: {error}",
-                    file.display()
-                );
-                return ExitCode::FAILURE;
-            }
-        }
-    }
-    let report = match vigilant_heron::shadow_report(inputs, options) {
-        Ok(report) => report,
-        Err(error) => {
+        let result = std::fs::File::open(file)
+            .and_then(|opened| report.read_log(std::io::BufReader::new(opened)));
+        if let Err(error) = result {
             let _ = writeln!(
                 stderr,
-                "vigilant-heron: cannot read the access logs: {error}"
+                "vigilant-heron: cannot read the access log {}: {error}",
+                file.display()
             );
             return ExitCode::FAILURE;
         }
-    };
+    }
     print_report(&report)
 }
 

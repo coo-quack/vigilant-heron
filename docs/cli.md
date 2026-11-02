@@ -318,8 +318,9 @@ and each of its lines counts as malformed.
 `shadow-report` never calls a backend and never reads the configuration file, so
 `-c` is refused and no configuration is needed.
 
-A line that is not a JSON object is counted as malformed and skipped. The report
-says how many lines were read, how many were JSON objects, and how many were skipped.
+A line that is not a JSON object is counted as malformed and skipped. A line longer
+than 1 MiB is counted as malformed too, and its rest is skipped. The report says how
+many lines were read, how many were JSON objects, and how many were skipped.
 
 A file that cannot be read stops the command with exit code 1. The message names
 the file.
@@ -339,10 +340,16 @@ The report has six parts, in this order.
   timeouts, and the p50 and p99 of `latency_ms`.
 - **Input tokens**: the total, and an estimated cost when a price is given.
 
-A backend call is a line with an `attack` score or with a `decision_error`. A
-timeout is a line whose `decision_error` is `timeout`. A line is blocked or
-redirected when `action` or `would_have` is `block` or `redirect`. A skip is a line
-whose `reason` is `skip` or `skip_rule`.
+A backend call is a line with an `attack` score, or with a `decision_error` that
+comes from a call to the backend: `timeout`, `rate_limited`, `connection`,
+`http_status`, `body`, `parse`, `rejected`, `invalid_response` or `invalid_score`.
+A line with `client_busy`, `backend_busy` or `request` never reached the backend,
+so it is not a call. A timeout is a line whose `decision_error` is `timeout`. A
+line is blocked or redirected when `action` or `would_have` is `block` or
+`redirect`. A skip is a line whose `reason` is `skip` or `skip_rule`.
+
+Paths in the report come from the log. They can contain tokens that appeared in
+URLs, so read the report before you paste it into an issue.
 
 The latency percentiles use only the calls that got an `attack` score. A timeout
 has no score, so its `latency_ms` is not counted.

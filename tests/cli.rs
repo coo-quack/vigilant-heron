@@ -2317,3 +2317,53 @@ fn shadow_report_does_not_decompress_a_gzip_file() -> Result<(), std::io::Error>
     );
     Ok(())
 }
+
+#[test]
+fn shadow_report_exits_one_and_names_a_directory_it_cannot_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-directory")?;
+    let output = shadow_report_run(&[&dir], &[])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot read the access log"), "{stderr}");
+    assert!(stderr.contains(&dir.display().to_string()), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_prints_paths_as_the_log_has_them() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-path")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            "/reset/tok_8f3a91",
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" GET /reset/tok_8f3a91 "), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_counts_a_line_longer_than_one_mib_as_malformed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-long-line")?;
+    let mut bytes = vec![b'x'; 1024 * 1024 + 1];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[]).as_bytes());
+    bytes.push(b'\n');
+    let log = dir.join("access.json");
+    std::fs::write(&log, bytes)?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 2 (1 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}

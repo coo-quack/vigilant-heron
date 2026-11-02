@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
 use vigilant_heron::{
-    Config, Outcome, ShadowOptions, SuggestOptions, check_request_with, shadow_report,
+    Config, Outcome, ShadowOptions, ShadowReport, SuggestOptions, check_request_with,
     suggest_skip_rules,
 };
 
@@ -176,7 +176,11 @@ fn bench_shadow_report(c: &mut Criterion) {
     let log = synthetic_log();
     let options = ShadowOptions::default();
     c.bench_function("shadow_report/10k_lines", |b| {
-        b.iter(|| black_box(shadow_report([black_box(log.as_bytes())], &options)));
+        b.iter(|| {
+            let mut report = ShadowReport::new(&options);
+            let result = report.read_log(black_box(log.as_bytes()));
+            black_box((result, report))
+        });
     });
 }
 

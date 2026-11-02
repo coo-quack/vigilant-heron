@@ -15,7 +15,7 @@ use std::io::{self, BufRead};
 
 use serde_json::Value;
 
-use crate::log_lines::{for_each_line, is_block, number_field, object_line, text_field};
+use crate::log_lines::{Line, for_each_line, is_block, number_field, object_line, text_field};
 
 /// The filter and thresholds of one run. The defaults are the thresholds that the documentation states.
 #[derive(Debug, Clone, PartialEq)]
@@ -173,10 +173,10 @@ impl Group {
 
 /// Learns skip-rule candidates from the lines of a `json` access log.
 ///
-/// `input` holds the log, one request per line. It is read one line at a time, so a
-/// large log is never held in memory whole. A line that is not valid UTF-8 is read
-/// with the invalid bytes replaced. Lines that are not usable are counted and otherwise
-/// ignored.
+/// `input` holds the log, one request per line. Each line is read on its own, and a
+/// line over the length limit is counted as unusable without being kept. A line that is
+/// not valid UTF-8 is read with the invalid bytes replaced. Lines that are not usable are
+/// counted and otherwise ignored.
 ///
 /// # Errors
 ///
@@ -190,7 +190,11 @@ pub fn suggest_skip_rules<R: BufRead>(
     let mut groups: BTreeMap<GroupKey, Group> = BTreeMap::new();
     for_each_line(input, |line| {
         total_lines += 1;
-        let Some(value) = usable_line(line) else {
+        let Line::Text(text) = line else {
+            unusable_lines += 1;
+            return;
+        };
+        let Some(value) = usable_line(text) else {
             unusable_lines += 1;
             return;
         };

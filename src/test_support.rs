@@ -50,3 +50,12 @@ site example.com {{
             message: "no site in the test fixture".to_owned(),
         })
 }
+
+/// A reader whose every read fails, to check that a read error is returned or named.
+pub(crate) struct FailingReader;
+
+impl std::io::Read for FailingReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::other("the disk went away"))
+    }
+}
