@@ -196,20 +196,32 @@ The four rules:
   WordPress's numeric parameters (`p`, `page_id`, `paged`, `cat`, `m` and
   `attachment_id`), a feed (`feed=rss2` or `feed=atom`) or a sitemap. The values are
   digits, or letters, digits and hyphens for a sitemap name. A quote, another
-  parameter or a newline in the query sends the request to the model, and markup in
-  the query is blocked by a built-in rule. The trade: a front-page view of these
-  shapes gets no model verdict.
-- **`wp-login-page`**: skips `GET` and `HEAD` of `/wp-login.php` with any query. A
-  `POST`, which carries the password, still goes to the model. The trade: a `GET` of
-  the login page is not seen by the model, so a query that no built-in rule catches
-  is forwarded.
+  parameter, a `+` or a newline in the query sends the request to the model. A NUL
+  byte is removed before matching, so `p=1%00` matches as `p=1`. Some markup is
+  blocked by a built-in rule, such as `<script>`. Other markup matches no built-in
+  rule and does not match the skip, so it goes to the model. The trade: a front-page
+  view of these shapes gets no model verdict.
+- **`wp-login-page`**: skips `GET` and `HEAD` of `/wp-login.php` with any query. The
+  model does not see that query, because a skipped request makes no backend call. A
+  `POST`, which carries the password, still goes to the model. The trade: a query on
+  the login page that no built-in rule blocks is never seen by the model. To narrow
+  the rule, edit your copy of it and add a `query` line, such as `query ~ "^$";`.
+  Then only a request with no query is skipped, and any other query goes to the model.
 - **`wp-admin-assets`**: skips `GET` and `HEAD` of `/wp-admin/load-scripts.php` and
   `/wp-admin/load-styles.php` when the query holds only `c` (`0` or `1`), an optional
-  `dir` (`ltr` or `rtl`), `load[chunk_N]` lists of handle names and a `ver`. Another
-  parameter, a quote or a newline sends the request to the model. The trade: a loader
-  request made of handle names is not seen by the model.
+  `dir` (`ltr` or `rtl`), `load[chunk_0]` to `load[chunk_9]` lists of handle names,
+  and a `ver` of 1 to 40 characters. Another parameter, a quote or a newline sends the
+  request to the model. The trade: a loader request made of handle names is not seen
+  by the model.
 - **`wp-robots`**: skips `GET` and `HEAD` of `/robots.txt` with no query. A query
   sends the request to the model. The trade is small, because the file is plain text.
+
+A skip rule looks only at the method, the path and the query. A skip rule's path
+must match in every reading, so `/robots.txt%3Bx` and `/wp-login.php;x` go to the
+model. Headers, cookies and the body of a skipped request are not seen by the model,
+because a skipped request makes no backend call. Built-in block rules that look at
+headers still run before the skip, so a request with the `sqlmap` user agent is
+blocked even on `/robots.txt`.
 
 Block rules still run before these skips. A request that a built-in rule or one of
 your own block rules matches is blocked, even when a skip rule also matches. For

@@ -152,8 +152,8 @@ fn assert_decision(
     Ok(())
 }
 
-/// The text of a command's output, for an assertion message.
-fn text(output: &Output) -> String {
+/// The stdout and then the stderr of a command, as one string, for an assertion message.
+fn stdout_and_stderr(output: &Output) -> String {
     format!(
         "stdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -188,6 +188,18 @@ fn text(output: &Output) -> String {
 #[case::post_request("POST", "/?p=1", Expected::Model)]
 #[case::other_path("GET", "/page/2?p=1", Expected::Model)]
 #[case::index_php_suffix("GET", "/index.php/x", Expected::Model)]
+#[case::second_parameter_outside_the_list("GET", "/?p=1&attachment_id=9", Expected::Model)]
+#[case::second_parameter_from_analytics("GET", "/?p=1&utm_source=1", Expected::Model)]
+#[case::plus_in_value("GET", "/?p=1+", Expected::Model)]
+// The NUL byte is removed from the query before matching, so `p=1%00` matches as `p=1`
+// and the skip applies.
+#[case::nul_in_value_is_removed_before_matching(
+    "GET",
+    "/?p=1%00",
+    Expected::Skip("wp-public-pages")
+)]
+// `<b>` matches no built-in block rule and not the skip regex, so the model decides.
+#[case::markup_no_built_in_rule_blocks("GET", "/?p=%3Cb%3E", Expected::Model)]
 #[case::block_rule_wins_over_the_skip(
     "GET",
     "/?p=1%20UNION%20SELECT%20password%20FROM%20users",
@@ -203,6 +215,15 @@ fn text(output: &Output) -> String {
 #[case::login_post("POST", "/wp-login.php", Expected::Model)]
 #[case::login_path_suffix("GET", "/wp-login.php/x", Expected::Model)]
 #[case::login_path_case("GET", "/WP-LOGIN.php", Expected::Model)]
+#[case::login_query_the_model_never_sees(
+    "GET",
+    "/wp-login.php?foo=bar",
+    Expected::Skip("wp-login-page")
+)]
+#[case::login_path_with_an_extra_letter("GET", "/wp-login.phpx", Expected::Model)]
+// Reading 2 of `/wp-login.php;x` is `/wp-login.php`, cut at the `;`. A rule that accepted any
+// reading would skip this request; `wp-login-page` needs every reading to match.
+#[case::login_path_with_a_semicolon_suffix("GET", "/wp-login.php;x", Expected::Model)]
 #[case::javascript_url_wins_over_the_skip(
     "GET",
     "/wp-login.php?redirect_to=javascript:alert(1)",
@@ -269,12 +290,50 @@ fn text(output: &Output) -> String {
     "/wp-admin/load-scripts.php?c=0&load%5Bchunk_0%5D=utils",
     Expected::Model
 )]
+#[case::empty_version(
+    "GET",
+    "/wp-admin/load-scripts.php?c=0&load%5Bchunk_0%5D=utils&ver=",
+    Expected::Model
+)]
+#[case::version_of_forty_characters(
+    "GET",
+    "/wp-admin/load-scripts.php?c=0&load%5Bchunk_0%5D=utils&ver=0123456789abcdefghijklmnopqrstuvwxyzABCD",
+    Expected::Skip("wp-admin-assets")
+)]
+#[case::version_of_forty_one_characters(
+    "GET",
+    "/wp-admin/load-scripts.php?c=0&load%5Bchunk_0%5D=utils&ver=0123456789abcdefghijklmnopqrstuvwxyzABCDE",
+    Expected::Model
+)]
+#[case::last_chunk_is_nine(
+    "GET",
+    "/wp-admin/load-scripts.php?c=0&load%5Bchunk_9%5D=utils&ver=6.8",
+    Expected::Skip("wp-admin-assets")
+)]
+#[case::two_digit_chunk_is_not_allowed(
+    "GET",
+    "/wp-admin/load-scripts.php?c=0&load%5Bchunk_10%5D=utils&ver=6.8",
+    Expected::Model
+)]
+#[case::path_with_a_suffix(
+    "GET",
+    "/wp-admin/load-scripts.php/x?c=0&load%5Bchunk_0%5D=utils&ver=6.8",
+    Expected::Model
+)]
+#[case::path_with_an_extra_letter(
+    "GET",
+    "/wp-admin/load-scripts.phpx?c=0&load%5Bchunk_0%5D=utils&ver=6.8",
+    Expected::Model
+)]
 // wp-robots: robots.txt with no query
 #[case::robots("GET", "/robots.txt", Expected::Skip("wp-robots"))]
 #[case::robots_head("HEAD", "/robots.txt", Expected::Skip("wp-robots"))]
 #[case::robots_with_query("GET", "/robots.txt?x=1", Expected::Model)]
 #[case::robots_post("POST", "/robots.txt", Expected::Model)]
 #[case::robots_trailing_slash("GET", "/robots.txt/", Expected::Model)]
+// Reading 2 of `/robots.txt%3Bx` is `/robots.txt`, cut at the `;`. A rule that accepted any
+// reading would skip this request; `wp-robots` needs every reading to match.
+#[case::robots_with_an_encoded_semicolon("GET", "/robots.txt%3Bx", Expected::Model)]
 fn each_rule_skips_its_requests_and_only_those(
     #[case] method: &str,
     #[case] target: &str,
@@ -307,35 +366,51 @@ fn the_rules_apply_to_every_site_that_includes_the_file() -> TestResult {
     )
 }
 
-#[test]
-fn a_site_line_limits_one_rule_to_the_named_site() -> TestResult {
+/// The shipped rules with `from` replaced by `to`. `from` must occur in the file.
+fn shipped_with_edit(from: &str, to: &str) -> Result<String, BoxError> {
     let shipped = shipped_rules()?;
-    let limited_header = "rule wp-robots {\n    description";
     assert!(
-        shipped.contains(limited_header),
-        "the rule wp-robots block changed"
+        shipped.contains(from),
+        "the shipped file no longer contains {from:?}"
     );
-    let rules = shipped.replacen(
-        limited_header,
-        "rule wp-robots {\n    site enforce.test;\n    description",
-        1,
-    );
-    let config = config_with_rules(&rules)?;
+    Ok(shipped.replacen(from, to, 1))
+}
+
+/// A configuration whose `wp-robots` rule has a `site enforce.test;` line.
+fn robots_limited_to_the_enforce_site() -> Result<Config, BoxError> {
+    config_with_rules(&shipped_with_edit(
+        "rule wp-robots {\n",
+        "rule wp-robots {\n    site enforce.test;\n",
+    )?)
+}
+
+#[test]
+fn a_site_line_makes_its_rule_apply_to_the_named_site() -> TestResult {
+    let config = robots_limited_to_the_enforce_site()?;
     assert_decision(
         &config,
         "enforce.test",
         "GET",
         "/robots.txt",
         Expected::Skip("wp-robots"),
-    )?;
+    )
+}
+
+#[test]
+fn a_site_line_keeps_its_rule_from_applying_to_another_site() -> TestResult {
+    let config = robots_limited_to_the_enforce_site()?;
     assert_decision(
         &config,
         "shadow.test",
         "GET",
         "/robots.txt",
         Expected::Model,
-    )?;
-    // The other rules are not limited, so they still apply to the other site.
+    )
+}
+
+#[test]
+fn a_site_line_leaves_the_other_rules_on_every_site() -> TestResult {
+    let config = robots_limited_to_the_enforce_site()?;
     assert_decision(
         &config,
         "shadow.test",
@@ -343,6 +418,51 @@ fn a_site_line_limits_one_rule_to_the_named_site() -> TestResult {
         "/wp-login.php",
         Expected::Skip("wp-login-page"),
     )
+}
+
+#[test]
+fn a_query_line_narrows_the_login_skip_to_the_queries_it_names() -> TestResult {
+    // The login rule with a query condition: only a query that matches `^$` is still skipped.
+    let config = config_with_rules(&shipped_with_edit(
+        "    path = /wp-login.php;\n",
+        "    path = /wp-login.php;\n    query ~ \"^$\";\n",
+    )?)?;
+    assert_decision(
+        &config,
+        "enforce.test",
+        "GET",
+        "/wp-login.php",
+        Expected::Skip("wp-login-page"),
+    )?;
+    assert_decision(
+        &config,
+        "enforce.test",
+        "GET",
+        "/wp-login.php?foo=bar",
+        Expected::Model,
+    )
+}
+
+#[test]
+fn a_skip_rule_does_not_look_at_the_headers_or_the_body() -> TestResult {
+    let config = config_with_rules(&shipped_rules()?)?;
+    let raw = b"GET /robots.txt HTTP/1.1\r\nHost: enforce.test\r\nCookie: session=abc\r\nX-Note: anything\r\nContent-Length: 4\r\n\r\nx=1y";
+    let check = check_request_with(&config, raw, CLIENT)?;
+    assert_eq!(check.outcome, Outcome::Forwarded);
+    assert_eq!(check.reason, Some("skip_rule"));
+    assert_eq!(check.rule_id.as_deref(), Some("wp-robots"));
+    Ok(())
+}
+
+#[test]
+fn a_built_in_block_rule_still_reads_the_headers_of_a_skipped_request() -> TestResult {
+    let config = config_with_rules(&shipped_rules()?)?;
+    let raw = b"GET /robots.txt HTTP/1.1\r\nHost: enforce.test\r\nUser-Agent: sqlmap/1.8\r\n\r\n";
+    let check = check_request_with(&config, raw, CLIENT)?;
+    assert_eq!(check.outcome, Outcome::Blocked(403));
+    assert_eq!(check.reason, Some("rule"));
+    assert_eq!(check.rule_id.as_deref(), Some("vh-scanner-001"));
+    Ok(())
 }
 
 #[test]
@@ -427,6 +547,35 @@ async fn a_skipped_request_is_forwarded_without_a_decision_backend_call() -> Tes
 }
 
 #[tokio::test]
+async fn a_skipped_request_with_a_cookie_and_a_body_does_not_call_the_backend() -> TestResult {
+    let stub = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let dir = fresh_dir()?;
+    let conf = write_router(&dir, &shipped_rules()?, &upstream.url(), &stub.decide_url())?;
+    let proxy = start_proxy_config(Config::load(&conf)?).await?;
+
+    let before = stub.calls();
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/robots.txt",
+        "enforce.test",
+        &[("cookie", "session=abc")],
+        Bytes::from_static(b"x=1y"),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        stub.calls(),
+        before,
+        "the skipped request reached the backend"
+    );
+
+    proxy.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_block_rule_refuses_a_request_that_a_skip_rule_also_matches_without_calling_the_backend()
 -> TestResult {
     let stub = StubDecider::start().await?;
@@ -489,15 +638,15 @@ fn the_example_configuration_with_the_wordpress_file_passes_the_test() -> TestRe
     };
 
     let test = run(&["-t", "-c"])?;
-    assert_eq!(test.status.code(), Some(0), "{}", text(&test));
+    assert_eq!(test.status.code(), Some(0), "{}", stdout_and_stderr(&test));
 
     let dump = run(&["-T", "-c"])?;
-    assert_eq!(dump.status.code(), Some(0), "{}", text(&dump));
+    assert_eq!(dump.status.code(), Some(0), "{}", stdout_and_stderr(&dump));
     let printed = String::from_utf8_lossy(&dump.stdout);
     assert!(
         printed.contains("rule wp-robots {"),
         "the dump does not show the included WordPress rules: {}",
-        text(&dump)
+        stdout_and_stderr(&dump)
     );
     Ok(())
 }
