@@ -1,6 +1,6 @@
 # Rotates the log files of vigilant-heron. SIGUSR1 makes the router reopen its
 # log files after the rotation.
-/var/log/vigilant-heron/*.log {
+/var/log/vigilant-heron/*.log /var/log/vigilant-heron/*.json {
     daily
     rotate 14
     compress

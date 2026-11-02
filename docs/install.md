@@ -431,7 +431,7 @@ The script copies the sample configuration and the token template only when thos
 The script does not start the service. It prints the next steps. Two of them are easy to miss:
 
 - Add `pid /run/vigilant-heron/vigilant-heron.pid;` to the configuration. The unit creates `/run/vigilant-heron`, and the router writes its pid file there.
-- Add `access_log /var/log/vigilant-heron/access.log main;` to the configuration. The logrotate file rotates the files in `/var/log/vigilant-heron`, so point the access log at that directory.
+- Add `access_log /var/log/vigilant-heron/access.json json;` to the configuration. The guide's tools, `shadow-report` and `suggest-skip-rules`, read the json format, and only that format has `user_agent` and `request_id`.
 
 The unit that the script installs is shown here, and the repository has the same file at `packaging/systemd/vigilant-heron.service`:
 
@@ -483,7 +483,7 @@ A reload keeps connections open. Use `sudo systemctl restart vigilant-heron` onl
 
 The unit runs the router with systemd's hardening options, so it can write only to its runtime directory and to `/var/log/vigilant-heron`.
 
-The logrotate file rotates each `/var/log/vigilant-heron/*.log` file daily, as the `vigilant-heron` user, and keeps 14 rotated files. After each rotation it sends SIGUSR1, so the router opens its log files again.
+The logrotate file rotates each `/var/log/vigilant-heron/*.log` and `*.json` file daily, as the `vigilant-heron` user, and keeps 14 rotated files. After each rotation it sends SIGUSR1, so the router opens its log files again.
 
 ## Updating
 

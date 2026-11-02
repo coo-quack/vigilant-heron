@@ -247,7 +247,7 @@ fn install_does_not_run_systemctl_and_prints_the_next_steps() -> TestResult {
         "{out}"
     );
     assert!(
-        out.contains("access_log /var/log/vigilant-heron/access.log main;"),
+        out.contains("access_log /var/log/vigilant-heron/access.json json;"),
         "{out}"
     );
     assert!(
@@ -435,7 +435,7 @@ fn the_logrotate_file_rotates_daily_and_sends_sigusr1() -> TestResult {
     let text = String::from_utf8(packaged_logrotate()?)?;
     let lines: Vec<&str> = text.lines().map(str::trim).collect();
     for wanted in [
-        "/var/log/vigilant-heron/*.log {",
+        "/var/log/vigilant-heron/*.log /var/log/vigilant-heron/*.json {",
         "daily",
         "rotate 14",
         "compress",
