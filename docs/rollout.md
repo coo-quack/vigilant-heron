@@ -88,10 +88,18 @@ Watch the trial for several days, including the owner's admin work, scheduled jo
 
 Each request gets one JSON line, and every value is a string. A `would_have` block therefore appears as `"would_have":"block"`, with no space after the colon. [Logging](/logging#the-built-in-formats) describes the fields.
 
+`shadow-report` gives most of these figures in one plain-text summary. Run it on the rotated log and the current log together, as [Summarize a shadow log](/cli#summarize-a-shadow-log) describes:
+
+```console
+$ vigilant-heron shadow-report /var/log/vigilant-heron/access.json.1 /var/log/vigilant-heron/access.json
+```
+
+The report prints paths from the log, which can carry tokens, so read it before you paste any part of it.
+
 Look at these things:
 
 1. **Counts by `reason` and `decision_error`.** A large count in one reason shows where most traffic goes.
-2. **Every `would_have=block` line.** Find them with `grep -c '"would_have":"block"' access.json`, then read the last few lines with `tail`.
+2. **Every `would_have=block` line.** Find them with `grep -c '"would_have":"block"' access.json`, then read the last few lines with `tail`. The report lists only the first 50 blocked or redirected lines, in log order.
 3. **Decision errors per hour.** Timeouts in an hour with little load point to the provider, not to the site.
 4. **`client_busy` bursts per minute and per client.** `client_busy` is the router's refusal when one client already has its share of backend calls in flight. One browser that loads many assets at once can cause it. Phases 4 and 5 show the fixes.
 5. **The p99 of `latency_ms`**, compared with your `timeout`.

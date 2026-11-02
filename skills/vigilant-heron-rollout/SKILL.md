@@ -35,7 +35,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - **Goal:** the site, its clients, the proxies, the backend's latency, `timeout`, the cost and the evaluation are known.
 - **Guide:** [1. Before you start](../../docs/rollout.md#1-before-you-start), and [`real_ip_from`](../../docs/install.md#putting-it-behind-nginx-or-cloudflare).
 - **Run:** once a first draft of the file exists, `vigilant-heron -t -c <file>`.
-- **Look for:** `test is successful`. With `TYPESAFE_API_KEY` unset, `-t` still exits 0 and only warns, but the router refuses to start without the variable. Measure latency on the router's server.
+- **Look for:** `test is successful`. With `TYPESAFE_API_KEY` unset, `-t` still exits 0, but the router refuses to start. Measure latency on the router's server.
 - **Gate:** every item in the guide's step 1 checklist is true.
 
 ### Phase 2: Shadow beside the site
@@ -49,9 +49,9 @@ Move on only when the gate is met and the operator has agreed to any change in t
 ### Phase 3: Reading the shadow log
 
 - **Goal:** find what the router would block, and whether the backend keeps up.
-- **Guide:** [3. Reading the shadow log](../../docs/rollout.md#3-reading-the-shadow-log), and [the built-in formats](../../docs/logging.md#the-built-in-formats) for the fields.
-- **Run:** read the log on the server. Count the lines by `reason` and by `decision_error`. List the blocks with `grep '"would_have":"block"' <access.json>`, count them, and read each line. `tail <access.json>` shows the latest. If your `log_format` has `$block_query`, read it for each block, masking personal data you quote. Compute the p99 of `latency_ms`, and sum `input_tokens`.
-- **Look for:** one reason that dominates; decision timeouts clustered in an hour with little load; `client_busy` bursts from one client; a p99 above `timeout`. Mask client addresses in any line you quote, such as `203.0.113.x`.
+- **Guide:** [3. Reading the shadow log](../../docs/rollout.md#3-reading-the-shadow-log), [Summarize a shadow log](../../docs/cli.md#summarize-a-shadow-log), and [the built-in formats](../../docs/logging.md#the-built-in-formats) for the fields.
+- **Run:** `vigilant-heron shadow-report <access.json.1> <access.json>` (no `-c`). Its overview counts `reason` and `decision_error`; its per-hour part gives the p99 of `latency_ms`. List the blocks with `grep '"would_have":"block"' <access.json>`, count them, and read each line; the report lists only the first 50. If your `log_format` has `$block_query`, read it for each block, masking personal data you quote.
+- **Look for:** one reason that dominates; decision timeouts clustered in an hour with little load; `client_busy` bursts from one client; a p99 above `timeout`. Do not pass `--full-addresses`, and mask any client address you quote, such as `203.0.113.x`.
 - **Gate:** every `"would_have":"block"` line has been read, and the counts and p99 are recorded.
 
 ### Phase 4: Writing skip rules
@@ -73,7 +73,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - **Goal:** the site's scripts pass through the router, with a tested way back.
 - **Guide:** [5. Putting the router in the request path](../../docs/rollout.md#5-putting-the-router-in-the-request-path).
 - **Run:** each nginx change, symlink switch, restart, stop and start needs the operator's approval. Run the guide's steps 1 to 4. For the router, run `vigilant-heron -t -c <file>`, then `vigilant-heron restart -c <file>`. To test the fallback, stop the router with `sudo systemctl stop vigilant-heron`, or `vigilant-heron stop -c <file>` for a background router, check that the site answers, and start it again.
-- **Look for:** the outer nginx uses `proxy_next_upstream error;`, not the default `error timeout`, which would send a slow request past the router ([step 5 of the guide](../../docs/rollout.md#5-putting-the-router-in-the-request-path) explains why). The inner server answers a script directly. A page and a login each have a log line, and `latency_ms` is compared with nginx's request time. While the router is stopped, the site still answers from the inner server.
+- **Look for:** the outer nginx uses `proxy_next_upstream error;`, not the default `error timeout`, which would send a slow request past the router ([step 5 of the guide](../../docs/rollout.md#5-putting-the-router-in-the-request-path) explains why). A page and a login each have a log line, and `latency_ms` is compared with nginx's request time. While the router is stopped, the site still answers from the inner server.
 - **Gate:** the guide's step 5 checklist is true, and the switch back was tested once.
 
 ### Phase 6: Switching to enforce
@@ -83,7 +83,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - **Run:**
   1. Ask the operator for an explicit yes before changing the mode. Then run `vigilant-heron -t -c <file>`.
   2. Check the rule offline before the reload: `vigilant-heron -c <file> test-request --url 'https://example.com/?id=1%20UNION%20SELECT%20password%20FROM%20users'` should report `result: blocked with 403`.
-  3. Ask the operator to approve the reload. Then run `vigilant-heron -s reload -c <file>`, or `sudo systemctl reload vigilant-heron` under systemd.
+  3. Ask the operator to approve the reload, then reload as in phase 4.
   4. Send the live test attack (guide, step 4) only with the operator's yes.
 - **Look for:** a 403 for the live attack; no block or 429 from the owner's normal actions; an upload over the limit gets 413; a reported block is found by its `request_id` in the JSON log.
 - **Gate:** every item in the guide's checklist is true, and the operator knows both ways back: `mode shadow;` with a reload, or the symlink to the direct upstream.
@@ -103,7 +103,8 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - `vigilant-heron -c <file> test-request <request.http>`: report what the router would do with a saved request; `-` reads standard input.
 - `vigilant-heron -c <file> test-request --url <url>`: the same, for a URL. `--host <name>` is needed for a path such as `/items?id=2`. `--method <m>` defaults to GET. `--header 'Name: value'` may repeat.
 - `vigilant-heron suggest-skip-rules <access.json>`: candidates from the JSON access log. `--site <name>` narrows the report. It takes no `-c`.
-- `vigilant-heron -s reload -c <file>`: re-read the file; use the running router's `-c`. `-s` also takes `reopen`, `stop` and `quit`, and returns at once for each, including `stop`.
+- `vigilant-heron shadow-report <access.json>...`: summary of json access logs from a shadow trial. It takes no `-c`.
+- `vigilant-heron -s reload -c <file>`: re-read the file; use the running router's `-c`. `-s` also takes `reopen`, `stop` and `quit`, each returning at once.
 - `vigilant-heron stop -c <file>`: stop a background router. Only this command waits until the router has exited.
 - `vigilant-heron start|restart -c <file>`: start or restart a background router. Under systemd, use `sudo systemctl reload|restart|stop vigilant-heron` instead.
 
