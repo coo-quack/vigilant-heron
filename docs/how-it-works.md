@@ -33,7 +33,9 @@ decides the request ends the evaluation.
    extension with no earlier script extension, the raw path has no `;`, `\`, `%2F`,
    `%5C` or `%3B`, and no `fail_closed_path` matches. A `static_location` restricts
    it to some prefixes. A query made only of `static_query_params` parameters with
-   plain values, such as `?ver=6.8.3`, counts as no query.
+   plain values, such as `?ver=6.8.3`, counts as no query. With
+   `static_query_token on`, a query that is one bare token, such as
+   `?wp-mce-49110-20250317`, counts as no query too.
 7. **Decision model.** The request is sent to the backend, and the policy
    compares the returned scores with `block_threshold` and
    `instruction_threshold`. The outcome is `model` when a threshold is reached and
