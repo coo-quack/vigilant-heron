@@ -1,0 +1,20 @@
+[Unit]
+Description=vigilant-heron router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vigilant-heron
+# Creates /run/vigilant-heron for the pid file that the configuration names.
+RuntimeDirectory=vigilant-heron
+# KEY=value lines with the API tokens. Readable by root and the service only.
+EnvironmentFile=/etc/vigilant-heron/env
+ExecStart=/usr/local/bin/vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf
+ExecReload=/usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf
+# SIGTERM already stops the router gracefully; this makes it explicit.
+KillSignal=SIGTERM
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

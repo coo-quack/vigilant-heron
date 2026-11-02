@@ -9,6 +9,15 @@
   `eval/rules.py` reports them as rows without model results until the providers
   are measured again.
 
+- Added: each release archive holds `packaging/install.sh`, a systemd unit and a
+  logrotate file under `packaging/`, and the sample configuration in
+  `examples/vigilant-heron.conf`. Run `sudo sh packaging/install.sh` from the
+  extracted archive to install the binary, the unit, the logrotate file and the
+  configuration and token files, instead of copying each one by hand. The script
+  never overwrites an existing configuration or token file, and it does not start
+  the service. The install guide's "Run as a service with systemd" section has the
+  details.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more

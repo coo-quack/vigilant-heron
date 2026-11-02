@@ -150,6 +150,10 @@ jobs:
             mkdir "$name"
             install -m 755 "dist/linux_$arch/vigilant-heron" "$name/vigilant-heron"
             cp "$GITHUB_WORKSPACE/LICENSE" "$GITHUB_WORKSPACE/README.md" "$name/"
+            # packaging/install.sh finds the binary at ../vigilant-heron and the sample at ../examples.
+            cp -R "$GITHUB_WORKSPACE/packaging" "$name/"
+            mkdir "$name/examples"
+            cp "$GITHUB_WORKSPACE/examples/vigilant-heron.conf" "$name/examples/"
             tar -czf "assets/$name.tar.gz" "$name"
           done
           (cd assets && sha256sum -- *.tar.gz > SHA256SUMS)
