@@ -233,6 +233,52 @@ async fn static_asset_is_forwarded_without_calling_the_backend() -> TestResult {
     proxy.stop().await
 }
 
+/// Adds `static_query_token on;` to the first site of `config_text`.
+fn with_static_query_token(text: &str) -> String {
+    text.replacen(
+        "    debug_headers on;\n",
+        "    debug_headers on;\n    static_query_token on;\n",
+        1,
+    )
+}
+
+#[tokio::test]
+async fn bare_cache_busting_token_skips_the_backend_only_when_static_query_token_is_on()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS);
+    let path = "/wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317";
+
+    let off = start_proxy(&text).await?;
+    let reply = send(
+        &off.base(),
+        Method::GET,
+        path,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 1, "off: the backend decides");
+    off.stop().await?;
+
+    let on = start_proxy(&with_static_query_token(&text)).await?;
+    let reply = send(
+        &on.base(),
+        Method::GET,
+        path,
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 1, "on: the backend is not called again");
+    on.stop().await
+}
+
 /// Adds `on_rate_limit allow` and `on_decision_error allow` to the first site of `config_text`.
 fn fail_open(text: &str) -> String {
     text.replacen(

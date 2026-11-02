@@ -213,7 +213,8 @@ pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
 /// - a GET or HEAD with no body and the raw path free of `;`, `\`, `%2F`, `%5C` and
 ///   `%3B` (case-insensitive);
 /// - no query, or one made only of `static_query_params` parameters, see
-///   [`cache_busters_only`];
+///   [`cache_busters_only`], or, with `static_query_token on`, one bare token, see
+///   [`bare_token`];
 /// - under a `static_location` prefix, when the site sets any: every view starts with one;
 /// - in every view, the last segment has a static extension and no earlier segment
 ///   has a script extension;
@@ -232,7 +233,7 @@ pub(crate) fn static_skip(
     }
     if input
         .raw_query()
-        .is_some_and(|query| !cache_busters_only(site, query))
+        .is_some_and(|query| !query_keeps_static_skip(site, query))
     {
         return false;
     }
@@ -252,8 +253,14 @@ pub(crate) fn static_skip(
     views.iter().all(|view| is_static_view(site, view)) && !fails_closed(site, views)
 }
 
-/// Longest value of a `static_query_params` parameter that keeps the static skip.
+/// Longest value of a `static_query_params` parameter, or bare query token, that keeps the static skip.
 const MAX_CACHE_BUSTER_LEN: usize = 64;
+
+/// Returns true when a raw query may keep the static skip: the `static_query_params` form,
+/// or, when the site sets `static_query_token on`, one bare token.
+fn query_keeps_static_skip(site: &SiteConfig, query: &str) -> bool {
+    cache_busters_only(site, query) || (site.static_query_token && bare_token(query))
+}
 
 /// Returns true when a raw query is made only of the site's `static_query_params`,
 /// such as the `?ver=6.8.3` that `WordPress` adds.
@@ -274,6 +281,18 @@ fn cache_busters_only(site: &SiteConfig, query: &str) -> bool {
                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
         })
     })
+}
+
+/// Returns true when a raw query is one bare token of 1 to 64 ASCII letters, digits, `.`,
+/// `_` or `-`, such as the `wp-mce-49110-20250317` that `WordPress`'s editor adds.
+///
+/// The token is checked raw. An `=` or `&` (a parameter form), a `%` or `+` (an escape)
+/// and an empty query all make the request inspected.
+fn bare_token(query: &str) -> bool {
+    (1..=MAX_CACHE_BUSTER_LEN).contains(&query.len())
+        && query
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// Returns true when a lowercase view ends in a static extension and no earlier segment
@@ -601,6 +620,102 @@ mod tests {
             screen_query(&config, raw_path, query),
             Screening::Inspect,
             "{raw_path}?{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::wordpress_tinymce("wp-mce-49110-20250317", Screening::Skip)]
+    #[case::one_letter("a", Screening::Skip)]
+    #[case::longest(&"a".repeat(64), Screening::Skip)]
+    #[case::every_allowed_mark("A.b_c-9", Screening::Skip)]
+    #[case::too_long(&"a".repeat(65), Screening::Inspect)]
+    #[case::empty("", Screening::Inspect)]
+    #[case::percent_escape("a%20b", Screening::Inspect)]
+    #[case::plus("a+b", Screening::Inspect)]
+    #[case::equals("a=1", Screening::Inspect)]
+    #[case::ampersand("a&b", Screening::Inspect)]
+    #[case::slash("a/b", Screening::Inspect)]
+    #[case::space("a b", Screening::Inspect)]
+    fn static_query_token_lets_only_a_bare_token_skip(
+        #[case] query: &str,
+        #[case] expected: Screening,
+    ) -> Result<(), ConfigError> {
+        // Built-in rules would catch some of these first; this checks the static skip alone.
+        let config = site("static_query_token on;\n    builtin_rules off;")?;
+        assert_eq!(
+            screen_query(&config, "/wp-includes/js/tinymce/wp-tinymce.js", query),
+            expected,
+            "{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::off_by_default("", "/wp-tinymce.js", "wp-mce-49110-20250317")]
+    #[case::not_static("static_query_token on;", "/index.php", "wp-mce-1")]
+    #[case::script_earlier("static_query_token on;", "/index.php/x.js", "wp-mce-1")]
+    #[case::outside_static_location(
+        "static_query_token on;\n    static_location /static/;",
+        "/img/a.js",
+        "wp-mce-1"
+    )]
+    fn static_query_token_does_not_widen_the_rest_of_the_static_skip(
+        #[case] fields: &str,
+        #[case] raw_path: &str,
+        #[case] query: &str,
+    ) -> Result<(), ConfigError> {
+        let config = site(fields)?;
+        assert_eq!(
+            screen_query(&config, raw_path, query),
+            Screening::Inspect,
+            "{raw_path}?{query}"
+        );
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::post(Method::POST, true)]
+    #[case::body(Method::GET, false)]
+    fn static_query_token_keeps_the_method_and_body_conditions(
+        #[case] method: Method,
+        #[case] body_is_empty: bool,
+    ) -> Result<(), ConfigError> {
+        let config = site("static_query_token on;\n    builtin_rules off;")?;
+        let headers = HeaderMap::new();
+        let client = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let input = RuleInput::new(
+            &method,
+            "/wp-tinymce.js",
+            Some("wp-mce-1"),
+            &headers,
+            &[],
+            client,
+        );
+        assert_eq!(
+            screen(
+                &config,
+                &input,
+                &lower_views("/wp-tinymce.js"),
+                body_is_empty
+            ),
+            Screening::Inspect
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_block_rule_still_runs_before_a_static_skip_with_a_bare_token() -> Result<(), ConfigError> {
+        let config = site(
+            "static_query_token on;\n    rule block-tinymce {\n        description \"blocked\";\n        action block;\n        path /wp-tinymce.js;\n    }",
+        )?;
+        assert_eq!(
+            screen_query(&config, "/wp-tinymce.js", "wp-mce-1"),
+            Screening::Rule(Some(Arc::from("block-tinymce")))
+        );
+        assert_eq!(
+            screen_query(&config, "/app.js", "wp-mce-1"),
+            Screening::Skip
         );
         Ok(())
     }

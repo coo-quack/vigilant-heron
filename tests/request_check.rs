@@ -74,6 +74,10 @@ async fn wait_for_line(path: &Path, request_id: &str) -> Result<Value, BoxError>
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the table lists one sample request per row; splitting it would hide the table"
+)]
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -164,10 +168,32 @@ fn cases() -> Vec<Case> {
             reason: Some("body_too_large"),
             rule: "",
         },
+        Case {
+            label: "enforce site without static_query_token, bare token goes to the backend",
+            method: Method::GET,
+            target: "/wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317",
+            host: "enforce.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::BackendDecides,
+            reason: None,
+            rule: "",
+        },
+        Case {
+            label: "static_query_token site, bare token takes the static skip",
+            method: Method::GET,
+            target: "/wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317",
+            host: "token.test",
+            headers: &[],
+            body_len: 0,
+            expect: Outcome::Forwarded,
+            reason: Some("skip"),
+            rule: "",
+        },
     ]
 }
 
-/// The configuration of both the check and the proxy: four sites and one top-level skip rule.
+/// The configuration of both the check and the proxy: five sites and one top-level skip rule.
 fn config_text(log: &str, decide_url: &str, upstream_url: &str) -> String {
     format!(
         r#"
@@ -213,6 +239,15 @@ site denied.test {{
     block_threshold 0.9;
     instruction_threshold 0.5;
     deny 127.0.0.1;
+}}
+
+site token.test {{
+    upstream "{upstream_url}";
+    mode enforce;
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    static_query_token on;
 }}
 "#
     )
