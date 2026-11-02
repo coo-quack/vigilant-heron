@@ -539,6 +539,10 @@ Longest wait for a free concurrency slot. A request that finds no slot in that t
 
 Most backend calls in flight at the same time. At least 1.
 
+A call holds its slot while it waits for the backend, and the [`timeout`](#timeout) ends that wait. So with a backend that does not answer, at most about `max_concurrency / timeout` new calls start per second. With the defaults, 64 slots and a 2000 ms timeout give about 32 new calls per second.
+
+A request that finds no free slot is decided by [`on_rate_limit`](#on-rate-limit). By default it is allowed, so it is forwarded without a model verdict. With `block` it is refused instead. A few slow clients can fill the slots, so with `block` their calls refuse requests from other clients too, not only their own.
+
 ### `max_concurrency_per_client`
 
 - **Syntax:** `max_concurrency_per_client <number>;`
