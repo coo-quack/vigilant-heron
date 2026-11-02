@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added: the guide [From shadow mode to enforce](docs/rollout.md), which walks through a
+  rollout in seven phases: the checks before a first install, a shadow trial beside the
+  site, reading the shadow log, skip rules, putting the router in the request path,
+  switching to enforce, and running it safely. It is linked from the sidebar, the README
+  and Getting started. The router itself is unchanged.
+
 - Fixed: a static-looking path no longer takes the static skip when an upstream might
   read it as something else. It goes to the backend instead. This covers an encoded
   `?`, `#` or NUL (`%3F`, `%23`, `%00`, in any letter case), any encoded `%` (`%25`, so
@@ -11,7 +17,6 @@
   forwarded as static assets without calling the backend. The list of script
   extensions also gains `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`,
   `shtml`, `shtm`, `cfm`, `cfc`, `ashx`, `asmx` and `axd`.
-
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
   instructions to a reader, comment form submissions and search queries) and three
