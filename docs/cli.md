@@ -18,6 +18,7 @@ follow nginx's, so `-t`, `-T` and `-s` do what they do in nginx.
 | `stop` | Stop the background router and wait until it has exited. |
 | `restart` | Check the configuration, then stop and start the background router. |
 | `test-request <file>` | Report what the router would do with one raw HTTP request, without calling the decision backend. See [Check a request with test-request](#check-a-request-with-test-request). |
+| `test-request --url <url>` | The same, for a request built from a URL, with `--host`, `--method` and `--header`. See [Check a URL with test-request](#check-a-url-with-test-request). |
 | `--client <address>` | The client address that `test-request` uses for the access list. The default is `127.0.0.1`. |
 | `suggest-skip-rules <file>` | Suggest skip rules from a `json` access log, for review. Nothing is applied. See [Learn skip rules from the access log](#learn-skip-rules-from-the-access-log). |
 | `--site`, `--min-judged`, `--min-clients`, `--min-days`, `--max-attack`, `--max-ai-instruction` | Filter and thresholds of `suggest-skip-rules`. |
@@ -133,7 +134,12 @@ $ echo $?
 
 A failure prints the file and line of the error, then `test failed`, and exits 1.
 The check reads the includes, rules, block pages and token variables. A token
-variable that is not set fails the check.
+variable that is not set does not fail the check. A warning names it on stderr,
+because the router will not start without it. Starting the router still needs the
+variable, as `start` and a foreground run do.
+
+So `-t` exits 0 when the token variable is missing. A deploy check that must catch a
+missing token should look for the warning on stderr, or start the router.
 
 ## Print the configuration with -T
 
@@ -170,8 +176,9 @@ deploy a rule or a configuration change. It reads the configuration the same way
 `-t` does, and reports the decision. Nothing is bound or forwarded, and neither the
 upstream nor the decision backend is contacted.
 
-Because the configuration is checked as `-t` checks it, the variable named by
-`api_token_env` must be set. Any value works, since the backend is not called.
+A token variable that is not set does not stop `test-request`. It prints the same
+warning as `-t`, then the report. The backend is not called, so the token is not
+needed for the report.
 
 ```console
 $ vigilant-heron -c examples/vigilant-heron.conf test-request examples/requests/sqli-get.http
@@ -238,6 +245,44 @@ The command exits 0 whenever the report is printed, whatever the verdict. A file
 cannot be read, a request that is not valid HTTP/1.1, or an invalid configuration
 prints the reason to stderr and exits 1. `test-request` cannot be combined with `-t`,
 `-T`, `-s`, `start`, `stop` or `restart`.
+
+## Check a URL with test-request
+
+`test-request --url <url>` checks one request given as a URL, so no file is needed.
+The report is the one that `test-request <file>` prints for the same request, and the
+exit codes are the same.
+
+```console
+$ vigilant-heron -c examples/vigilant-heron.conf test-request --url 'https://www.example.com/products?id=1%20UNION%20SELECT%20password%20FROM%20users'
+warning: TYPESAFE_API_KEY (api_token_env) is not set; the router will not start without it
+request: GET "/products?id=1%20UNION%20SELECT%20password%20FROM%20users" (Host: "www.example.com", client: 127.0.0.1)
+site: example.com (shadow off)
+limits: not simulated (counts depend on earlier requests); limit_req zones: none; limit_conn zones: none
+access list: allowed
+deny_path: no match
+rules: vh-sqli-001 matched (block): UNION SELECT in a query string
+result: blocked with 403 by rule vh-sqli-001
+$ echo $?
+0
+```
+
+The warning appears because the example configuration names the Jev token variable,
+and it is not set in this shell. The check does not need it.
+
+- A `http://` or `https://` URL sets the Host header from its host name. A port is
+  kept when it is not the default for the scheme (80 for `http`, 443 for `https`);
+  the default port is left out.
+- The path and query of the URL are the request target. An empty path is `/`.
+- A URL that starts with `/` is a path. It needs `--host <name>`, which sets the
+  Host header: `test-request --url /items?id=2 --host www.example.com`.
+- `--method <m>` sets the request method. It is GET when the option is not given,
+  and it is written in uppercase.
+- `--header 'Name: value'` adds a request header. Repeat the option for more headers.
+- `--host`, `--method` and `--header` are only for `test-request --url`. `--host`
+  is refused with an absolute URL, because the URL already gives the Host.
+- A URL with a `#` fragment, a space, or user information (the part before `@`) is
+  refused with the reason, and the command exits 1.
+- `--url` cannot be combined with a request file.
 
 ## Learn skip rules from the access log
 
