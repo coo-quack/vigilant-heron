@@ -169,6 +169,256 @@ async fn query_shape_is_empty_when_the_request_has_no_query() -> TestResult {
     proxy.stop().await
 }
 
+/// A rule that blocks any query containing `forbidden`.
+const PROBE_RULE: &str = r#"
+    rule query-probe {
+        description "probe in the query";
+        action block;
+        query ~* "forbidden";
+    }"#;
+
+/// A configuration whose access log writes `request_id|action|reason|would_have|block_query`
+/// lines, so a test can check the block query next to the decision.
+fn block_query_config(
+    decide_url: &str,
+    upstream: &str,
+    path: &Path,
+    mode: &str,
+    site_extra: &str,
+) -> Result<Config, BoxError> {
+    let text = format!(
+        r#"
+listen 127.0.0.1:0;
+request_id_header x-request-id;
+log_format blocked "$request_id|$action|$reason|$would_have|$block_query";
+access_log "{log}" blocked;
+client_max_body_size 1024;
+decision {{
+    backend http;
+    url "{decide_url}";
+    timeout 300ms;
+    inspect_body 512;
+}}
+
+site example.com {{
+    upstream "{upstream}";
+    mode {mode};
+    action block;
+    block_threshold 0.9;
+    instruction_threshold 0.5;
+    {site_extra}
+}}
+"#,
+        log = path.display(),
+    );
+    Ok(Config::parse_str(&text, "logging.conf")?)
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_a_rule_blocks() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-rule");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=forbidden&p=1", "bq-rule").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-rule|").await?;
+    assert_eq!(line, "bq-rule|block|rule|-|q=forbidden&p=1");
+    assert_eq!(decider.calls(), 0, "the rule blocks before the backend");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_the_model_blocks() -> TestResult {
+    let decider = StubDecider::start().await?;
+    decider.set_behavior(common::StubBehavior {
+        attack: 0.95,
+        ..common::StubBehavior::default()
+    });
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-model");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(&decider.decide_url(), &upstream.url(), &path, "enforce", "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=1", "bq-model").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-model|").await?;
+    assert_eq!(line, "bq-model|block|model|-|q=1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_a_shadow_decision_would_have_blocked() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-shadow");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "shadow",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=forbidden", "bq-shadow").await?;
+
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "shadow mode forwards the request"
+    );
+    let line = wait_for_field_line(&path, "bq-shadow|").await?;
+    assert_eq!(line, "bq-shadow|allow|rule|block|q=forbidden");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_empty_when_the_request_is_allowed() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-allowed");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=1", "bq-allow").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let line = wait_for_field_line(&path, "bq-allow|").await?;
+    assert_eq!(line, "bq-allow|allow|below_threshold|-|-");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_redacts_sensitive_parameters_in_the_log() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-redact");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(
+        &proxy.base(),
+        "/search?password=hunter2&token=abc&q=forbidden",
+        "bq-redact",
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-redact|").await?;
+    assert_eq!(
+        line,
+        "bq-redact|block|rule|-|password=[REDACTED]&token=[REDACTED]&q=forbidden"
+    );
+    let text = std::fs::read_to_string(&path)?;
+    assert!(
+        !text.contains("hunter2") && !text.contains("=abc"),
+        "a sensitive value leaked into the log: {text}"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_matches_the_query_the_backend_received() -> TestResult {
+    let decider = StubDecider::start().await?;
+    decider.set_behavior(common::StubBehavior {
+        attack: 0.95,
+        ..common::StubBehavior::default()
+    });
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-backend");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(&decider.decide_url(), &upstream.url(), &path, "enforce", "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?token=abc&q=1", "bq-match").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let sent = decider.last_event().and_then(|event| {
+        event["event"]["untrusted"]["query"]
+            .as_str()
+            .map(str::to_owned)
+    });
+    assert_eq!(sent.as_deref(), Some("token=[REDACTED]&q=1"));
+    let line = wait_for_field_line(&path, "bq-match|").await?;
+    assert_eq!(line, "bq-match|block|model|-|token=[REDACTED]&q=1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_keeps_a_long_query_whole() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("block-query-long");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "enforce",
+        PROBE_RULE,
+    )?;
+    let proxy = start_proxy_config(config).await?;
+    let query = format!("q=forbidden{}", "a".repeat(3000));
+
+    let reply = get_with_id(&proxy.base(), &format!("/search?{query}"), "bq-long").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-long|").await?;
+    assert_eq!(line, format!("bq-long|block|rule|-|{query}"));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn block_query_is_logged_when_a_decision_failure_blocks() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let decide_url = common::closed_port_url().await?;
+    let path = log_path("block-query-failure");
+    let _ = std::fs::remove_file(&path);
+    let config = block_query_config(
+        &decide_url,
+        &upstream.url(),
+        &path,
+        "enforce",
+        "on_decision_error block;",
+    )?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/search?q=1", "bq-fail").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_field_line(&path, "bq-fail|").await?;
+    assert_eq!(line, "bq-fail|block|decision_error_blocked|-|q=1");
+    proxy.stop().await
+}
+
 #[tokio::test]
 async fn long_request_id_is_cut_to_128_bytes_and_not_sent_to_the_backend() -> TestResult {
     let decider = StubDecider::start().await?;

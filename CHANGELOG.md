@@ -7,6 +7,13 @@
   instructions to a reader, a comment form and search queries) and three `block`
   rows of prompt injection aimed at an AI. The router itself is unchanged.
 
+- Added: the `$block_query` log variable. It holds the query string of a blocked
+  request (`$action` is `block`, or in shadow mode `$would_have` is `block`), with
+  sensitive parameters redacted as the backend sees them. It is empty for every other
+  request, and it is not in the built-in `json` and `main` formats, since a query can
+  carry personal data. Add it to your own `log_format` to use it. See
+  [Logging](/logging#block-query).
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more

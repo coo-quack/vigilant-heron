@@ -74,6 +74,7 @@ written as `$name` or `${name}`.
 | `$method` | Request method |
 | `$path` | Request path |
 | `$query_shape` | Names of the query parameters and the kind of each value, never the value itself: `p=<num>&s=<text>`. See below |
+| `$block_query` | Query string of a blocked request, with sensitive parameters redacted, or empty. Not in the built-in formats; see [`$block_query`](#block-query) |
 | `$status` | Status sent to the client |
 | `$action` | `allow`, `block`, `redirect` or `reject`, the last for a request refused by a limit |
 | `$reason` | Why the decision was made, see below |
@@ -127,6 +128,31 @@ values are left out. The log still shows which kinds of requests a site receives
 At most 16 parameters are shown, and a further parameter adds `<more>`. Parameters
 are separated by `&` as in the request, and `;` is also accepted as a separator.
 The variable is empty when the request has no query.
+
+### `$block_query`
+
+`$block_query` records the query string of a blocked request, so a reviewer can
+see what the request contained. It helps tell an attack from a false positive,
+and find what in a legitimate request the model reacted to.
+
+The variable is set when `$action` is `block`, whatever the reason, and in shadow
+mode when `$would_have` is `block`. For every other request it is empty.
+
+```nginx
+log_format blocked escape=default "$time_iso8601 $client_ip $site \"$method $path\" $status $action $reason block_query=\"$block_query\"";
+access_log /var/log/vigilant-heron/access.log blocked;
+```
+
+The value is the query as the decision backend received it. Parameters with
+sensitive names, such as `password` and `token`, are redacted the same way, and so
+are the names listed in `redact_field`. The value is escaped like every other
+variable, so it cannot split a line. The router does not cut it. The request line
+is already limited by `large_client_header_buffers`, so the value cannot grow past
+that limit.
+
+The variable is not in the built-in `json` and `main` formats. A query can carry
+personal data, so the router writes it only when you add `$block_query` to a
+`log_format` of your own.
 
 ## Error log
 
