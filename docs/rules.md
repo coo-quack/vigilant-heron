@@ -164,3 +164,54 @@ first five.
 rule did. The built-in `json` format logs it as `rule_id`, and a `log_format` can
 include `$rule_id`. The reasons for these decisions are `access_denied`, `rule`
 (also `deny_path`, which has no id) and `skip_rule`. See [Logging](/logging).
+
+## WordPress rules
+
+`examples/rules.d/wordpress.conf` has four skip rules for a WordPress site. They
+spare the decision model the requests that WordPress sends all the time and that a
+verdict hardly changes. Each rule skips only the request shapes it names, and a
+skipped request is forwarded without a call to the decision backend.
+
+To use the file, copy it to `rules.d/` next to your configuration, and include it
+from the top level:
+
+```nginx
+include rules.d/wordpress.conf;
+```
+
+The rules have no `site` line, so they apply to every site in the configuration.
+To limit one rule to a site, add a `site` line inside its block, with the name of a
+configured site:
+
+```nginx
+rule wp-robots {
+    site www.example.com;
+    # the rest of the rule, as in the file
+}
+```
+
+The four rules:
+
+- **`wp-public-pages`**: skips `GET` and `HEAD` of `/` when the query holds only
+  WordPress's numeric parameters (`p`, `page_id`, `paged`, `cat`, `m` and
+  `attachment_id`), a feed (`feed=rss2` or `feed=atom`) or a sitemap. The values are
+  digits, or letters, digits and hyphens for a sitemap name. A quote, another
+  parameter or a newline in the query sends the request to the model, and markup in
+  the query is blocked by a built-in rule. The trade: a front-page view of these
+  shapes gets no model verdict.
+- **`wp-login-page`**: skips `GET` and `HEAD` of `/wp-login.php` with any query. A
+  `POST`, which carries the password, still goes to the model. The trade: a `GET` of
+  the login page is not seen by the model, so a query that no built-in rule catches
+  is forwarded.
+- **`wp-admin-assets`**: skips `GET` and `HEAD` of `/wp-admin/load-scripts.php` and
+  `/wp-admin/load-styles.php` when the query holds only `c` (`0` or `1`), an optional
+  `dir` (`ltr` or `rtl`), `load[chunk_N]` lists of handle names and a `ver`. Another
+  parameter, a quote or a newline sends the request to the model. The trade: a loader
+  request made of handle names is not seen by the model.
+- **`wp-robots`**: skips `GET` and `HEAD` of `/robots.txt` with no query. A query
+  sends the request to the model. The trade is small, because the file is plain text.
+
+Block rules still run before these skips. A request that a built-in rule or one of
+your own block rules matches is blocked, even when a skip rule also matches. For
+example, `GET /wp-login.php?redirect_to=javascript:alert(1)` is blocked by
+`vh-xss-002`.
