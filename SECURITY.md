@@ -241,8 +241,8 @@ failure and on the site settings:
   group of its own, `client_busy`. It follows `on_client_busy`, which defaults to
   `"block"`: the client gets 429 with an empty body and an `X-Request-ID` header, and the backend is not called.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
-  `"block"` (the default) applies the site's `action`, `"allow"` forwards the
-  request.
+  `"allow"` (the default) forwards the request, and `"block"` applies the site's
+  `action`.
 - `fail_closed_path` always blocks a failure on a matching path, whatever the
   group or setting.
 - Deterministic rules (the access list, `deny_path` and block rules) are decided
