@@ -439,18 +439,17 @@ fn multipart_boundary(content_type: Option<&str>) -> Option<String> {
         return None;
     }
     while !rest.is_empty() {
-        let at = rest.find(['=', ';'])?;
-        let key = rest.get(..at)?.trim();
-        let after = rest.get(at + 1..)?;
-        if !rest.get(at..)?.starts_with('=') {
-            rest = after;
-            continue;
-        }
-        let (value, remaining) = parameter_value(after);
-        if key.eq_ignore_ascii_case("boundary") {
-            return Some(value.to_owned()).filter(|boundary| !boundary.is_empty());
-        }
-        rest = remaining;
+        let (key, after) = rest.split_once(['=', ';'])?;
+        rest = if rest.strip_prefix(key)?.starts_with('=') {
+            let (value, remaining) = parameter_value(after);
+            if key.trim().eq_ignore_ascii_case("boundary") {
+                return Some(value.to_owned()).filter(|boundary| !boundary.is_empty());
+            }
+            remaining
+        } else {
+            // A parameter without `=`: skip it.
+            after
+        };
     }
     None
 }
@@ -483,8 +482,9 @@ struct Delimiter {
 /// What follows `--boundary` on a delimiter line.
 #[derive(Debug, PartialEq, Eq)]
 enum DelimiterEnd {
-    /// `--`: the closing delimiter. The epilogue follows.
-    Closing,
+    /// `--`: the closing delimiter. `close_end` is the offset just past the `--`, where
+    /// the epilogue starts.
+    Closing { close_end: usize },
     /// Spaces or tabs, then a newline. A part follows.
     Line,
     /// Spaces or tabs, then the end of the text: the line was cut.
@@ -501,28 +501,33 @@ enum DelimiterEnd {
 fn find_delimiter(text: &str, open: &str, sep: &str, from: usize) -> Option<Delimiter> {
     let mut search = from;
     if from == 0 && text.starts_with(open) {
-        if let Some(end) = delimiter_end(text.get(open.len()..)?) {
+        if let Some(end) = delimiter_end(text, open.len()) {
             return Some(Delimiter { start: 0, end });
         }
         search = open.len();
     }
     loop {
-        let start = search + text.get(search..)?.find(sep)? + 1;
-        let after = start + open.len();
-        if let Some(end) = delimiter_end(text.get(after..)?) {
+        // Checked sums: the search position can neither wrap nor stall.
+        let found = text.get(search..)?.find(sep)?;
+        let start = search.checked_add(found)?.checked_add(1)?;
+        let after = start.checked_add(open.len())?;
+        if let Some(end) = delimiter_end(text, after) {
             return Some(Delimiter { start, end });
         }
         search = after;
     }
 }
 
-/// Reads what follows `--boundary` on a line. Returns `None` when the line is not a
-/// delimiter line, so its text is content.
-fn delimiter_end(after: &str) -> Option<DelimiterEnd> {
-    if after.starts_with("--") {
-        return Some(DelimiterEnd::Closing);
+/// Reads what follows `--boundary` at `after` in `text`. Returns `None` when the line is
+/// not a delimiter line, so its text is content.
+fn delimiter_end(text: &str, after: usize) -> Option<DelimiterEnd> {
+    let rest = text.get(after..)?;
+    if rest.starts_with("--") {
+        return Some(DelimiterEnd::Closing {
+            close_end: after + 2,
+        });
     }
-    let line = after.trim_start_matches([' ', '\t']);
+    let line = rest.trim_start_matches([' ', '\t']);
     if line.is_empty() {
         Some(DelimiterEnd::Cut)
     } else if line.starts_with("\r\n") || line.starts_with('\n') {
@@ -570,8 +575,7 @@ fn redact_multipart(
             DelimiterEnd::Cut => {
                 return scan_cut_rest(out, text, delim.start, truncated, redact_fields);
             }
-            DelimiterEnd::Closing => {
-                let close_end = after + 2;
+            DelimiterEnd::Closing { close_end } => {
                 out.push_str(text.get(delim.start..close_end)?);
                 // The epilogue runs to the next delimiter line, when the sender put one
                 // there, or to the end. Parts after it are still read as parts.
@@ -636,12 +640,10 @@ fn redact_multipart(
 /// Finds the blank line that ends the part headers in `part`. Returns its offset and its
 /// length, which is 2 for `\n\n` and 3 for `\n\r\n`.
 fn blank_line(part: &str) -> Option<(usize, usize)> {
-    match (part.find("\n\r\n"), part.find("\n\n")) {
-        (Some(crlf), Some(lf)) if lf < crlf => Some((lf, 2)),
-        (Some(crlf), _) => Some((crlf, 3)),
-        (None, Some(lf)) => Some((lf, 2)),
-        (None, None) => None,
-    }
+    // The two cannot start at the same offset, so the smaller offset decides.
+    let lf = part.find("\n\n").map(|at| (at, 2));
+    let crlf = part.find("\n\r\n").map(|at| (at, 3));
+    [lf, crlf].into_iter().flatten().min()
 }
 
 /// Appends the rest of a cut body from `pos`, scanned as text. This is for text that could
@@ -2205,27 +2207,31 @@ mod tests {
     }
 
     #[rstest]
-    #[case::closing("--x", Some(DelimiterEnd::Closing))]
-    #[case::cut_at_the_end("", Some(DelimiterEnd::Cut))]
-    #[case::cut_after_spaces_and_tabs("  \t", Some(DelimiterEnd::Cut))]
-    #[case::crlf_line("\r\nx", Some(DelimiterEnd::Line))]
-    #[case::lf_line_after_spaces("  \t\nx", Some(DelimiterEnd::Line))]
-    #[case::text_is_content("x", None)]
-    #[case::space_then_text_is_content(" x", None)]
-    #[case::single_dash_is_content("-", None)]
-    #[case::cr_alone_is_content("\r", None)]
+    #[rstest]
+    #[case::closing("--x", 0, Some(DelimiterEnd::Closing { close_end: 2 }))]
+    #[case::closing_at_an_offset("x--", 1, Some(DelimiterEnd::Closing { close_end: 3 }))]
+    #[case::cut_at_the_end("", 0, Some(DelimiterEnd::Cut))]
+    #[case::cut_after_spaces_and_tabs("  \t", 0, Some(DelimiterEnd::Cut))]
+    #[case::crlf_line("\r\nx", 0, Some(DelimiterEnd::Line))]
+    #[case::lf_line_after_spaces("  \t\nx", 0, Some(DelimiterEnd::Line))]
+    #[case::text_is_content("x", 0, None)]
+    #[case::space_then_text_is_content(" x", 0, None)]
+    #[case::single_dash_is_content("-", 0, None)]
+    #[case::cr_alone_is_content("\r", 0, None)]
     fn delimiter_end_reads_what_follows_the_boundary(
-        #[case] after: &str,
+        #[case] text: &str,
+        #[case] after: usize,
         #[case] expected: Option<DelimiterEnd>,
     ) {
-        assert_eq!(delimiter_end(after), expected);
+        assert_eq!(delimiter_end(text, after), expected);
     }
 
     #[rstest]
     #[case::delimiter_at_the_start("--BB\r\nx", 0, Some(Delimiter { start: 0, end: DelimiterEnd::Line }))]
     #[case::boundary_not_after_a_newline("x--BB\r\n", 0, None)]
-    #[case::boundary_followed_by_text_is_skipped("--BBx\n--BB--", 0, Some(Delimiter { start: 6, end: DelimiterEnd::Closing }))]
+    #[case::boundary_followed_by_text_is_skipped("--BBx\n--BB--", 0, Some(Delimiter { start: 6, end: DelimiterEnd::Closing { close_end: 12 } }))]
     #[case::search_starts_after_the_given_offset("--BB\r\n--BB\r\n", 4, Some(Delimiter { start: 6, end: DelimiterEnd::Line }))]
+    #[case::start_of_text_is_not_a_delimiter_after_the_start("--BB\r\n", 1, None)]
     #[case::cut_after_spaces("\n--BB \t", 0, Some(Delimiter { start: 1, end: DelimiterEnd::Cut }))]
     fn find_delimiter_accepts_only_lines_that_are_delimiters(
         #[case] text: &str,
@@ -2233,6 +2239,38 @@ mod tests {
         #[case] expected: Option<Delimiter>,
     ) {
         assert_eq!(find_delimiter(text, "--BB", "\n--BB", from), expected);
+    }
+
+    #[rstest]
+    #[case::lf("a\n\nb", Some((1, 2)))]
+    #[case::crlf("a\n\r\nb", Some((1, 3)))]
+    #[case::lf_before_crlf("a\n\nb\n\r\n", Some((1, 2)))]
+    #[case::crlf_before_lf("a\n\r\nb\n\n", Some((1, 3)))]
+    #[case::no_blank_line("a\nb\r\n", None)]
+    fn blank_line_finds_the_first_blank_line_of_either_kind(
+        #[case] part: &str,
+        #[case] expected: Option<(usize, usize)>,
+    ) {
+        assert_eq!(blank_line(part), expected);
+    }
+
+    #[rstest]
+    #[case::filename("filename", true)]
+    #[case::upper_case("FILENAME", true)]
+    #[case::filename_star("filename*", true)]
+    #[case::continuation("filename*0", true)]
+    #[case::encoded_continuation("filename*0*", true)]
+    #[case::filenames("filenames", false)]
+    #[case::filename_underscore("filename_", false)]
+    #[case::name("name", false)]
+    #[case::file("file", false)]
+    #[case::other_eight_letters_then_a_star("abcdefgh*", false)]
+    #[case::prefixed_filename("xfilename", false)]
+    fn is_file_part_key_accepts_filename_and_its_continuations(
+        #[case] key: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(is_file_part_key(key), expected);
     }
 
     #[test]
