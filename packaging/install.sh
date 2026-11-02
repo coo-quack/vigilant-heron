@@ -179,10 +179,11 @@ cat <<NEXT
 installed vigilant-heron. The service is not started.
 
 Next steps:
-  1. Edit $CONF_FILE. Add the pid line that the unit expects, a log file for
-     rotation, and your sites:
+  1. Edit $CONF_FILE. Add the pid line that the unit expects, a JSON access log
+     (the guide's tools, shadow-report and suggest-skip-rules, read the json
+     format), and your sites:
        pid /run/vigilant-heron/vigilant-heron.pid;
-       access_log /var/log/vigilant-heron/access.log main;
+       access_log /var/log/vigilant-heron/access.json json;
   2. Put the API token in $ENV_FILE, for example TYPESAFE_API_KEY=...
   3. sudo systemctl daemon-reload
   4. sudo systemctl enable --now vigilant-heron

@@ -12,6 +12,7 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use rstest::rstest;
 use rustix::process::{Pid, test_kill_process};
 
 /// The binary under test.
@@ -2033,27 +2034,56 @@ fn test_request_url_and_a_request_file_together_are_refused() -> Result<(), std:
     Ok(())
 }
 
-#[test]
-fn test_request_works_without_the_token_variable_and_warns() -> Result<(), std::io::Error> {
-    let dir = test_dir("test-request-token-missing")?;
+/// `test-request` passes with a warning when the token variable is unset, for the same request
+/// given as a file or as a `--url`. The report must name the target `/items?id=1`, so a wrong
+/// URL parse fails the test.
+#[rstest]
+#[case::from_a_file(false)]
+#[case::from_a_url(true)]
+fn test_request_works_without_the_token_variable_and_warns(
+    #[case] from_url: bool,
+) -> Result<(), std::io::Error> {
+    let dir = test_dir(if from_url {
+        "test-request-url-token-missing"
+    } else {
+        "test-request-file-token-missing"
+    })?;
     let conf = write_file(&dir, "router.conf", &jev_config("VH_TEST_ABSENT_TOKEN"))?;
-    let file = write_file(
-        &dir,
-        "plain.txt",
-        "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
-    )?;
-    let output = run_without_token(
-        &[
-            "test-request",
-            file.to_str().unwrap_or_default(),
-            "-c",
-            conf.to_str().unwrap_or_default(),
-        ],
-        "VH_TEST_ABSENT_TOKEN",
-    )?;
+    let conf_arg = conf.to_str().unwrap_or_default();
+    let output = if from_url {
+        run_without_token(
+            &[
+                "test-request",
+                "--url",
+                "https://example.com/items?id=1",
+                "-c",
+                conf_arg,
+            ],
+            "VH_TEST_ABSENT_TOKEN",
+        )?
+    } else {
+        let file = write_file(
+            &dir,
+            "plain.txt",
+            "GET /items?id=1 HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        )?;
+        run_without_token(
+            &[
+                "test-request",
+                file.to_str().unwrap_or_default(),
+                "-c",
+                conf_arg,
+            ],
+            "VH_TEST_ABSENT_TOKEN",
+        )?
+    };
     let stdout = stdout_of(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains(r#"request: GET "/items?id=1" (Host: "example.com", client: 127.0.0.1)"#),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("would be sent to the decision backend (jev, model jev-latest)"),
         "{stdout}"

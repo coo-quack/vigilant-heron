@@ -6,6 +6,8 @@ Run each site in `mode shadow;` until the log shows what the router would block,
 
 ## 1. Before you start
 
+On a Linux server, install the release with the packaged `install.sh`. It also installs the systemd unit and the logrotate file, and it sets the log directory's permissions that phase 3 checks. [Run as a service with systemd](/install#run-as-a-service-with-systemd) describes the script's steps.
+
 ### What the site serves and who uses it
 
 1. List what the site serves: static files (images, CSS, JavaScript), scripts, forms and uploads.
@@ -20,7 +22,7 @@ Run each site in `mode shadow;` until the log shows what the router would block,
 
 5. Choose a decision backend. This is the model that judges each request. [Decision backends](/decision-backends) lists the choices.
 6. Measure the backend's latency from the server that will run the router, not from your workstation. The p99 is the time that 99 in 100 answers beat. Two figures from one rollout, both measured from the router's server: one backend had a median of about 130 ms and a maximum under 200 ms, and the other had a p99 of about 1.8 s. With a p99 of 1.8 s, at least 1 request in 100 takes longer than the 1000 ms `timeout` in step 7, so those requests fall back to `on_decision_error`.
-7. Set `timeout` from your measurements. Every judged request waits for the backend, up to `timeout`, even when the answer is slow:
+7. Set `timeout` from your measurements. The default is 2000 ms; [`timeout`](/configuration#timeout) describes it. Every judged request waits for the backend, up to `timeout`, even when the answer is slow:
 
    ```nginx
    decision {
@@ -39,6 +41,8 @@ Run each site in `mode shadow;` until the log shows what the router would block,
 ### How good the backend is on your traffic
 
 11. Run the labelled evaluation with your backend, as [Evaluation](/evaluation) describes. When the shadow log shows a request near the threshold, add it as a row. The format is in [`eval/README.md`](https://github.com/coo-quack/vigilant-heron/blob/develop/eval/README.md).
+
+Until `TYPESAFE_API_KEY` is set, `-t` and `test-request --url` still pass. They print a warning and carry on, but the router does not start without the key. [Check a URL with test-request](/cli#check-a-url-with-test-request) shows the output.
 
 **Before you move on:**
 
@@ -84,26 +88,26 @@ Watch the trial for several days, including the owner's admin work, scheduled jo
 
 Each request gets one JSON line, and every value is a string. A `would_have` block therefore appears as `"would_have":"block"`, with no space after the colon. [Logging](/logging#the-built-in-formats) describes the fields.
 
+`shadow-report` gives most of these figures in one plain-text summary. Run it on the rotated log and the current log together, as [Summarize a shadow log](/cli#summarize-a-shadow-log) describes:
+
+```console
+$ vigilant-heron shadow-report /var/log/vigilant-heron/access.json.1 /var/log/vigilant-heron/access.json
+```
+
+The report prints paths from the log, which can carry tokens, so read it before you paste any part of it.
+
 Look at these things:
 
 1. **Counts by `reason` and `decision_error`.** A large count in one reason shows where most traffic goes.
-2. **Every `would_have=block` line.** Find them with `grep -c '"would_have":"block"' access.json`, then read the last few lines with `tail`.
+2. **Every `would_have=block` line.** Find them with `grep -c '"would_have":"block"' access.json`, then read the last few lines with `tail`. The report lists only the first 50 blocked or redirected lines, in log order.
 3. **Decision errors per hour.** Timeouts in an hour with little load point to the provider, not to the site.
 4. **`client_busy` bursts per minute and per client.** `client_busy` is the router's refusal when one client already has its share of backend calls in flight. One browser that loads many assets at once can cause it. Phases 4 and 5 show the fixes.
 5. **The p99 of `latency_ms`**, compared with your `timeout`.
 6. **`input_tokens`**, to replace the estimate from phase 1.
 
-Tell your own traffic from attacks by what the requests do, not by IP address. Your browsers send recognizable User-Agent values, and an admin workflow has a recognizable order: a login, an edit, then an upload. IP addresses change, and a cloud provider's address shows no partner, since anyone can rent one. To see the User-Agent, add a second log beside the JSON log. Keep the JSON log too, because `suggest-skip-rules` reads only that format. Both lines go at the top level of the router's configuration:
+Tell your own traffic from attacks by what the requests do, not by IP address. Your browsers send recognizable User-Agent values, and an admin workflow has a recognizable order: a login, an edit, then an upload. IP addresses change, and a cloud provider's address shows no partner, since anyone can rent one. The built-in `json` format has a `user_agent` key, so the JSON log shows the User-Agent beside each request. Keep that log, because `suggest-skip-rules` reads the JSON format.
 
-```nginx
-# the router's configuration, at the top level
-log_format review escape=json "$time_iso8601 $client_ip $site $method $path $query_shape $status $reason $decision_error $would_have $http_user_agent";
-
-access_log /var/log/vigilant-heron/access.json json;   # for suggest-skip-rules
-access_log /var/log/vigilant-heron/review.log review;  # adds the User-Agent
-```
-
-By default the log keeps only `query_shape`, such as `id=<num>&s=<text>`, never the values. The `$path` field is different: the router logs the path as the client sent it, so a token in a path, such as a password-reset link, appears in the log. Keep the logs private. The log directory should be `750` and owned by the router's user and the `adm` group, and the files `640`, as the `packaging/` install script and logrotate file set them:
+By default the log keeps only `query_shape`, such as `id=<num>&s=<text>`, never the values. The `$path` field is different: the router logs the path as the client sent it, so a token in a path, such as a password-reset link, appears in the log. Keep the logs private. The `packaging/` install script sets the log directory to `750`, owned by the router's user and the `adm` group. The files get `640` from the unit's `UMask=0027` and from logrotate's `create 640`:
 
 ```console
 $ sudo install -d -m 750 -o vigilant-heron -g adm /var/log/vigilant-heron
@@ -111,7 +115,7 @@ $ ls -ld /var/log/vigilant-heron    # expect drwxr-x---
 $ ls -l /var/log/vigilant-heron     # expect -rw-r----- for each log file
 ```
 
-To review a block, find the web server's own log line for the same second, client and path.
+To review a block, find the web server's own log line for the same second, client and path. To see what a blocked request carried, add `$block_query` to a `log_format` of your own. The value is redacted like the event sent to the backend, but a query can still carry personal data, so the built-in formats leave it out; [`$block_query`](/logging#block-query) has an example.
 
 **Before you move on:**
 
@@ -142,7 +146,9 @@ rule skip-product-page {
 
 The `site` line limits the rule to `example.com`. A rule without a `site` line applies to every site, so add one unless you mean that.
 
-Put the rule in a file under `rules.d/`, include that file, and check the configuration with `vigilant-heron -t`. It reports the file and line of any error. `-t` and [`test-request`](/cli#check-a-request-with-test-request), which reports what the router would do with a saved request, print a warning when `TYPESAFE_API_KEY` is not set, and do not fail. The router itself does not start without the variable, so set it before you start the router. See [Rules](/rules#write-your-own-rule).
+For a WordPress site, start from [`examples/rules.d/wordpress.conf`](https://github.com/coo-quack/vigilant-heron/blob/develop/examples/rules.d/wordpress.conf), whose [four rules](/rules#wordpress-rules) apply to every site until you add a `site` line to each. Copy the file, narrow each rule to the request shapes your site sends, and test each one as below.
+
+Put the rule in a file under `rules.d/`, include that file, and check the configuration with `vigilant-heron -t`. It reports the file and line of any error. See [Rules](/rules#write-your-own-rule).
 
 Keep these facts in mind. A skip rule never overrides a block rule, because the built-in block rules run first. A skipped request is not seen by the model at all, headers and cookies included.
 
@@ -151,6 +157,8 @@ Test each rule before you reload. Run `test-request` on a request the rule must 
 ```console
 $ vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf test-request near-miss-extra.http
 ```
+
+To test a URL without writing a file, use `test-request --url`, as [Check a URL with test-request](/cli#check-a-url-with-test-request) shows.
 
 `suggest-skip-rules` lists candidates from the JSON log. Its thresholds are strict, so on a small site it may print nothing. It changes no file, so review each candidate before you copy it. See [Learn skip rules from the access log](/cli#learn-skip-rules-from-the-access-log).
 
@@ -302,7 +310,7 @@ The way back is rehearsed before enforce, while the router is still in shadow mo
    $ sudo ln -sfn /etc/nginx/vh/router.conf /etc/nginx/vh/upstream.conf && sudo nginx -t && sudo nginx -s reload
    ```
 
-3. **Switch to enforce.** Only after step 2 passes, change `mode shadow;` to `mode enforce;`, check the file, and reload. A reload applies the new file to new requests, and requests already in flight finish with the configuration they started with:
+3. **Switch to enforce.** Only after step 2 passes, change `mode shadow;` to `mode enforce;`, check the file, and reload. Before the reload, `test-request --url` reports what the router would do with a known attack, without calling the backend; [Check a URL with test-request](/cli#check-a-url-with-test-request) shows the report. A reload applies the new file to new requests, and requests already in flight finish with the configuration they started with:
 
    ```console
    $ vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf
@@ -317,7 +325,7 @@ The way back is rehearsed before enforce, while the router is still in shadow mo
    $ curl -i "https://example.com/?id=1%20UNION%20SELECT%20password%20FROM%20users"
    ```
 
-   Have the owner log in, save a post, upload a file within the limit, and use the admin screens. Check the log for any block or 429 from these actions. A 429 is the `client_busy` refusal, which `on_client_busy` sends by default.
+   Have the owner log in, save a post, upload a file within the limit, and use the admin screens. Check the log for any block or 429 from these actions. A 429 is the `client_busy` refusal, which `on_client_busy` sends by default. A visitor who reports a block can quote its request id: the blocked response carries it in an `X-Request-ID` header, and the JSON log has it as `request_id`. To log an id that a proxy already sets, name that header in [`request_id_header`](/configuration#request-id-header).
 
 5. **Know the two ways back after enforce.** Set `mode shadow;` and reload, which keeps the router in the path and recording. Or point the symlink at `direct.conf` and reload nginx, which takes the router out of the path.
 
@@ -333,7 +341,7 @@ The way back is rehearsed before enforce, while the router is still in shadow mo
 ## 7. Principles for running it safely
 
 - **Layers.** Put a CDN or an edge web application firewall (WAF, a filter of attack patterns) first, then the web server's deny rules, the router's rules and the model. The model only adds blocks, and no model answer can turn a rule block into an allow.
-- **What the backend receives.** The router removes credential headers, redacts sensitive fields, and sends only the first `inspect_body` bytes of a body. Uploads can still carry personal data, such as a location in a photo's metadata. Name such fields with `redact_field` in the `decision` block, for example `redact_field gps_position;`. For a body within `inspect_body`, the part's value is replaced by `[REDACTED]`. For a file upload, that value is the file bytes. The part's headers, including the file name and content type, are still sent.
+- **What the backend receives.** The router removes credential headers, redacts sensitive fields, and sends only the first `inspect_body` bytes of a body. In a multipart body longer than that, the parts before the cut, and the part the cut falls in, are still redacted by name, so a `password` value is not sent. A file upload's content is replaced by `[REDACTED]` by default (`redact_file_parts`), so the metadata in a photo, such as its location, is not sent; the part's headers, including the file name and content type, still are. A personal field that is not sensitive by name, such as a location typed into a form, must be listed in `redact_field` in the `decision` block, for example `redact_field gps_position;`.
 - **Defaults that favor availability.** A failed decision forwards the request, and a client over its share is refused, as phase 1 explains. For the few paths where a missed attack costs more than a refused visitor, such as a login page, set `fail_closed_path`. A request on those paths is blocked whenever the decision fails:
 
   ```nginx
