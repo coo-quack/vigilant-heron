@@ -659,7 +659,7 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params) or, when [`static_query_token`](#static-query-token) `on` is set, only one bare token) and no body that skip the backend. When given, the list replaces the defaults. Repeatable.
+File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params) or, when [`static_query_token`](#static-query-token) `on` is set, only one bare token) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. An empty list (`static_extensions;`) turns the static skip off for the site.
 
 A static-looking path is inspected, and goes to the backend, when any of these holds:
 
