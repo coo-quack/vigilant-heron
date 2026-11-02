@@ -15,6 +15,8 @@ use std::io::{self, BufRead};
 
 use serde_json::Value;
 
+use crate::log_lines::{Line, for_each_line, is_block, number_field, object_line, text_field};
+
 /// The filter and thresholds of one run. The defaults are the thresholds that the documentation states.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SuggestOptions {
@@ -171,40 +173,37 @@ impl Group {
 
 /// Learns skip-rule candidates from the lines of a `json` access log.
 ///
-/// `input` holds the log, one request per line. It is read one line at a time, so a
-/// large log is never held in memory whole. A line that is not valid UTF-8 is read
-/// with the invalid bytes replaced. Lines that are not usable are counted and otherwise
-/// ignored.
+/// `input` holds the log, one request per line. Each line is read on its own, and a
+/// line over the length limit is counted as unusable without being kept. A line that is
+/// not valid UTF-8 is read with the invalid bytes replaced. Lines that are not usable are
+/// counted and otherwise ignored.
 ///
 /// # Errors
 ///
 /// Returns the error of a failed read from `input`.
 pub fn suggest_skip_rules<R: BufRead>(
-    mut input: R,
+    input: R,
     options: &SuggestOptions,
 ) -> io::Result<SuggestReport> {
     let mut total_lines = 0;
     let mut unusable_lines = 0;
     let mut groups: BTreeMap<GroupKey, Group> = BTreeMap::new();
-    let mut buffer = Vec::new();
-    loop {
-        buffer.clear();
-        if input.read_until(b'\n', &mut buffer)? == 0 {
-            break;
-        }
-        let line = String::from_utf8_lossy(&buffer);
-        let line = line.trim_end_matches(['\n', '\r']);
+    for_each_line(input, |line| {
         total_lines += 1;
-        let Some(value) = usable_line(line) else {
+        let Line::Text(text) = line else {
             unusable_lines += 1;
-            continue;
+            return;
+        };
+        let Some(value) = usable_line(text) else {
+            unusable_lines += 1;
+            return;
         };
         let key = group_key(&value);
         if options.site.as_deref().is_some_and(|site| site != key.site) {
-            continue;
+            return;
         }
         groups.entry(key).or_default().add(&value);
-    }
+    })?;
 
     let mut found: Vec<(Candidate, Option<String>)> = Vec::new();
     let mut skipped_shapes = 0;
@@ -248,10 +247,7 @@ pub fn suggest_skip_rules<R: BufRead>(
 
 /// Parses one line. Returns the object when it is a JSON object with a `query_shape` string.
 fn usable_line(line: &str) -> Option<Value> {
-    let value: Value = serde_json::from_str(line).ok()?;
-    if !value.is_object() {
-        return None;
-    }
+    let value = object_line(line)?;
     value.get("query_shape").and_then(Value::as_str)?;
     Some(value)
 }
@@ -264,27 +260,6 @@ fn group_key(value: &Value) -> GroupKey {
         path: text_field(value, "path").to_owned(),
         query_shape: text_field(value, "query_shape").to_owned(),
     }
-}
-
-/// A string field, or the empty string when it is missing or not a string.
-fn text_field<'a>(value: &'a Value, name: &str) -> &'a str {
-    value.get(name).and_then(Value::as_str).unwrap_or("")
-}
-
-/// A number field. The `json` format writes scores as strings, so a string is parsed
-/// too. An empty or non-numeric value gives `None`.
-fn number_field(value: &Value, name: &str) -> Option<f64> {
-    let number = match value.get(name)? {
-        Value::String(text) => text.parse::<f64>().ok()?,
-        Value::Number(number) => number.as_f64()?,
-        _ => return None,
-    };
-    number.is_finite().then_some(number)
-}
-
-/// Whether an action or `would_have` value blocks the request.
-fn is_block(text: &str) -> bool {
-    matches!(text, "block" | "redirect")
 }
 
 /// The report entry of a group.
@@ -487,6 +462,7 @@ impl fmt::Display for SuggestReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EndsOnce;
     use rstest::rstest;
     use serde_json::json;
 
@@ -537,7 +513,7 @@ mod tests {
             .map(Value::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        suggest_skip_rules(text.as_bytes(), &SuggestOptions::default())
+        suggest_skip_rules(EndsOnce::new(text.as_bytes()), &SuggestOptions::default())
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"))
     }
 
@@ -618,8 +594,9 @@ mod tests {
             usable.as_str(),
         ]
         .join("\n");
-        let report = suggest_skip_rules(input.as_bytes(), &SuggestOptions::default())
-            .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
+        let report =
+            suggest_skip_rules(EndsOnce::new(input.as_bytes()), &SuggestOptions::default())
+                .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         assert_eq!(report.total_lines, 6, "{report}");
         assert_eq!(report.unusable_lines, 5, "{report}");
         assert_eq!(report.usable_lines, 1, "{report}");
@@ -785,7 +762,7 @@ mod tests {
             .map(Value::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        let report = suggest_skip_rules(text.as_bytes(), &options)
+        let report = suggest_skip_rules(EndsOnce::new(text.as_bytes()), &options)
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         assert_eq!(report.candidates.len(), 1, "{report}");
         assert_eq!(
@@ -825,7 +802,7 @@ mod tests {
 
     #[test]
     fn an_empty_run_says_no_shape_meets_the_thresholds() {
-        let report = suggest_skip_rules("".as_bytes(), &SuggestOptions::default())
+        let report = suggest_skip_rules(EndsOnce::new("".as_bytes()), &SuggestOptions::default())
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         let text = report.to_string();
         assert!(
@@ -844,7 +821,7 @@ mod tests {
         let lines = spread(50, 10, 3, "0.1", "0.1");
         let text = run(&lines).to_string();
         assert!(text.contains("Candidates: 1\nA learned rule forwards matching requests without the model, so the model no longer judges their headers or body. Block rules, built-in and your own, still run first.\n") , "{text}");
-        let empty = suggest_skip_rules("".as_bytes(), &SuggestOptions::default())
+        let empty = suggest_skip_rules(EndsOnce::new("".as_bytes()), &SuggestOptions::default())
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"))
             .to_string();
         assert!(!empty.contains("forwards matching requests"), "{empty}");
@@ -869,7 +846,7 @@ mod tests {
         };
         let line = judged_value(1, 0, "GET", "/", "p=<num>", "", "");
         let text = line.to_string();
-        let report = suggest_skip_rules(text.as_bytes(), &options)
+        let report = suggest_skip_rules(EndsOnce::new(text.as_bytes()), &options)
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         assert!(report.candidates.is_empty(), "{report}");
         assert!(report.needs_review.is_empty(), "{report}");

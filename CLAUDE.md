@@ -52,6 +52,8 @@ src/
   request_id.rs  # Request ids: the request-id header value or a generated id, and the X-Request-ID response header
   request_url.rs # test-request --url: builds the raw request from a URL, --host, --method and --header
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
+  log_lines.rs   # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
+  shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
   sanitize.rs    # Backend event: header drop, body redaction, truncation
   decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
@@ -64,7 +66,7 @@ src/
   error.rs       # Error types
   test_support.rs # Builds sites and configurations for the unit tests
 benches/
-  hot_path.rs    # Criterion benchmarks of the hot path through the public API (check_request, suggest_skip_rules, config loading)
+  hot_path.rs    # Criterion benchmarks of the hot path through the public API (check_request, suggest_skip_rules, shadow_report, config loading)
 tests/
   router.rs      # In-process integration tests with stub upstream and backend
   clef.rs        # In-process tests of the Clef backend against a fake endpoint

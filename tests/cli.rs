@@ -2375,3 +2375,465 @@ fn start_reports_a_router_that_exited_while_starting_without_waiting_out_the_tim
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// shadow-report: summarize json access logs from a shadow trial
+// ---------------------------------------------------------------------------
+
+/// One `json` access log line from client `client` at `time`, with the given fields set.
+/// The other fields are empty strings, as the router writes them.
+fn shadow_line(time: &str, client: &str, fields: &[(&str, &str)]) -> String {
+    let mut object = serde_json::Map::new();
+    for name in [
+        "request_id",
+        "site",
+        "host",
+        "query_shape",
+        "status",
+        "rule_id",
+        "would_have",
+        "attack",
+        "ai_instruction",
+        "category",
+        "decision_error",
+        "retry_after",
+        "input_tokens",
+        "latency_ms",
+    ] {
+        object.insert(name.to_owned(), serde_json::json!(""));
+    }
+    object.insert("time".to_owned(), serde_json::json!(time));
+    object.insert("client_ip".to_owned(), serde_json::json!(client));
+    object.insert("method".to_owned(), serde_json::json!("GET"));
+    object.insert("path".to_owned(), serde_json::json!("/"));
+    object.insert("action".to_owned(), serde_json::json!("allow"));
+    object.insert("reason".to_owned(), serde_json::json!("model"));
+    for (name, value) in fields {
+        object.insert((*name).to_owned(), serde_json::json!(value));
+    }
+    serde_json::Value::Object(object).to_string()
+}
+
+/// A blocked request on `path` at `time` from `client`, as a shadow trial logs it.
+fn blocked_shadow_line(time: &str, client: &str, path: &str) -> String {
+    shadow_line(
+        time,
+        client,
+        &[("action", "block"), ("path", path), ("rule_id", "wp-login")],
+    )
+}
+
+/// Runs `shadow-report` on the given log files, with the environment as the test sets it.
+fn shadow_report_run(paths: &[&Path], extra: &[&str]) -> Result<Output, std::io::Error> {
+    let mut args = vec!["shadow-report"];
+    let names: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    args.extend(names.iter().map(String::as_str));
+    args.extend_from_slice(extra);
+    run(&args)
+}
+
+#[test]
+fn shadow_report_prints_a_plain_text_report_for_one_log() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            &[("attack", "0.1")],
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(output.stderr.is_empty(), "{}", text(&output));
+    assert!(stdout.contains("Files read: 1\n"), "{stdout}");
+    assert!(
+        stdout.contains("Per day (UTC):\n  2026-11-02  lines 1  backend calls 1"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_ignores_a_missing_configuration_file() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-env")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/wp-login.php"),
+    )?;
+    let output = run_env(
+        &["shadow-report", log.to_str().unwrap_or_default()],
+        &[("VIGILANT_HERON_CONFIG", "/nonexistent/vigilant-heron.conf")],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout_of(&output).contains("Blocked or redirected lines: 1"),
+        "{}",
+        text(&output)
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_contacts_no_backend() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-backend")?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let port = listener.local_addr()?.port();
+    let conf = write_file(
+        &dir,
+        "router.conf",
+        &format!(
+            "listen 127.0.0.1:0;\ndecision {{\n    backend http;\n    url http://127.0.0.1:{port}/decide;\n}}\nsite example.com {{\n    upstream http://127.0.0.1:9;\n}}\n"
+        ),
+    )?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            &[("attack", "0.1")],
+        ),
+    )?;
+    let output = run_env(
+        &["shadow-report", log.to_str().unwrap_or_default()],
+        &[("VIGILANT_HERON_CONFIG", conf.to_str().unwrap_or_default())],
+    )?;
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "the report connected to the decision backend"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_refuses_the_config_flag() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-config")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[]),
+    )?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let output = run(&[
+        "shadow-report",
+        log.to_str().unwrap_or_default(),
+        "-c",
+        conf.to_str().unwrap_or_default(),
+    ])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shadow-report reads only the access logs; -c is not used"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_needs_at_least_one_log_file() -> Result<(), std::io::Error> {
+    let output = run(&["shadow-report"])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("shadow-report needs at least one access log file"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_exits_one_and_names_a_file_it_cannot_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-missing")?;
+    let missing = dir.join("rotated-away.json");
+    let output = shadow_report_run(&[&missing], &[])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot read the access log"), "{stderr}");
+    assert!(stderr.contains("rotated-away.json"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_reads_several_files_in_the_order_given() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-order")?;
+    let older = write_file(
+        &dir,
+        "access.json.1",
+        &blocked_shadow_line("2026-11-01T23:00:00+00:00", "192.0.2.77", "/first"),
+    )?;
+    let newer = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line("2026-11-02T01:00:00+00:00", "192.0.2.77", "/second"),
+    )?;
+    let output = shadow_report_run(&[&older, &newer], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("Files read: 2\n"), "{stdout}");
+    let first = stdout.find(" /first ").unwrap_or(usize::MAX);
+    let second = stdout.find(" /second ").unwrap_or(usize::MAX);
+    assert!(first < second, "{stdout}");
+
+    let reversed = shadow_report_run(&[&newer, &older], &[])?;
+    let stdout = stdout_of(&reversed);
+    let first = stdout.find(" /first ").unwrap_or(usize::MAX);
+    let second = stdout.find(" /second ").unwrap_or(usize::MAX);
+    assert!(second < first, "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_shortens_client_addresses_by_default() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-short")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &format!(
+            "{}\n{}",
+            blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"),
+            blocked_shadow_line("2026-11-02T10:00:01+00:00", "2001:db8:1:2::5", "/b")
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" 192.0.2.x GET /a "), "{stdout}");
+    assert!(stdout.contains(" 2001:db8:1:: GET /b "), "{stdout}");
+    assert!(!stdout.contains("192.0.2.77"), "{stdout}");
+    assert!(!stdout.contains("2001:db8:1:2::5"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_full_addresses_prints_them_in_full() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-full")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"),
+    )?;
+    let output = shadow_report_run(&[&log], &["--full-addresses"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" 192.0.2.77 GET /a "), "{stdout}");
+    assert!(!stdout.contains("192.0.2.x"), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_lists_at_most_fifty_lines_by_default() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-default-lines")?;
+    let lines: Vec<String> = (0..51)
+        .map(|_| blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"))
+        .collect();
+    let log = write_file(&dir, "access.json", &lines.join("\n"))?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Blocked or redirected lines: 51 (listing the first 50; 1 more not shown, use --max-lines to list more)"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches(" GET /a ").count(), 50, "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_max_lines_sets_how_many_lines_are_listed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-max-lines")?;
+    let lines: Vec<String> = (0..3)
+        .map(|_| blocked_shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", "/a"))
+        .collect();
+    let log = write_file(&dir, "access.json", &lines.join("\n"))?;
+    let output = shadow_report_run(&[&log], &["--max-lines", "2"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Blocked or redirected lines: 3 (listing the first 2; 1 more not shown, use --max-lines to list more)"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches(" GET /a ").count(), 2, "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_estimates_the_cost_with_usd_per_mtok() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-price")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            &[("input_tokens", "2000000")],
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &["--usd-per-mtok=3"])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains("Input tokens: 2000000\n"), "{stdout}");
+    assert!(
+        stdout.contains("Estimated input cost: $6.0000 at $3 per million input tokens"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_counts_a_line_that_is_not_json_as_malformed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-malformed")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &format!(
+            "not json at all\n{}\n",
+            shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[])
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 2 (1 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_does_not_decompress_a_gzip_file() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-gzip")?;
+    let mut bytes = vec![0x1f_u8, 0x8b, 0x08, 0x00];
+    bytes.extend_from_slice(b"\x00\x00\x00\x00\x00\x03compressed body\n");
+    let log = dir.join("access.json.gz");
+    std::fs::write(&log, bytes)?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 1 (0 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn shadow_report_exits_one_and_names_a_directory_it_cannot_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-directory")?;
+    let output = shadow_report_run(&[&dir], &[])?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(output.stdout.is_empty(), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot read the access log"), "{stderr}");
+    assert!(stderr.contains(&dir.display().to_string()), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_prints_paths_as_the_log_has_them() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-path")?;
+    let log = write_file(
+        &dir,
+        "access.json",
+        &blocked_shadow_line(
+            "2026-11-02T10:00:00+00:00",
+            "192.0.2.77",
+            "/reset/tok_8f3a91",
+        ),
+    )?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(stdout.contains(" GET /reset/tok_8f3a91 "), "{stdout}");
+    Ok(())
+}
+
+#[test]
+fn shadow_report_counts_a_line_longer_than_one_mib_as_malformed() -> Result<(), std::io::Error> {
+    let dir = test_dir("shadow-report-long-line")?;
+    let mut bytes = vec![b'x'; 1024 * 1024 + 1];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(shadow_line("2026-11-02T10:00:00+00:00", "192.0.2.77", &[]).as_bytes());
+    bytes.push(b'\n');
+    let log = dir.join("access.json");
+    std::fs::write(&log, bytes)?;
+    let output = shadow_report_run(&[&log], &[])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Lines read: 2 (1 JSON objects, 1 malformed lines skipped)"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+/// Runs the binary with `args`, with standard input read from `stdin`.
+fn run_with_stdin(args: &[&str], stdin: std::fs::File) -> Result<Output, std::io::Error> {
+    Command::new(BIN)
+        .args(args)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .stdin(stdin)
+        .output()
+}
+
+#[test]
+fn suggest_skip_rules_counts_a_line_longer_than_one_mib_as_unusable() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("suggest-long-line")?;
+    let mut bytes = vec![b'x'; 1024 * 1024 + 1];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(
+        br#"{"time":"2026-01-01T10:00:00Z","site":"example.com","method":"GET","path":"/","query_shape":"p=<num>"}"#,
+    );
+    bytes.push(b'\n');
+    let log = dir.join("access.json");
+    std::fs::write(&log, bytes)?;
+    let output = run(&["suggest-skip-rules", log.to_str().unwrap_or_default()])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Read 2 lines: 1 with query_shape, 1 without"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn suggest_skip_rules_names_standard_input_when_it_cannot_be_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-stdin-error")?;
+    // A directory opens as standard input, but reading it fails.
+    let output = run_with_stdin(&["suggest-skip-rules", "-"], std::fs::File::open(&dir)?)?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read the access log standard input"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("access log -"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_request_names_standard_input_when_it_cannot_be_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-stdin-error")?;
+    let output = run_with_stdin(&["test-request", "-"], std::fs::File::open(&dir)?)?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read the request file standard input"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("request file -"), "{stderr}");
+    Ok(())
+}
