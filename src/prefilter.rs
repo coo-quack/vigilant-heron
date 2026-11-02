@@ -35,8 +35,14 @@ const DYNAMIC_EXTENSIONS: [&str; 10] = [
 ];
 
 /// Raw path text that makes a path unsafe for a static skip: a parameter separator,
-/// a backslash, or an encoded `/`, `\` or `;`. Compared in lowercase.
-const UNSAFE_RAW_MARKERS: [&str; 5] = [";", "\\", "%2f", "%5c", "%3b"];
+/// a backslash, or an encoded `/`, `\`, `;`, `?`, `#` or NUL. Compared in lowercase.
+const UNSAFE_RAW_MARKERS: [&str; 8] = [";", "\\", "%2f", "%5c", "%3b", "%3f", "%23", "%00"];
+
+/// Text that makes a lowercase view unsafe for a static skip: a `?` or `#` once decoded,
+/// or an escape of one (`%3f`, `%23`) or of NUL (`%00`) left after one decode, which
+/// means the path was encoded twice. NUL bytes are removed from views, so a decoded NUL
+/// is caught by the raw `%00` marker instead.
+const UNSAFE_VIEW_MARKERS: [&str; 5] = ["?", "#", "%3f", "%23", "%00"];
 
 /// The ways the request path is read by the security checks.
 ///
@@ -210,12 +216,13 @@ pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
 ///
 /// Every condition must hold:
 ///
-/// - a GET or HEAD with no body and the raw path free of `;`, `\`, `%2F`, `%5C` and
-///   `%3B` (case-insensitive);
+/// - a GET or HEAD with no body and the raw path free of `;`, `\`, `%2F`, `%5C`, `%3B`,
+///   `%3F`, `%23` and `%00` (case-insensitive);
 /// - no query, or one made only of `static_query_params` parameters, see
 ///   [`cache_busters_only`], or, with `static_query_token on`, one bare token, see
 ///   [`query_keeps_static_skip`];
 /// - under a `static_location` prefix, when the site sets any: every view starts with one;
+/// - in every view, no `?`, `#`, `%3F`, `%23` or `%00` (see [`UNSAFE_VIEW_MARKERS`]);
 /// - in every view, the last segment has a static extension and no earlier segment
 ///   has a script extension;
 /// - no `fail_closed_path` matches any view.
@@ -239,6 +246,13 @@ pub(crate) fn static_skip(
     }
     let raw = input.raw_path.to_ascii_lowercase();
     if UNSAFE_RAW_MARKERS.iter().any(|marker| raw.contains(marker)) {
+        return false;
+    }
+    if views.iter().any(|view| {
+        UNSAFE_VIEW_MARKERS
+            .iter()
+            .any(|marker| view.contains(marker))
+    }) {
         return false;
     }
     if !site.static_locations.is_empty()
@@ -519,6 +533,39 @@ mod tests {
     #[case::encoded_slash(Method::GET, "/a%2Fb.css", false, true, Screening::Inspect)]
     #[case::encoded_backslash(Method::GET, "/a%5cb.css", false, true, Screening::Inspect)]
     #[case::encoded_semicolon(Method::GET, "/a%3Bb.css", false, true, Screening::Inspect)]
+    // An encoded `?`, `#` or NUL can hide a script name from the extension check, as in
+    // `/x.php?a.js`, which an upstream may read as a script named `x.php`.
+    #[case::encoded_question_mark(Method::GET, "/x.php%3Fa.js", false, true, Screening::Inspect)]
+    #[case::encoded_question_mark_lowercase(
+        Method::GET,
+        "/x.php%3fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::encoded_hash(Method::GET, "/x.php%23a.js", false, true, Screening::Inspect)]
+    #[case::encoded_nul(Method::GET, "/x.php%00.js", false, true, Screening::Inspect)]
+    // Encoded twice: the first decode leaves `%3F`, `%23` or `%00` in the view.
+    #[case::double_encoded_question_mark(
+        Method::GET,
+        "/x.php%253Fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::double_encoded_hash(Method::GET, "/x.php%2523a.js", false, true, Screening::Inspect)]
+    #[case::double_encoded_nul(Method::GET, "/x.php%2500.js", false, true, Screening::Inspect)]
+    // A literal `?` or `#` in a reading is inspected too, even though the HTTP layer normally splits it off.
+    #[case::literal_question_mark_in_a_reading(
+        Method::GET,
+        "/x.php?a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::literal_hash_in_a_reading(Method::GET, "/x.php#a.js", false, true, Screening::Inspect)]
+    // A plain static path with none of these still skips.
+    #[case::plain_static_path_still_skips(Method::GET, "/a.js", false, true, Screening::Skip)]
     // A script earlier in the path serves the request as PATH_INFO.
     #[case::path_info_of_a_script(Method::GET, "/index.php/x.css", false, true, Screening::Inspect)]
     #[case::path_info_of_an_aspx_page(

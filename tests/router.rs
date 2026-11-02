@@ -319,6 +319,37 @@ async fn a_question_mark_with_an_empty_query_is_sent_to_the_backend_with_static_
     proxy.stop().await
 }
 
+#[tokio::test]
+async fn an_encoded_separator_in_a_static_looking_path_is_sent_to_the_backend() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    // Each encoded `?`, NUL and double-encoded `?` gets one backend call, in turn.
+    for (index, target) in ["/x.php%3Fa.js", "/x.php%00.js", "/x.php%253Fa.js"]
+        .into_iter()
+        .enumerate()
+    {
+        let reply = send(
+            &proxy.base(),
+            Method::GET,
+            target,
+            "example.com",
+            &[],
+            Bytes::new(),
+        )
+        .await?;
+        assert_eq!(reply.status, StatusCode::OK, "{target}");
+        assert_eq!(stub.calls(), index + 1, "{target} goes to the backend");
+    }
+    proxy.stop().await
+}
+
 /// Adds `on_rate_limit allow` and `on_decision_error allow` to the first site of `config_text`.
 fn fail_open(text: &str) -> String {
     text.replacen(

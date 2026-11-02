@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Fixed: a static asset path with an encoded `?`, `#` or NUL (`%3F`, `%23`, `%00`, in
+  any letter case), or one of those escapes left after one decode (`%253F`), no longer
+  takes the static skip. Such a request goes to the backend. Before, `/x.php%3Fa.js`
+  and `/x.php%00.js` were forwarded as static assets without calling the backend.
+
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
   instructions to a reader, comment form submissions and search queries) and three
