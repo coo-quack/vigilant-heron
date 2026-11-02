@@ -344,3 +344,281 @@ fn the_block_query_example_in_the_logging_docs_loads() -> TestResult {
     vigilant_heron::Config::parse_str(&text, "docs/logging.md")?;
     Ok(())
 }
+
+/// The rollout skill's folder and its file, relative to the repository root.
+const ROLLOUT_SKILL_DIR: &str = "skills/vigilant-heron-rollout";
+const ROLLOUT_SKILL: &str = "skills/vigilant-heron-rollout/SKILL.md";
+
+/// The GitHub anchor of a heading: lowercase, punctuation dropped, each space a hyphen.
+fn github_slug(heading: &str) -> String {
+    let mut slug = String::new();
+    for c in heading.chars() {
+        if c == ' ' {
+            slug.push('-');
+        } else if c.is_alphanumeric() || c == '-' || c == '_' {
+            slug.extend(c.to_lowercase());
+        }
+    }
+    slug
+}
+
+/// The text of every heading in `doc` outside fenced code blocks, without its `#` marks.
+fn heading_texts(doc: &str) -> Vec<&str> {
+    let mut in_fence = false;
+    let mut headings = Vec::new();
+    for line in doc.lines() {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            let hashes = line.bytes().take_while(|&b| b == b'#').count();
+            if (1..=6).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ') {
+                headings.push(line.get(hashes + 1..).unwrap_or("").trim());
+            }
+        }
+    }
+    headings
+}
+
+/// The targets of the Markdown links in `doc` that are not web or mail addresses.
+fn relative_link_targets(doc: &str) -> Vec<&str> {
+    doc.split("](")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next())
+        .filter(|target| !target.starts_with("http") && !target.starts_with("mailto:"))
+        .collect()
+}
+
+/// The repository path of a link target in the rollout skill. A target without a path, which
+/// is only an anchor, names the skill itself.
+fn skill_link_path(target: &str) -> String {
+    let path = target.split('#').next().unwrap_or("");
+    if path.is_empty() {
+        ROLLOUT_SKILL.to_owned()
+    } else {
+        format!("{ROLLOUT_SKILL_DIR}/{path}")
+    }
+}
+
+/// The command-line flags named in `text`: words that start with `-` or `--`, then a letter.
+/// A bare `-` (standard input) is not a flag, and `=` ends a flag's name.
+fn flags_in(text: &str) -> BTreeSet<String> {
+    text.split(|c: char| c.is_whitespace() || "|`'\"()[]<>,;:.".contains(c))
+        .filter_map(|word| {
+            let word = word.split('=').next()?;
+            let name = word.strip_prefix("--").or_else(|| word.strip_prefix('-'))?;
+            let starts_with_letter = name.chars().next()?.is_ascii_alphabetic();
+            let well_formed = name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+            (starts_with_letter && well_formed).then(|| word.to_owned())
+        })
+        .collect()
+}
+
+/// Splits the rollout skill into the lines of its front matter and the rest of the file.
+fn split_front_matter(skill: &str) -> Result<(&str, &str), Box<dyn Error>> {
+    let rest = skill
+        .strip_prefix("---\n")
+        .ok_or("the rollout skill does not start with a front matter block")?;
+    let (front, body) = rest
+        .split_once("\n---\n")
+        .ok_or("the rollout skill's front matter has no closing ---")?;
+    Ok((front, body))
+}
+
+#[test]
+fn the_rollout_skill_front_matter_names_the_skill() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    let (front, _) = split_front_matter(&skill)?;
+    assert!(
+        front
+            .lines()
+            .any(|line| line == "name: vigilant-heron-rollout"),
+        "the front matter does not name the skill vigilant-heron-rollout"
+    );
+    assert!(
+        front.lines().any(|line| line.starts_with("description:")),
+        "the front matter has no description"
+    );
+    Ok(())
+}
+
+#[test]
+fn the_rollout_skill_body_stays_within_the_word_budget() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    let (_, body) = split_front_matter(&skill)?;
+    let words = body.split_whitespace().count();
+    assert!(
+        words <= 1500,
+        "the rollout skill body has {words} words, over the 1,500 budget"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_relative_link_in_the_rollout_skill_points_at_an_existing_file() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    let targets = relative_link_targets(&skill);
+    assert!(
+        !targets.is_empty(),
+        "the rollout skill has no relative links"
+    );
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let missing: Vec<&str> = targets
+        .iter()
+        .copied()
+        .filter(|target| !root.join(skill_link_path(target)).exists())
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "relative links in the rollout skill that point at no file: {missing:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_anchor_in_the_rollout_skill_names_a_heading_of_its_target() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    let mut checked = 0;
+    let mut unknown = Vec::new();
+    for target in relative_link_targets(&skill) {
+        let Some((_, anchor)) = target.split_once('#') else {
+            continue;
+        };
+        let doc = read(&skill_link_path(target))?;
+        checked += 1;
+        let slugs: BTreeSet<String> = heading_texts(&doc).into_iter().map(github_slug).collect();
+        if !slugs.contains(anchor) {
+            unknown.push(target.to_owned());
+        }
+    }
+    assert!(checked > 0, "the rollout skill has no anchored links");
+    assert!(
+        unknown.is_empty(),
+        "anchors in the rollout skill that name no heading of their file: {unknown:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_flag_in_the_rollout_skill_is_in_the_command_line_docs() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    let cli = read("docs/cli.md")?;
+    let documented = flags_in(&cli);
+    let missing: Vec<String> = flags_in(&skill).difference(&documented).cloned().collect();
+    assert!(
+        missing.is_empty(),
+        "flags named in the rollout skill but not in docs/cli.md: {missing:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn suggest_skip_rules_in_the_rollout_skill_takes_no_config_flag() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    // The code spans are the text between backticks. Prose such as "takes no `-c`" is not a command.
+    let commands: Vec<&str> = skill
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| span.contains("suggest-skip-rules"))
+        .collect();
+    assert!(
+        !commands.is_empty(),
+        "the rollout skill never names suggest-skip-rules in a code span"
+    );
+    for command in commands {
+        let flags = flags_in(command);
+        assert!(
+            !flags.contains("-c") && !flags.contains("--config"),
+            "the rollout skill passes a config flag to suggest-skip-rules: {command}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn the_command_line_docs_say_suggest_skip_rules_takes_no_config_flag() -> TestResult {
+    let cli = read("docs/cli.md")?;
+    let text = section(&cli, 2, "Learn skip rules from the access log")
+        .ok_or("docs/cli.md has no \"## Learn skip rules from the access log\" section")?;
+    // The sentence is wrapped across two lines in the source, so the whitespace is normalized.
+    let sentence = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        sentence.contains("so `-c` cannot be given"),
+        "docs/cli.md no longer says that suggest-skip-rules takes no -c"
+    );
+    Ok(())
+}
+
+#[test]
+fn every_command_word_of_the_quick_reference_appears_in_the_docs_for_it() -> TestResult {
+    let skill = read(ROLLOUT_SKILL)?;
+    let quick_reference = section(&skill, 2, "Command quick reference")
+        .ok_or("the rollout skill has no \"## Command quick reference\" section")?;
+    let cli = read("docs/cli.md")?;
+    let install = read("docs/install.md")?;
+    let mut checked = 0;
+    let mut missing = Vec::new();
+    for span in quick_reference.split('`').skip(1).step_by(2) {
+        let words: Vec<&str> = span.split_whitespace().collect();
+        let doc = match words.as_slice() {
+            ["vigilant-heron", ..] => &cli,
+            ["sudo", "systemctl", ..] => &install,
+            _ => continue,
+        };
+        checked += 1;
+        let tokens: BTreeSet<&str> = doc
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .collect();
+        for word in words.iter().skip(1) {
+            for name in word.split('|') {
+                let is_command_word = name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                    && name.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+                if is_command_word && !tokens.contains(name) {
+                    missing.push(name.to_owned());
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "the quick reference has no vigilant-heron or systemctl command"
+    );
+    assert!(
+        missing.is_empty(),
+        "command words of the quick reference that the docs for them do not name: {missing:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn github_slug_drops_punctuation_and_joins_words_with_hyphens() {
+    assert_eq!(github_slug("1. Before you start"), "1-before-you-start");
+    assert_eq!(github_slug("Reload or restart?"), "reload-or-restart");
+    assert_eq!(
+        github_slug("Run in the background: start, stop, restart"),
+        "run-in-the-background-start-stop-restart"
+    );
+}
+
+#[test]
+fn heading_texts_ignores_a_hash_line_inside_a_code_block() {
+    let doc = "# Title\n```sh\n# not a heading\n```\n## Real\n";
+    assert_eq!(heading_texts(doc), vec!["Title", "Real"]);
+}
+
+#[test]
+fn relative_link_targets_skips_web_and_mail_links() {
+    let doc = "[a](docs/a.md#x) [b](https://example.com/) [c](http://example.com/) \
+               [d](mailto:someone@example.com) [e](#top)";
+    assert_eq!(relative_link_targets(doc), vec!["docs/a.md#x", "#top"]);
+}
+
+#[test]
+fn flags_are_found_in_prose_and_code_but_not_in_stdin_or_numbers() {
+    let found =
+        flags_in("run `vigilant-heron -c x test-request --url 'u' -` or -1, --client=1.2.3.4");
+    assert_eq!(
+        found.into_iter().collect::<Vec<_>>(),
+        vec!["--client", "--url", "-c"]
+    );
+}
