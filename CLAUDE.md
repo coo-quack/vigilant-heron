@@ -76,7 +76,7 @@ tests/
   wordpress_rules.rs # The optional WordPress rule file: each rule's matches and near misses, block precedence, the -t test
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   block.rs       # block_status and block_page responses, including 444 and location overrides
-  docs.rs        # Keeps docs/ in step with the parser's directive lists
+  docs.rs        # Keeps docs/ in step with the parser's directive lists, and the rollout skill's links and flags with docs/
   packaging.rs   # install.sh with --root in a temp dir: files, modes, second run, symlinks, archive layout, unit and logrotate content
   error_log.rs   # The error log across SIGHUP and SIGUSR1, with the real binary
   rate_limits.rs # limit_req and limit_conn: locations, log variables, dry run and shadow, gated upstream
@@ -123,6 +123,7 @@ Top-level and documentation files:
 
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
+skills/          # Agent skills (npx skills add coo-quack/vigilant-heron): vigilant-heron-rollout drives docs/rollout.md on a real server
 .github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
