@@ -3,9 +3,9 @@
 //! The id is logged as `$request_id` and sent back in the `X-Request-ID` response
 //! header, so a site owner can quote it when reporting a blocked request.
 
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use http::HeaderName;
 
@@ -15,31 +15,40 @@ pub(crate) const RESPONSE_HEADER: HeaderName = HeaderName::from_static("x-reques
 /// The longest header value that is used as an id. A longer value is replaced by a generated id.
 pub(crate) const MAX_HEADER_ID_BYTES: usize = 64;
 
-/// Fixed for the process at its first use, from the start time and the process id.
-static SEED: LazyLock<u64> = LazyLock::new(|| {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let nanos = u64::try_from(nanos).unwrap_or(u64::MAX);
-    mix(nanos ^ (u64::from(std::process::id()) << 32))
-});
+/// The seed of the process, drawn on first use and fixed for the rest of the process.
+static SEED: LazyLock<u64> = LazyLock::new(draw_seed);
 
 /// Counts the generated ids of the process, so that no two of them are equal.
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Generates an id of 16 lowercase hex digits.
 ///
-/// The seed plus the counter is mixed with a bijection, so two calls in one process never
-/// return the same id.
+/// Two calls in one process never return the same id, because the counter differs.
 pub(crate) fn generate() -> String {
-    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{:016x}", mix(SEED.wrapping_add(count)))
+    id_for(*SEED, COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The id that `seed` gives for the `count`th generated id.
+///
+/// The seed plus the count is mixed with a bijection, so distinct counts give distinct ids.
+fn id_for(seed: u64, count: u64) -> String {
+    format!("{:016x}", mix(seed.wrapping_add(count)))
+}
+
+/// Draws a seed from std's `RandomState`, which the OS keys at random for each process.
+///
+/// The seed does not come from the clock or the process id, so it is not guessable from them.
+fn draw_seed() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(0);
+    hasher.finish()
 }
 
 /// The id that a request-id header value gives, or `None` when the value cannot be used.
 ///
-/// A usable value is 1 to 64 visible ASCII characters (0x21 to 0x7e). Spaces, control
-/// characters and non-ASCII bytes are refused, so the id is safe in a header and a log line.
+/// A usable value is 1 to 64 bytes, all visible ASCII (0x21 to 0x7e). Spaces, tabs,
+/// control characters, DEL and non-ASCII bytes are refused, so the id is safe in a header
+/// and a log line.
 pub(crate) fn from_header(value: &[u8]) -> Option<String> {
     let usable = !value.is_empty()
         && value.len() <= MAX_HEADER_ID_BYTES
@@ -82,6 +91,16 @@ mod tests {
     }
 
     #[test]
+    fn two_different_seeds_give_different_first_ids() {
+        assert_ne!(id_for(1, 0), id_for(2, 0));
+    }
+
+    #[test]
+    fn two_drawn_seeds_differ() {
+        assert_ne!(draw_seed(), draw_seed());
+    }
+
+    #[test]
     fn the_mixer_is_injective_on_consecutive_inputs() {
         let outputs: HashSet<u64> = (0..10_000_u64).map(mix).collect();
 
@@ -104,6 +123,8 @@ mod tests {
     #[case::space(b"a b")]
     #[case::control(b"a\x7fb")]
     #[case::tab(b"a\tb")]
+    #[case::bell(b"a\x07b")]
+    #[case::del(b"a\x7f")]
     #[case::non_ascii("id-é".as_bytes())]
     #[case::too_long(&[b'x'; 65])]
     fn a_header_value_that_is_not_a_usable_id_is_refused(#[case] value: &[u8]) {

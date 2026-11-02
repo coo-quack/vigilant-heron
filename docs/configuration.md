@@ -111,9 +111,13 @@ Status for a request whose `Host` matches no site. Must be a 4xx or 5xx code.
 - **Default:** none.
 - **Context:** top level.
 
-Request header whose value is logged as `$request_id`. The value is not sent to the decision backend.
+Request header whose value is logged as `$request_id`. The header is removed from the request that the decision backend receives, so the client's id does not reach the backend.
 
-When the header is missing, empty, longer than 64 characters, or contains a space or a non-ASCII character, the router makes a 16-character id for the request instead, such as `3f9a0c17b2d4e8a1`. That id is logged in the same way. Each response that the router writes itself, after it has read the request, carries the id in an `X-Request-ID` header, so a client can quote it. A forwarded upstream response does not get the header.
+The router uses the header's value as the id when the header is present and usable. A value is unusable when it is empty, longer than 64 bytes, or contains any byte outside visible ASCII (0x21 to 0x7E): a space, a tab, a control character, DEL, or any non-ASCII byte. When the header is missing or unusable, the router makes a 16-character id for the request instead, such as `3f9a0c17b2d4e8a1`. That id is logged in the same way.
+
+Each response that the router writes itself, after it has read the request, carries the id in an `X-Request-ID` header, so a client can quote it. A forwarded upstream response does not get the header.
+
+Name a header that the proxy in front of the router sets or overwrites. Otherwise a client can choose its own id.
 
 ### `real_ip_from`
 

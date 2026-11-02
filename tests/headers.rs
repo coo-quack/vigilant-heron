@@ -247,7 +247,7 @@ async fn a_proxy_set_header_request_id_is_the_generated_id_when_the_request_has_
     ))
     .await?;
 
-    let generated = send(
+    let reply = send(
         &proxy.base(),
         Method::GET,
         "/hello",
@@ -256,7 +256,27 @@ async fn a_proxy_set_header_request_id_is_the_generated_id_when_the_request_has_
         Bytes::new(),
     )
     .await?;
-    let given = send(
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let id = received(&reply.json(), "x-id").unwrap_or_default();
+    assert_eq!(id.len(), 16, "{id}");
+    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{id}");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_proxy_set_header_request_id_is_the_client_id_when_the_request_has_one() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream.url(),
+        "request_id_header x-request-id;",
+        "proxy_set_header X-Id $request_id;",
+    ))
+    .await?;
+
+    let reply = send(
         &proxy.base(),
         Method::GET,
         "/hello",
@@ -266,10 +286,7 @@ async fn a_proxy_set_header_request_id_is_the_generated_id_when_the_request_has_
     )
     .await?;
 
-    assert_eq!(generated.status, StatusCode::OK);
-    let id = received(&generated.json(), "x-id").unwrap_or_default();
-    assert_eq!(id.len(), 16, "{id}");
-    assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()), "{id}");
-    assert_eq!(received(&given.json(), "x-id").as_deref(), Some("given-1"));
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(received(&reply.json(), "x-id").as_deref(), Some("given-1"));
     proxy.stop().await
 }

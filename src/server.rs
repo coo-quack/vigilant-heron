@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
 use bytes::Bytes;
 use http::header::{
     CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION, UPGRADE,
+    X_CONTENT_TYPE_OPTIONS,
 };
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
@@ -737,10 +738,10 @@ async fn pipeline(
         );
     };
     let Some(site) = state.sites.get(index) else {
-        return with_request_id(status_response(state.default_status, ""), trace.request_id);
+        return empty_answer(state.default_status, trace.request_id);
     };
     let Some(proxy) = state.proxies.get(index) else {
-        return with_request_id(status_response(state.default_status, ""), trace.request_id);
+        return empty_answer(state.default_status, trace.request_id);
     };
     let sinks = state
         .site_sinks
@@ -1049,18 +1050,14 @@ async fn respond(
         }
         Action::Block => block_outcome(block, delivery.ctx.request_id, complete),
         Action::Reject(status) => {
-            let mut response =
-                with_request_id(status_response(*status, ""), delivery.ctx.request_id);
+            let mut response = empty_answer(*status, delivery.ctx.request_id);
             if !complete {
                 close(&mut response);
             }
             Outcome::answered(response)
         }
         Action::Redirect(location) => {
-            let mut response = with_request_id(
-                status_response(StatusCode::FOUND, ""),
-                delivery.ctx.request_id,
-            );
+            let mut response = empty_answer(StatusCode::FOUND, delivery.ctx.request_id);
             response.headers_mut().insert(LOCATION, location.clone());
             if !complete {
                 close(&mut response);
@@ -1225,6 +1222,11 @@ fn request_id_for(state: &AppState, headers: &HeaderMap) -> String {
         .unwrap_or_else(request_id::generate)
 }
 
+/// An answer without a body, with the given status and the request id.
+fn empty_answer(status: StatusCode, request_id: &str) -> Response<ResponseBody> {
+    with_request_id(status_response(status, ""), request_id)
+}
+
 /// Adds the `X-Request-ID` header to a response the router generated itself.
 fn with_request_id(mut response: Response<ResponseBody>, id: &str) -> Response<ResponseBody> {
     if let Ok(value) = HeaderValue::from_str(id) {
@@ -1354,7 +1356,7 @@ fn reject(
         ..rejection_record(status.as_u16(), reason, trace.started)
     };
     write_access(sinks, &record, &parts.headers);
-    let mut response = with_request_id(status_response(status, ""), trace.request_id);
+    let mut response = empty_answer(status, trace.request_id);
     if closing {
         close(&mut response);
     }
@@ -1421,6 +1423,9 @@ fn typed_response(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }
 

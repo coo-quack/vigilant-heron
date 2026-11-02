@@ -534,6 +534,13 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
         excess_expected,
         "the excess follows on_client_busy"
     );
+    // Only the router's own 429 carries the request id; an answer forwarded from the backend does not.
+    let expected_header = if excess_expected == 429 {
+        "flood-excess"
+    } else {
+        ""
+    };
+    assert_eq!(request_id_header(&excess), expected_header);
     let excess_line = wait_for_access_line(&log, "flood-excess").await?;
     assert_eq!(excess_line["decision_error"], "client_busy");
     assert_eq!(excess_line["reason"], excess_reason);
@@ -812,5 +819,27 @@ async fn client_busy_refusal_with_an_unread_body_closes_the_connection() -> Test
 
     assert!(head.starts_with("http/1.1 429"), "{head}");
     assert!(head.contains("connection: close"), "{head}");
+    proxy.stop().await
+}
+
+/// A backend 429 that `on_rate_limit block` turns into a block answers with the request id.
+#[tokio::test]
+async fn a_rate_limit_blocked_by_on_rate_limit_carries_the_request_id_header() -> TestResult {
+    let fake = start_jev_fake().await?;
+    let upstream = Upstream::start().await?;
+    let mut setup = Setup::new(fake.url.clone(), upstream.url());
+    setup.on_rate_limit = "block";
+    let proxy = start_proxy_config(setup.config()?).await?;
+
+    let reply = get_as(
+        &proxy.base(),
+        "/articles/ratelimited",
+        "203.0.113.1",
+        "rate-blocked-1",
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(request_id_header(&reply), "rate-blocked-1");
     proxy.stop().await
 }

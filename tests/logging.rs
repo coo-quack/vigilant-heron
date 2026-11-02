@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
 use common::{
-    BoxError, Reply, StubBehavior, StubDecider, TestResult, Upstream, assert_plain_block,
-    request_id_header, send, start_proxy_config,
+    BoxError, Reply, StubBehavior, StubDecider, TestResult, Upstream, assert_plain_block, send,
+    start_proxy_config,
 };
 use http::{Method, StatusCode};
 use serde_json::Value;
@@ -183,8 +183,8 @@ async fn query_shape_is_empty_when_the_request_has_no_query() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_request_id_header_longer_than_64_characters_is_replaced_by_a_generated_id_and_not_sent_to_the_backend()
--> TestResult {
+async fn a_request_id_header_longer_than_64_characters_is_replaced_by_a_generated_id() -> TestResult
+{
     let decider = attacking_decider().await?;
     let upstream = Upstream::start().await?;
     let path = log_path("truncation");
@@ -196,11 +196,27 @@ async fn a_request_id_header_longer_than_64_characters_is_replaced_by_a_generate
     let reply = get_with_id(&proxy.base(), "/?q=x", &long_id).await?;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    let generated = request_id_header(&reply);
+    let generated = assert_plain_block(&reply);
     assert_eq!(generated.len(), 16, "{generated}");
     let line = wait_for_line(&path, &generated).await?;
     assert_eq!(line["request_id"].as_str(), Some(generated.as_str()));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_request_id_header_is_not_sent_to_the_decision_backend() -> TestResult {
+    let decider = StubDecider::start().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("not-sent");
+    let _ = std::fs::remove_file(&path);
+    let config = config_for("http", &decider.decide_url(), &upstream.url(), &path, "")?;
+    let proxy = start_proxy_config(config).await?;
+
+    let reply = get_with_id(&proxy.base(), "/articles", "backend-1").await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
     let event = decider.last_event().unwrap_or_default();
+    assert!(!event.is_null(), "the decision backend was not called");
     let names: Vec<&str> = event["event"]["untrusted"]["headers"]
         .as_array()
         .map(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect())
@@ -689,8 +705,7 @@ async fn a_request_without_the_id_header_gets_a_generated_id_in_the_log_and_the_
 }
 
 #[tokio::test]
-async fn the_request_id_header_is_echoed_on_a_blocked_response_and_logged_with_the_same_value()
--> TestResult {
+async fn the_request_id_header_is_echoed_on_a_blocked_response() -> TestResult {
     let decider = attacking_decider().await?;
     let upstream = Upstream::start().await?;
     let path = log_path("echoed-id");
@@ -708,8 +723,29 @@ async fn the_request_id_header_is_echoed_on_a_blocked_response_and_logged_with_t
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
     assert_eq!(assert_plain_block(&reply), "echo-1");
-    let line = wait_for_line(&path, "echo-1").await?;
-    assert_eq!(line["request_id"].as_str(), Some("echo-1"));
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn the_access_log_line_of_a_blocked_request_has_its_request_id() -> TestResult {
+    let decider = attacking_decider().await?;
+    let upstream = Upstream::start().await?;
+    let path = log_path("logged-id");
+    let _ = std::fs::remove_file(&path);
+    let proxy = start_proxy_config(config_for(
+        "http",
+        &decider.decide_url(),
+        &upstream.url(),
+        &path,
+        "",
+    )?)
+    .await?;
+
+    let reply = get_with_id(&proxy.base(), "/?q=x", "logged-1").await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let line = wait_for_line(&path, "logged-1").await?;
+    assert_eq!(line["request_id"].as_str(), Some("logged-1"));
     proxy.stop().await
 }
 

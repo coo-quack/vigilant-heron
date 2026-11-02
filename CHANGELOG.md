@@ -35,7 +35,8 @@
 - Changed: a block without a `block_page` answers a plain-text body,
   `Request blocked. Request ID: <id>`, instead of an empty body (a 403 used to answer
   `Forbidden`). The id is the one in the `X-Request-ID` header and in the access log.
-  A `block_page` is sent as before.
+  A `block_page` is sent as before. Both kinds of block body also carry
+  `X-Content-Type-Options: nosniff`.
 - Changed: `$request_id` is never empty, so the `main` format's `request_id="..."` is
   always filled, and a `proxy_set_header` that uses it sends the generated id to the
   upstream. A request-id header that is longer than 64 characters, or contains a

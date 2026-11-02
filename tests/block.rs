@@ -350,3 +350,67 @@ async fn a_block_page_is_sent_unchanged_with_the_request_id_header() -> TestResu
     assert_eq!(request_id_header(&reply), "page-id-1");
     proxy.stop().await
 }
+
+#[tokio::test]
+async fn a_plain_text_block_is_sent_with_nosniff() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = attacking_stub().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), &upstream.url(), "", "")).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_plain_block(&reply);
+    assert_eq!(
+        reply
+            .headers
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_block_page_is_sent_with_nosniff() -> TestResult {
+    let dir = std::env::temp_dir().join("vh-block-it-page-nosniff");
+    std::fs::create_dir_all(&dir)?;
+    let page = dir.join("blocked.html");
+    std::fs::write(&page, "<!doctype html><h1>Blocked</h1>")?;
+    let upstream = Upstream::start().await?;
+    let stub = attacking_stub().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream.url(),
+        "",
+        &format!("block_page {};", page.display()),
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        reply
+            .headers
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+    proxy.stop().await
+}
