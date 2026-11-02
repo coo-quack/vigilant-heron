@@ -209,12 +209,16 @@ impl ShadowReport {
         if time.is_empty() {
             return;
         }
-        if self.first_time.as_deref().is_none_or(|first| time < first) {
-            self.first_time = Some(time.to_owned());
-        }
-        if self.last_time.as_deref().is_none_or(|last| time > last) {
-            self.last_time = Some(time.to_owned());
-        }
+        let first = self
+            .first_time
+            .as_deref()
+            .map_or(time, |first| first.min(time));
+        self.first_time = Some(first.to_owned());
+        let last = self
+            .last_time
+            .as_deref()
+            .map_or(time, |last| last.max(time));
+        self.last_time = Some(last.to_owned());
     }
 
     fn add_blocked(&mut self, value: &Value) {

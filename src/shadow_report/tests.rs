@@ -4,7 +4,7 @@ use super::*;
 use crate::decision::{Limits, decision_client, post_json};
 use crate::error::{DecisionError, ProbabilityError};
 use crate::log_lines::MAX_LINE_BYTES;
-use crate::test_support::FailingReader;
+use crate::test_support::{EndsOnce, FailingReader};
 use rstest::rstest;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
@@ -67,7 +67,7 @@ fn render_with(text: &str, options: &ShadowOptions) -> String {
 /// Reads one log into the report, failing the test when the read fails.
 fn read_or_panic(report: &mut ShadowReport, input: &[u8]) {
     report
-        .read_log(input)
+        .read_log(EndsOnce::new(input))
         .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
 }
 

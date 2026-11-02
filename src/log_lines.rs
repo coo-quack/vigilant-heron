@@ -49,28 +49,32 @@ pub(crate) fn for_each_line<R: BufRead>(
         if content.len() > MAX_LINE_BYTES {
             visit(Line::TooLong);
             // Without a line break, the read stopped at the limit, so the rest of the line is
-            // skipped. At the end of the input there is nothing left to skip.
-            if !complete {
-                discard_through_newline(&mut input)?;
+            // skipped. Stop at the end of the input, without reading it again.
+            if !complete && !discard_through_newline(&mut input)? {
+                return Ok(());
             }
             continue;
         }
         let text = String::from_utf8_lossy(content);
         visit(Line::Text(&text));
+        // Without a line break and within the limit, the input has ended.
+        if !complete {
+            return Ok(());
+        }
     }
 }
 
-/// Reads and drops the input up to and including the next line break, or to the end of
-/// the input. Nothing is kept.
-fn discard_through_newline<R: BufRead>(input: &mut R) -> io::Result<()> {
+/// Reads and drops the input up to and including the next line break. Nothing is kept.
+/// Returns `false` when the input ended before a line break.
+fn discard_through_newline<R: BufRead>(input: &mut R) -> io::Result<bool> {
     loop {
         let available = input.fill_buf()?;
         if available.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(index) = available.iter().position(|&byte| byte == b'\n') {
             input.consume(index + 1);
-            return Ok(());
+            return Ok(true);
         }
         let length = available.len();
         input.consume(length);
@@ -113,15 +117,60 @@ pub(crate) fn is_block(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::FailingReader;
+    use crate::test_support::{EndsOnce, FailingReader};
     use rstest::rstest;
     use serde_json::json;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// The size of the chunks that [`CountingReader`] hands out.
+    const CHUNK: usize = 8 * 1024;
+
+    /// A reader over `data` that adds up the bytes its caller consumes in `consumed`. Like
+    /// [`EndsOnce`], a read after the end of the input is an error.
+    struct CountingReader {
+        data: Vec<u8>,
+        position: usize,
+        consumed: Rc<Cell<usize>>,
+        ended: bool,
+    }
+
+    impl Read for CountingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = {
+                let available = self.fill_buf()?;
+                let count = available.len().min(buffer.len());
+                buffer[..count].copy_from_slice(&available[..count]);
+                count
+            };
+            self.consume(count);
+            Ok(count)
+        }
+    }
+
+    impl BufRead for CountingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            let rest = self.data.get(self.position..).unwrap_or_default();
+            if rest.is_empty() {
+                if self.ended {
+                    return Err(io::Error::other("read after the end of the input"));
+                }
+                self.ended = true;
+            }
+            Ok(rest.get(..CHUNK).unwrap_or(rest))
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.position += amount;
+            self.consumed.set(self.consumed.get() + amount);
+        }
+    }
 
     /// The lines that `for_each_line` passes on: the text of each line, or `None` for a
     /// line that was too long.
     fn lines_of(input: &[u8]) -> Vec<Option<String>> {
         let mut lines = Vec::new();
-        for_each_line(input, |line| match line {
+        for_each_line(EndsOnce::new(input), |line| match line {
             Line::Text(text) => lines.push(Some(text.to_owned())),
             Line::TooLong => lines.push(None),
         })
@@ -270,5 +319,48 @@ mod tests {
     #[case::other_case("Block", false)]
     fn block_and_redirect_are_the_blocking_actions(#[case] text: &str, #[case] expected: bool) {
         assert_eq!(is_block(text), expected);
+    }
+
+    #[test]
+    fn a_line_of_one_hundred_thousand_bytes_is_read_whole() {
+        let mut input = vec![b'a'; 100_000];
+        input.push(b'\n');
+        let lines = lines_of(&input);
+        assert_eq!(
+            lines.first().and_then(Option::as_ref).map(String::len),
+            Some(100_000)
+        );
+        assert_eq!(lines.len(), 1);
+    }
+
+    #[test]
+    fn a_line_one_over_one_mebibyte_is_too_long() {
+        // 1 MiB is 1_048_576 bytes; the line has 1_048_577.
+        let mut input = vec![b'a'; 1_048_577];
+        input.extend_from_slice(b"\nok\n");
+        assert_eq!(lines_of(&input), [None, Some("ok".to_owned())]);
+    }
+
+    #[test]
+    fn a_too_long_line_is_reported_after_the_read_limit_and_before_the_rest_is_read() {
+        // The read stops at the limit (the longest line with its CRLF), and the rest of the
+        // line is only skipped after `visit` has been told the line is too long.
+        let consumed = Rc::new(Cell::new(0));
+        let mut data = vec![b'x'; 3 * 1024 * 1024];
+        data.push(b'\n');
+        let reader = CountingReader {
+            data,
+            position: 0,
+            consumed: Rc::clone(&consumed),
+            ended: false,
+        };
+        let mut consumed_at_too_long = None;
+        for_each_line(reader, |line| {
+            if line == Line::TooLong && consumed_at_too_long.is_none() {
+                consumed_at_too_long = Some(consumed.get());
+            }
+        })
+        .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
+        assert_eq!(consumed_at_too_long, Some(MAX_LINE_BYTES + 2));
     }
 }

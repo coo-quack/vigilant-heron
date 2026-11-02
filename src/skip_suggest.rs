@@ -462,6 +462,7 @@ impl fmt::Display for SuggestReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::EndsOnce;
     use rstest::rstest;
     use serde_json::json;
 
@@ -512,7 +513,7 @@ mod tests {
             .map(Value::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        suggest_skip_rules(text.as_bytes(), &SuggestOptions::default())
+        suggest_skip_rules(EndsOnce::new(text.as_bytes()), &SuggestOptions::default())
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"))
     }
 
@@ -593,8 +594,9 @@ mod tests {
             usable.as_str(),
         ]
         .join("\n");
-        let report = suggest_skip_rules(input.as_bytes(), &SuggestOptions::default())
-            .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
+        let report =
+            suggest_skip_rules(EndsOnce::new(input.as_bytes()), &SuggestOptions::default())
+                .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         assert_eq!(report.total_lines, 6, "{report}");
         assert_eq!(report.unusable_lines, 5, "{report}");
         assert_eq!(report.usable_lines, 1, "{report}");
@@ -760,7 +762,7 @@ mod tests {
             .map(Value::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        let report = suggest_skip_rules(text.as_bytes(), &options)
+        let report = suggest_skip_rules(EndsOnce::new(text.as_bytes()), &options)
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         assert_eq!(report.candidates.len(), 1, "{report}");
         assert_eq!(
@@ -800,7 +802,7 @@ mod tests {
 
     #[test]
     fn an_empty_run_says_no_shape_meets_the_thresholds() {
-        let report = suggest_skip_rules("".as_bytes(), &SuggestOptions::default())
+        let report = suggest_skip_rules(EndsOnce::new("".as_bytes()), &SuggestOptions::default())
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         let text = report.to_string();
         assert!(
@@ -819,7 +821,7 @@ mod tests {
         let lines = spread(50, 10, 3, "0.1", "0.1");
         let text = run(&lines).to_string();
         assert!(text.contains("Candidates: 1\nA learned rule forwards matching requests without the model, so the model no longer judges their headers or body. Block rules, built-in and your own, still run first.\n") , "{text}");
-        let empty = suggest_skip_rules("".as_bytes(), &SuggestOptions::default())
+        let empty = suggest_skip_rules(EndsOnce::new("".as_bytes()), &SuggestOptions::default())
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"))
             .to_string();
         assert!(!empty.contains("forwards matching requests"), "{empty}");
@@ -844,7 +846,7 @@ mod tests {
         };
         let line = judged_value(1, 0, "GET", "/", "p=<num>", "", "");
         let text = line.to_string();
-        let report = suggest_skip_rules(text.as_bytes(), &options)
+        let report = suggest_skip_rules(EndsOnce::new(text.as_bytes()), &options)
             .unwrap_or_else(|error| panic!("reading from memory failed: {error}"));
         assert!(report.candidates.is_empty(), "{report}");
         assert!(report.needs_review.is_empty(), "{report}");
