@@ -6,15 +6,27 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=vigilant-heron
-# Creates /run/vigilant-heron for the pid file that the configuration names.
+# Creates /run/vigilant-heron, the directory of the pid file that the configuration names.
 RuntimeDirectory=vigilant-heron
-# KEY=value lines with the API tokens. Readable by root and the service only.
+# KEY=value lines with the API tokens. systemd reads this file as root, so only root can read it.
 EnvironmentFile=/etc/vigilant-heron/env
 ExecStart=/usr/local/bin/vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf
 ExecReload=/usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf
 # SIGTERM already stops the router gracefully; this makes it explicit.
 KillSignal=SIGTERM
 Restart=on-failure
+# Hardening. The router writes only to its runtime directory and its log directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/vigilant-heron
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

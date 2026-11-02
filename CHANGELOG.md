@@ -16,7 +16,10 @@
   configuration and token files, instead of copying each one by hand. The script
   never overwrites an existing configuration or token file, and it does not start
   the service. The install guide's "Run as a service with systemd" section has the
-  details.
+  details. The unit runs the router with systemd's hardening options. The token file
+  is readable by root only, because systemd reads it as root. The script stops, before
+  it writes anything, when one of its target paths is a symbolic link, when the group
+  `adm` is missing, or when the user `vigilant-heron` has another primary group.
 
 ## v0.4.1 (2026-10-29)
 

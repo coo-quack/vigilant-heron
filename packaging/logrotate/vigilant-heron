@@ -8,6 +8,7 @@
     missingok
     notifempty
     create 640 vigilant-heron adm
+    su vigilant-heron adm
     postrotate
         systemctl kill -s USR1 vigilant-heron.service >/dev/null 2>&1 || true
     endscript
