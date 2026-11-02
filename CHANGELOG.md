@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.5.0 (2026-11-03)
 
 - Changed: the packaged logrotate file also rotates `/var/log/vigilant-heron/*.json`, so the
   JSON access log that the installation guide now suggests is rotated too.
