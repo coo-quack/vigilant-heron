@@ -2067,6 +2067,37 @@ fn test_request_works_without_the_token_variable_and_warns() -> Result<(), std::
     Ok(())
 }
 
+#[test]
+fn test_request_url_works_without_the_token_variable_and_warns() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-url-token-missing")?;
+    let conf = write_file(&dir, "router.conf", &jev_config("VH_TEST_ABSENT_TOKEN"))?;
+    let conf_arg = conf.to_str().unwrap_or_default();
+    let output = run_without_token(
+        &[
+            "test-request",
+            "--url",
+            "https://example.com/items?id=1",
+            "-c",
+            conf_arg,
+        ],
+        "VH_TEST_ABSENT_TOKEN",
+    )?;
+    let stdout = stdout_of(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("would be sent to the decision backend (jev, model jev-latest)"),
+        "{stdout}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line == token_warning("VH_TEST_ABSENT_TOKEN")),
+        "{stderr}"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // suggest-skip-rules: learn skip-rule candidates from a json access log
 // ---------------------------------------------------------------------------

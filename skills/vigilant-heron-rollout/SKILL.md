@@ -11,9 +11,9 @@ description: >-
 
 ## Purpose
 
-The rollout in [From shadow mode to enforce](../../docs/rollout.md) is the source of truth: read the guide's section before each phase. This file holds only commands, gates and rules.
+The guide [From shadow mode to enforce](../../docs/rollout.md) is the source of truth: read its section before each phase. This file holds only commands, gates and rules.
 
-The published copy is at https://coo-quack.github.io/vigilant-heron/rollout. Outside the repository, the relative links do not resolve: replace `../../docs/<page>.md#<anchor>` with `https://coo-quack.github.io/vigilant-heron/<page>#<anchor>`.
+Outside the repository, replace `../../docs/<page>.md#<anchor>` with the published `https://coo-quack.github.io/vigilant-heron/<page>#<anchor>`.
 
 Here `<file>` is the router's configuration, and `example.com` is the site's host name.
 
@@ -22,9 +22,9 @@ Here `<file>` is the router's configuration, and `example.com` is the site's hos
 - Ask the operator before any change to live traffic, to the web server, or to `mode enforce;`. Starting, stopping, restarting and reloading the router are changes to live traffic too.
 - Never change live traffic before the way back has been tested.
 - Never print or paste API tokens, secret header values or full client addresses into issues or chat.
-- Do not identify the owner's traffic by IP address alone. Addresses change, and a cloud address does not show a partner. Use the User-Agent and request order, as [phase 3 of the guide](../../docs/rollout.md#3-reading-the-shadow-log) explains.
+- Do not identify the owner's traffic by IP address alone; use the User-Agent and request order, as [phase 3 of the guide](../../docs/rollout.md#3-reading-the-shadow-log) explains.
 - Do not widen a skip rule without testing its near misses with `test-request`.
-- Stop and report when a step fails, and do not work around it. Report a step as passed only after you ran it and read its output.
+- Stop and report when a step fails, without working around it. Report a step as passed only after you ran it and read its output.
 
 ## Phases
 
@@ -42,15 +42,15 @@ Move on only when the gate is met and the operator has agreed to any change in t
 
 - **Goal:** nginx copies requests to the router in shadow mode; the site's answers do not change.
 - **Guide:** [2. Shadow beside the site](../../docs/rollout.md#2-shadow-beside-the-site), and [the nginx mirror](../../docs/install.md#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror).
-- **Run:** ask the operator before editing nginx. Start the router, or run `vigilant-heron restart -c <file>` if it runs: `listen` is read only at startup. Ask the operator to schedule the job that stops the trial (guide, step 2). Then send one ordinary request to the site.
-- **Look for:** one JSON line per request in the router's access log, no doubled lines on `/`, and no CDN secret header in what the router receives.
+- **Run:** ask the operator before editing nginx. Start the router, or run `vigilant-heron restart -c <file>` if it runs (`listen` is read only at startup). Ask the operator to schedule the job that stops the trial. Then send one ordinary request to the site.
+- **Look for:** one JSON line per request in the access log, no doubled lines on `/`, and no CDN secret header in what the router receives.
 - **Gate:** the guide's checklist is true, and the stop job is scheduled and named in the report.
 
 ### Phase 3: Reading the shadow log
 
 - **Goal:** find what the router would block, and whether the backend keeps up.
 - **Guide:** [3. Reading the shadow log](../../docs/rollout.md#3-reading-the-shadow-log), and [the built-in formats](../../docs/logging.md#the-built-in-formats) for the fields.
-- **Run:** read the log on the server. Count the lines by `reason` and by `decision_error`. List the blocks with `grep '"would_have":"block"' <access.json>`, count them, and read each line. `tail <access.json>` shows the latest. Compute the p99 of `latency_ms`, and sum `input_tokens`.
+- **Run:** read the log on the server. Count the lines by `reason` and by `decision_error`. List the blocks with `grep '"would_have":"block"' <access.json>`, count them, and read each line. `tail <access.json>` shows the latest. If your `log_format` has `$block_query`, read it for each block, masking personal data you quote. Compute the p99 of `latency_ms`, and sum `input_tokens`.
 - **Look for:** one reason that dominates; decision timeouts clustered in an hour with little load; `client_busy` bursts from one client; a p99 above `timeout`. Mask client addresses in any line you quote, such as `203.0.113.x`.
 - **Gate:** every `"would_have":"block"` line has been read, and the counts and p99 are recorded.
 
@@ -60,7 +60,7 @@ Move on only when the gate is met and the operator has agreed to any change in t
 - **Guide:** [4. Writing skip rules](../../docs/rollout.md#4-writing-skip-rules), [writing your own rule](../../docs/rules.md#write-your-own-rule), and [learning skip rules](../../docs/cli.md#learn-skip-rules-from-the-access-log).
 - **Run:**
   1. `vigilant-heron suggest-skip-rules <access.json>`. It takes no `-c` and changes no file.
-  2. Copy the candidates the operator approves into `rules.d/`.
+  2. Copy the candidates the operator approves into `rules.d/`. For WordPress, copy `examples/rules.d/wordpress.conf` instead, narrow its rules and add a `site` line to each.
   3. Run `vigilant-heron -t -c <file>`.
   4. Test the guide's example rule (`GET /products?id=<digits>`): `vigilant-heron -c <file> test-request --url 'https://example.com/products?id=42'`.
   5. Test these near misses: a quote (`id=42%27`), a script tag (`id=%3Cscript%3E`), an extra parameter (`id=42&x=1`), an encoded newline (`id=42%0A`), a `POST` (`--method POST`), and a longer path (`/products/extra`).
@@ -72,20 +72,20 @@ Move on only when the gate is met and the operator has agreed to any change in t
 
 - **Goal:** the site's scripts pass through the router, with a tested way back.
 - **Guide:** [5. Putting the router in the request path](../../docs/rollout.md#5-putting-the-router-in-the-request-path).
-- **Run:** each nginx change, symlink switch, restart, stop and start needs the operator's approval. Run the commands in the guide's steps 1 to 4. For the router, run `vigilant-heron -t -c <file>`, then `vigilant-heron restart -c <file>`. To test the fallback, stop the router with `sudo systemctl stop vigilant-heron`, or `vigilant-heron stop -c <file>` for a background router, check that the site answers, and start it again.
+- **Run:** each nginx change, symlink switch, restart, stop and start needs the operator's approval. Run the guide's steps 1 to 4. For the router, run `vigilant-heron -t -c <file>`, then `vigilant-heron restart -c <file>`. To test the fallback, stop the router with `sudo systemctl stop vigilant-heron`, or `vigilant-heron stop -c <file>` for a background router, check that the site answers, and start it again.
 - **Look for:** the outer nginx uses `proxy_next_upstream error;`, not the default `error timeout`, which would send a slow request past the router ([step 5 of the guide](../../docs/rollout.md#5-putting-the-router-in-the-request-path) explains why). The inner server answers a script directly. A page and a login each have a log line, and `latency_ms` is compared with nginx's request time. While the router is stopped, the site still answers from the inner server.
 - **Gate:** the guide's step 5 checklist is true, and the switch back was tested once.
 
 ### Phase 6: Switching to enforce
 
-- **Goal:** move from `mode shadow;` to `mode enforce;` only after the upload limit and the way back are tested.
+- **Goal:** enforce only after the upload limit and the way back are tested.
 - **Guide:** [6. Switching to enforce](../../docs/rollout.md#6-switching-to-enforce).
 - **Run:**
   1. Ask the operator for an explicit yes before changing the mode. Then run `vigilant-heron -t -c <file>`.
   2. Check the rule offline before the reload: `vigilant-heron -c <file> test-request --url 'https://example.com/?id=1%20UNION%20SELECT%20password%20FROM%20users'` should report `result: blocked with 403`.
   3. Ask the operator to approve the reload. Then run `vigilant-heron -s reload -c <file>`, or `sudo systemctl reload vigilant-heron` under systemd.
   4. Send the live test attack (guide, step 4) only with the operator's yes.
-- **Look for:** a 403 for the live attack; no block or 429 from the owner's normal actions; an upload over the limit gets 413.
+- **Look for:** a 403 for the live attack; no block or 429 from the owner's normal actions; an upload over the limit gets 413; a reported block is found by its `request_id` in the JSON log.
 - **Gate:** every item in the guide's checklist is true, and the operator knows both ways back: `mode shadow;` with a reload, or the symlink to the direct upstream.
 
 ### Phase 7: Principles for running it safely

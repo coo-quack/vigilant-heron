@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Changed: the guide [From shadow mode to enforce](docs/rollout.md) and the rollout skill now
+  point to the features added since they were written: the packaged `install.sh` and systemd
+  unit, the WordPress skip rules, `test-request --url` and checks without the API token,
+  `$block_query`, request ids, the redaction of file parts and the 2000 ms default `timeout`.
+  Its User-Agent advice now uses the `user_agent` key of the JSON log. The router itself is
+  unchanged.
+
 - Added: `skills/vigilant-heron-rollout/SKILL.md`, an agent skill that drives the guide
   [From shadow mode to enforce](docs/rollout.md) on a real server: the seven phases as a
   checklist with the gate before each next phase, the commands to run and what to look
