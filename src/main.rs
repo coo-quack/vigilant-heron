@@ -138,7 +138,7 @@ fn test_request(config: &Path, file: &Path, client: IpAddr) -> ExitCode {
             let _ = writeln!(
                 stderr,
                 "vigilant-heron: cannot read the request file {}: {error}",
-                file.display()
+                input_name(file)
             );
             return ExitCode::FAILURE;
         }
@@ -180,7 +180,7 @@ fn suggest_skip_rules(file: &Path, options: &SuggestOptions) -> ExitCode {
             let _ = writeln!(
                 stderr,
                 "vigilant-heron: cannot read the access log {}: {error}",
-                file.display()
+                input_name(file)
             );
             return ExitCode::FAILURE;
         }
@@ -201,7 +201,7 @@ fn shadow_report(files: &[PathBuf], options: &ShadowOptions) -> ExitCode {
             let _ = writeln!(
                 stderr,
                 "vigilant-heron: cannot read the access log {}: {error}",
-                file.display()
+                input_name(file)
             );
             return ExitCode::FAILURE;
         }
@@ -220,6 +220,15 @@ fn print_report(report: &impl Display) -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+/// How an input file is named in an error message: `standard input` for `-`, otherwise the path.
+fn input_name(file: &Path) -> String {
+    if file == Path::new("-") {
+        "standard input".to_owned()
+    } else {
+        file.display().to_string()
+    }
 }
 
 /// Reads a file whole, or standard input for `-`.

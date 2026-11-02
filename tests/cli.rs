@@ -2367,3 +2367,63 @@ fn shadow_report_counts_a_line_longer_than_one_mib_as_malformed() -> Result<(), 
     );
     Ok(())
 }
+
+/// Runs the binary with `args`, with standard input read from `stdin`.
+fn run_with_stdin(args: &[&str], stdin: std::fs::File) -> Result<Output, std::io::Error> {
+    Command::new(BIN)
+        .args(args)
+        .env_remove("VIGILANT_HERON_CONFIG")
+        .stdin(stdin)
+        .output()
+}
+
+#[test]
+fn suggest_skip_rules_counts_a_line_longer_than_one_mib_as_unusable() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("suggest-long-line")?;
+    let mut bytes = vec![b'x'; 1024 * 1024 + 1];
+    bytes.push(b'\n');
+    bytes.extend_from_slice(
+        br#"{"time":"2026-01-01T10:00:00Z","site":"example.com","method":"GET","path":"/","query_shape":"p=<num>"}"#,
+    );
+    bytes.push(b'\n');
+    let log = dir.join("access.json");
+    std::fs::write(&log, bytes)?;
+    let output = run(&["suggest-skip-rules", log.to_str().unwrap_or_default()])?;
+    let stdout = stdout_of(&output);
+    assert_eq!(output.status.code(), Some(0), "{}", text(&output));
+    assert!(
+        stdout.contains("Read 2 lines: 1 with query_shape, 1 without"),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn suggest_skip_rules_names_standard_input_when_it_cannot_be_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("suggest-stdin-error")?;
+    // A directory opens as standard input, but reading it fails.
+    let output = run_with_stdin(&["suggest-skip-rules", "-"], std::fs::File::open(&dir)?)?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read the access log standard input"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("access log -"), "{stderr}");
+    Ok(())
+}
+
+#[test]
+fn test_request_names_standard_input_when_it_cannot_be_read() -> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-stdin-error")?;
+    let output = run_with_stdin(&["test-request", "-"], std::fs::File::open(&dir)?)?;
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot read the request file standard input"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("request file -"), "{stderr}");
+    Ok(())
+}

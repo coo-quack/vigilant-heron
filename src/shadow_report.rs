@@ -26,7 +26,8 @@ const BURST_PATHS: usize = 3;
 
 /// The `decision_error` causes that come from a call to the backend. The lines with
 /// `client_busy`, `backend_busy` or `request` never reached the backend, so they are not
-/// calls.
+/// calls. `parse` can also come from encoding the request, before any call; it is counted
+/// as a call anyway.
 const BACKEND_CAUSES: [&str; 9] = [
     "timeout",
     "rate_limited",
@@ -506,13 +507,12 @@ fn or_dash(text: &str) -> &str {
     if text.is_empty() { "-" } else { text }
 }
 
-/// Makes a value from the log safe to print. Control characters (C0, DEL and C1), U+2028
-/// and U+2029 are written as `\u{..}` escapes, so a value cannot move the cursor or change
-/// the terminal. Other text is kept as it is.
+/// Makes a value from the log safe to print. The characters that [`needs_escape`] names are
+/// written as `\u{..}` escapes. Other text is kept as it is.
 fn visible(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+        if needs_escape(c) {
             // Writing to a String cannot fail.
             let _ = write!(out, "\\u{{{:x}}}", u32::from(c));
         } else {
@@ -520,6 +520,25 @@ fn visible(text: &str) -> String {
         }
     }
     out
+}
+
+/// Whether a character is written as an escape. These are the control characters, the line
+/// separators, the bidirectional controls, which can reverse the order of the text shown,
+/// and the zero-width characters, which can hide text. Any of them could make the report
+/// show something other than what the log holds.
+fn needs_escape(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
 }
 
 /// The nearest-rank percentile of sorted values: the value at rank `ceil(percent * n / 100)`,

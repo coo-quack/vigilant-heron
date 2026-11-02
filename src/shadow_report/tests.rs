@@ -1,10 +1,14 @@
 //! Unit tests of the shadow report: the sections, the escaping and the reading of the logs.
 
 use super::*;
+use crate::decision::{Limits, decision_client, post_json};
+use crate::error::{DecisionError, ProbabilityError};
 use crate::log_lines::MAX_LINE_BYTES;
 use crate::test_support::FailingReader;
 use rstest::rstest;
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
+use std::time::Duration;
 
 /// The fields of the `json` format, which a line without them does not have.
 const FIELDS: &[&str] = &[
@@ -657,4 +661,155 @@ fn a_line_longer_than_the_limit_is_counted_as_malformed() {
         report.contains("Lines read: 2 (1 JSON objects, 1 malformed lines skipped)"),
         "{report}"
     );
+}
+
+#[rstest]
+#[case::right_to_left_override("\u{202e}", "\\u{202e}")]
+#[case::left_to_right_isolate("\u{2066}", "\\u{2066}")]
+#[case::arabic_letter_mark("\u{061c}", "\\u{61c}")]
+#[case::zero_width_space("\u{200b}", "\\u{200b}")]
+#[case::byte_order_mark("\u{feff}", "\\u{feff}")]
+fn bidirectional_and_zero_width_characters_are_written_as_escapes(
+    #[case] text: &str,
+    #[case] expected: &str,
+) {
+    assert_eq!(visible(text), expected);
+}
+
+#[test]
+fn every_bidirectional_and_zero_width_character_is_escaped() {
+    let characters = [
+        '\u{061C}', '\u{200B}', '\u{200C}', '\u{200D}', '\u{200E}', '\u{200F}', '\u{202A}',
+        '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2060}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}', '\u{FEFF}',
+    ];
+    for c in characters {
+        let shown = visible(&c.to_string());
+        assert!(
+            !shown.contains(c),
+            "U+{:04X} reached the output",
+            u32::from(c)
+        );
+        assert_eq!(shown, format!("\\u{{{:x}}}", u32::from(c)));
+    }
+}
+
+#[test]
+fn a_bidirectional_override_in_a_path_is_written_as_an_escape() {
+    let text = log(&[line(&[("action", "block"), ("path", "/\u{202e}gnp.exe")])]);
+    let report = render(&text);
+    assert!(report.contains(" /\\u{202e}gnp.exe "), "{report}");
+    assert!(!report.contains('\u{202e}'), "{report}");
+}
+
+/// The causes that the report does not count as a backend call. `client_busy` is not a
+/// `DecisionError` cause: its line never reaches the backend, so it is named here too.
+const NOT_CALL_CAUSES: [&str; 3] = ["client_busy", "backend_busy", "request"];
+
+/// Every variant name of `DecisionError`, sorted. The match in `variant_name` has no
+/// wildcard arm, so a new variant does not compile until it is named there and listed here.
+const VARIANTS: [&str; 12] = [
+    "AnswerType",
+    "Body",
+    "Busy",
+    "Json",
+    "MissingAnswer",
+    "Probability",
+    "RateLimited",
+    "Rejected",
+    "Request",
+    "Status",
+    "Timeout",
+    "Transport",
+];
+
+/// The name of the variant of a `DecisionError`.
+fn variant_name(error: &DecisionError) -> &'static str {
+    match error {
+        DecisionError::Timeout => "Timeout",
+        DecisionError::Busy => "Busy",
+        DecisionError::RateLimited { .. } => "RateLimited",
+        DecisionError::Transport(_) => "Transport",
+        DecisionError::Status(_) => "Status",
+        DecisionError::Body(_) => "Body",
+        DecisionError::Json(_) => "Json",
+        DecisionError::Request(_) => "Request",
+        DecisionError::Probability(_) => "Probability",
+        DecisionError::Rejected => "Rejected",
+        DecisionError::MissingAnswer { .. } => "MissingAnswer",
+        DecisionError::AnswerType { .. } => "AnswerType",
+    }
+}
+
+/// One error of each variant, as the decision code produces them. `Transport` needs a real
+/// failed exchange, because the error from hyper has no public constructor.
+async fn one_error_of_each_variant() -> Result<Vec<DecisionError>, Box<dyn std::error::Error>> {
+    let client = decision_client()?;
+    let limits = Limits {
+        timeout: Duration::from_millis(500),
+        queue_timeout: Duration::ZERO,
+        slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    };
+    let url: http::Uri = "http://127.0.0.1:9/decide".parse()?;
+    let transport = post_json(&client, &url, None, Vec::new(), &limits)
+        .await
+        .err()
+        .ok_or("the exchange with the closed port succeeded")?;
+    let json = serde_json::from_str::<Value>("not json")
+        .err()
+        .ok_or("the text parsed as JSON")?;
+    let request = http::Request::builder()
+        .uri("http://[")
+        .body(())
+        .err()
+        .ok_or("the request was built")?;
+    Ok(vec![
+        DecisionError::Timeout,
+        DecisionError::Busy,
+        DecisionError::RateLimited { retry_after: None },
+        transport,
+        DecisionError::Status(http::StatusCode::BAD_GATEWAY),
+        DecisionError::Body(Box::new(io::Error::other("the body broke"))),
+        DecisionError::Json(json),
+        DecisionError::Request(request),
+        DecisionError::Probability(ProbabilityError { value: 2.0 }),
+        DecisionError::Rejected,
+        DecisionError::MissingAnswer { id: "answers" },
+        DecisionError::AnswerType { id: "answers" },
+    ])
+}
+
+#[tokio::test]
+async fn every_cause_a_decision_error_can_give_is_a_backend_call_or_a_known_non_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    let errors = one_error_of_each_variant().await?;
+
+    let mut variants: Vec<&str> = errors.iter().map(variant_name).collect();
+    variants.sort_unstable();
+    let mut expected = VARIANTS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        variants, expected,
+        "a variant has no sample in one_error_of_each_variant"
+    );
+
+    let causes: BTreeSet<&str> = errors.iter().map(DecisionError::cause).collect();
+    for cause in &causes {
+        assert!(
+            BACKEND_CAUSES.contains(cause) || NOT_CALL_CAUSES.contains(cause),
+            "the cause {cause} is neither a backend call nor a known non-call: add it to BACKEND_CAUSES or NOT_CALL_CAUSES"
+        );
+    }
+    // A listed cause that no error gives is stale. `client_busy` comes from the assessment.
+    for cause in BACKEND_CAUSES.iter().chain(
+        NOT_CALL_CAUSES
+            .iter()
+            .filter(|cause| **cause != "client_busy"),
+    ) {
+        assert!(
+            causes.contains(cause),
+            "{cause} is listed but no DecisionError gives it"
+        );
+    }
+    Ok(())
 }

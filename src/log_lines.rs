@@ -10,8 +10,8 @@ use std::io::{self, BufRead, Read};
 
 use serde_json::Value;
 
-/// The longest line that is kept, in bytes, without its line break. A longer line is
-/// passed on as [`Line::TooLong`].
+/// The longest line that is kept, in bytes, without its line break (LF or CRLF). A longer
+/// line is passed on as [`Line::TooLong`].
 pub(crate) const MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// One line of a log, as [`for_each_line`] passes it on.
@@ -35,22 +35,28 @@ pub(crate) fn for_each_line<R: BufRead>(
     mut input: R,
     mut visit: impl FnMut(Line<'_>),
 ) -> io::Result<()> {
-    // One byte more than the limit, so that a line of exactly the limit and its line break fit.
-    let limit = u64::try_from(MAX_LINE_BYTES + 1).unwrap_or(u64::MAX);
+    // The longest line with its CRLF break, so that a line of exactly the limit fits with either break.
+    let limit = u64::try_from(MAX_LINE_BYTES + 2).unwrap_or(u64::MAX);
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
         if Read::take(&mut input, limit).read_until(b'\n', &mut buffer)? == 0 {
             return Ok(());
         }
-        if buffer.len() > MAX_LINE_BYTES && buffer.last() != Some(&b'\n') {
+        let complete = buffer.last() == Some(&b'\n');
+        let without_break = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
+        let content = without_break.strip_suffix(b"\r").unwrap_or(without_break);
+        if content.len() > MAX_LINE_BYTES {
             visit(Line::TooLong);
-            discard_through_newline(&mut input)?;
+            // Without a line break, the read stopped at the limit, so the rest of the line is
+            // skipped. At the end of the input there is nothing left to skip.
+            if !complete {
+                discard_through_newline(&mut input)?;
+            }
             continue;
         }
-        let content = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
         let text = String::from_utf8_lossy(content);
-        visit(Line::Text(text.trim_end_matches('\r')));
+        visit(Line::Text(&text));
     }
 }
 
@@ -167,6 +173,25 @@ mod tests {
             lines.first().and_then(Option::as_ref).map(String::len),
             Some(MAX_LINE_BYTES)
         );
+    }
+
+    #[test]
+    fn a_line_of_exactly_the_length_limit_with_crlf_is_read_whole() {
+        let mut input = vec![b'a'; MAX_LINE_BYTES];
+        input.extend_from_slice(b"\r\n");
+        let lines = lines_of(&input);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines.first().and_then(Option::as_ref).map(String::len),
+            Some(MAX_LINE_BYTES)
+        );
+    }
+
+    #[test]
+    fn a_line_one_byte_over_the_limit_with_crlf_is_too_long_and_the_next_line_is_read() {
+        let mut input = vec![b'a'; MAX_LINE_BYTES + 1];
+        input.extend_from_slice(b"\r\nok\n");
+        assert_eq!(lines_of(&input), [None, Some("ok".to_owned())]);
     }
 
     #[test]

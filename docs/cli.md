@@ -252,7 +252,8 @@ Follow these steps.
 1. **Check the log format.** The command needs the access log in the built-in
    `json` format, written by a version that includes the
    [`query_shape`](/logging#query-shape) field.
-   Lines written by an older version are counted as unusable and ignored.
+   Lines written by an older version are counted as unusable and ignored. A line
+   longer than 1 MiB is counted as unusable too, and its rest is skipped.
 2. **Run the command.** Give the log file, or `-` to read standard input:
 
    ```console
@@ -344,9 +345,10 @@ A backend call is a line with an `attack` score, or with a `decision_error` that
 comes from a call to the backend: `timeout`, `rate_limited`, `connection`,
 `http_status`, `body`, `parse`, `rejected`, `invalid_response` or `invalid_score`.
 A line with `client_busy`, `backend_busy` or `request` never reached the backend,
-so it is not a call. A timeout is a line whose `decision_error` is `timeout`. A
-line is blocked or redirected when `action` or `would_have` is `block` or
-`redirect`. A skip is a line whose `reason` is `skip` or `skip_rule`.
+so it is not a call. A `parse` error can also come from encoding the request, before
+any call, and it still counts as a call. A timeout is a line whose `decision_error`
+is `timeout`. A line is blocked or redirected when `action` or `would_have` is
+`block` or `redirect`. A skip is a line whose `reason` is `skip` or `skip_rule`.
 
 Paths in the report come from the log. They can contain tokens that appeared in
 URLs, so read the report before you paste it into an issue.
