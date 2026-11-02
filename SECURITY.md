@@ -115,8 +115,21 @@ decision model, in the order the README gives. They never send data anywhere.
   are removed. A third level of encoding is not decoded, so an input encoded three
   times is not seen as the attack it encodes. The request is forwarded unchanged.
   A block matches when any reading matches, so the reading an upstream uses cannot
-  escape a `deny_path`. A static skip needs every reading to be static, so a
-  path such as `/index.php/x.css` or `/x;.css` is always inspected.
+  escape a `deny_path`. A static skip needs every reading to be static. A
+  static-looking path is still inspected, and goes to the backend, when any of
+  these holds:
+  - the raw path has `;`, `\`, `%2F`, `%5C` or `%3B`, or a `?`, `#` or NUL written
+    as `%3F`, `%23` or `%00`, in any letter case;
+  - the raw path has `%25` (an encoded `%`, so the path may be encoded more than
+    once), `%u`, `%c0` or `%c1` (escapes some decoders accept);
+  - a dot-separated part of a segment after its name is a script extension, as in
+    `/index.php/x.css`, `/x.php.js` or `/x.phar/a.js`;
+  - the request is not a plain GET or HEAD with no body and no unlisted query, or
+    the last segment has no static extension;
+  - a `static_location` prefix is set and a reading is outside it, or a
+    `fail_closed_path` matches a reading.
+
+  The same list is in the `static_extensions` entry of the configuration reference.
 - A body rule sees only the first `inspect_body` bytes. Anything later in the
   body is not matched, and a multipart body is not parsed.
 - Regexes use the `regex` crate, which matches in time linear in the input and
