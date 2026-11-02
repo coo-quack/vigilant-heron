@@ -5,8 +5,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
+use vigilant_heron::Config;
 use vigilant_heron::directives::{
     DECISION_DIRECTIVES, SITE_DIRECTIVES, STARTUP_ONLY_DIRECTIVES, TOP_LEVEL_DIRECTIVES,
 };
@@ -18,15 +20,101 @@ fn read(relative: &str) -> Result<String, Box<dyn Error>> {
     Ok(std::fs::read_to_string(path)?)
 }
 
-/// Returns the text of the `## <title>` section, up to the next level-2 heading.
-fn section<'a>(doc: &'a str, title: &str) -> Option<&'a str> {
-    let heading = format!("\n## {title}\n");
+/// Returns the text of the section titled `title` at heading `level` (`2` for `##`), up to the
+/// next heading of the same or a higher level. Lines inside fenced code blocks are not headings,
+/// so a `# comment` in a configuration example does not end the section.
+fn section<'a>(doc: &'a str, level: usize, title: &str) -> Option<&'a str> {
+    let heading = format!("\n{} {title}\n", "#".repeat(level));
     let start = doc.find(&heading)? + heading.len();
     let body = doc.get(start..)?;
-    match body.find("\n## ") {
-        Some(end) => body.get(..end),
-        None => Some(body),
+    let mut in_fence = false;
+    let mut offset: usize = 0;
+    for line in body.split_inclusive('\n') {
+        if line.starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            let hashes = line.bytes().take_while(|&b| b == b'#').count();
+            if (1..=level).contains(&hashes) && line.as_bytes().get(hashes) == Some(&b' ') {
+                return body.get(..offset.saturating_sub(1));
+            }
+        }
+        offset += line.len();
     }
+    Some(body)
+}
+
+#[test]
+fn a_section_ends_at_a_heading_of_the_same_or_a_higher_level() {
+    let doc = "\n### Wanted\nbody\n#### Deeper\nkept\n## Next\nafter\n";
+    assert_eq!(section(doc, 3, "Wanted"), Some("body\n#### Deeper\nkept"));
+}
+
+#[test]
+fn a_hash_line_inside_a_code_block_does_not_end_a_section() {
+    let doc = "\n## Unit\n```ini\n# a comment\n[Unit]\n```\nafter\n## Next\nx\n";
+    assert_eq!(
+        section(doc, 2, "Unit"),
+        Some("```ini\n# a comment\n[Unit]\n```\nafter")
+    );
+}
+
+/// Returns the first `nginx` code block in the `###` section titled `title` whose text starts
+/// with `starts_with`.
+fn nginx_block_in_section<'a>(doc: &'a str, title: &str, starts_with: &str) -> Option<&'a str> {
+    let body = section(doc, 3, title)?;
+    let block_start = body.find(&format!("```nginx\n{starts_with}"))? + "```nginx\n".len();
+    let block = body.get(block_start..)?;
+    block.get(..block.find("\n```")?)
+}
+
+/// Returns the first word after `marker` in `text`, without the `;` that ends a directive.
+fn word_after<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    let rest = text.split_once(marker)?.1;
+    rest.split(|c: char| c.is_whitespace() || c == ';').next()
+}
+
+#[test]
+fn the_wordpress_router_example_loads_with_the_values_it_documents() -> TestResult {
+    const TITLE: &str = "WordPress behind nginx";
+    const MISSING: &str =
+        "docs/install.md has no matching example in the \"WordPress behind nginx\" section";
+    let doc = read("docs/install.md")?;
+    let router = nginx_block_in_section(&doc, TITLE, "listen 127.0.0.1:8090;").ok_or(MISSING)?;
+    let outer_upstream =
+        nginx_block_in_section(&doc, TITLE, "upstream php_router {").ok_or(MISSING)?;
+    let inner_server =
+        nginx_block_in_section(&doc, TITLE, "server {\n    listen 127.0.0.1:").ok_or(MISSING)?;
+
+    // The token comes from the environment at run time; the test supplies a fixed value.
+    let config = Config::parse_str_with_lookup(router, "docs/install.md", |_| {
+        Some("docs-test-token".to_owned())
+    })?;
+
+    // The router listens where the outer upstream sends, and forwards to the inner server.
+    let first_upstream_server = word_after(outer_upstream, "server ").ok_or(MISSING)?;
+    let inner_listen = word_after(inner_server, "listen ").ok_or(MISSING)?;
+    assert_eq!(config.listen, first_upstream_server);
+    let site = config.sites.first().ok_or("the example has no site")?;
+    assert_eq!(
+        site.upstream
+            .authority()
+            .map(ToString::to_string)
+            .as_deref(),
+        Some(inner_listen)
+    );
+
+    // X-Real-IP is believed from 127.0.0.1 alone, not from the whole 127/8 network.
+    assert_eq!(config.realip.header.as_str(), "x-real-ip");
+    assert!(!config.realip.recursive, "real_ip_recursive is off");
+    assert_eq!(config.realip.trusted.len(), 1);
+    let trusted = config.realip.trusted.first().ok_or("no trusted network")?;
+    assert!(trusted.contains(Ipv4Addr::LOCALHOST.into()));
+    assert!(!trusted.contains(Ipv4Addr::new(127, 0, 0, 2).into()));
+
+    assert_eq!(site.timeouts.max_body_bytes, Some(64 * 1024 * 1024));
+    // Every request that reaches the router runs PHP, so the static skip is off.
+    assert_eq!(site.static_extensions, Vec::<String>::new());
+    Ok(())
 }
 
 fn missing_directives<'a>(section_text: &str, names: &[&'a str]) -> Vec<&'a str> {
@@ -46,7 +134,7 @@ fn every_directive_the_parser_accepts_is_documented() -> TestResult {
         ("Site block", SITE_DIRECTIVES),
     ];
     for (title, names) in cases {
-        let text = section(&doc, title)
+        let text = section(&doc, 2, title)
             .ok_or_else(|| format!("docs/configuration.md has no \"## {title}\" section"))?;
         let missing = missing_directives(text, names);
         assert!(
@@ -60,7 +148,7 @@ fn every_directive_the_parser_accepts_is_documented() -> TestResult {
 #[test]
 fn the_wordpress_section_names_every_rule_and_the_include_line() -> TestResult {
     let doc = read("docs/rules.md")?;
-    let text = section(&doc, "WordPress rules")
+    let text = section(&doc, 2, "WordPress rules")
         .ok_or("docs/rules.md has no \"## WordPress rules\" section")?;
     let shipped = read("examples/rules.d/wordpress.conf")?;
     let ids: Vec<&str> = shipped
@@ -220,6 +308,24 @@ fn builtin_rule_default_column_matches_the_default_off_directives() -> TestResul
         .filter(|id| !table.contains_key(*id))
         .collect();
     assert!(missing.is_empty(), "no Default cell for {missing:?}");
+    Ok(())
+}
+
+#[test]
+fn the_systemd_unit_in_the_install_guide_is_the_packaged_file() -> TestResult {
+    let doc = read("docs/install.md")?;
+    let body = section(&doc, 2, "Run as a service with systemd")
+        .ok_or("docs/install.md has no \"## Run as a service with systemd\" section")?;
+    let block = body
+        .split("```ini\n")
+        .nth(1)
+        .and_then(|rest| rest.split("```").next())
+        .ok_or("docs/install.md has no ini block in the systemd section")?;
+    assert_eq!(
+        block,
+        read("packaging/systemd/vigilant-heron.service")?,
+        "the unit in docs/install.md differs from packaging/systemd/vigilant-heron.service"
+    );
     Ok(())
 }
 

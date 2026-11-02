@@ -5,6 +5,7 @@
 //! the header names the decision block redacts. Every error names the file and
 //! line of the directive that caused it.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -517,6 +518,23 @@ pub enum FailureAction {
     Block,
 }
 
+/// A configuration read for a check that calls no backend: `-t`, `-T` and `test-request`.
+///
+/// It is for checks only. Do not serve from it: a token that is not set holds a
+/// placeholder, and the router would start without a real token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckedConfig {
+    /// The configuration. A token that is not set holds a placeholder, which is never sent.
+    pub config: Config,
+    /// The token variable that is not set, when the configuration names one. The router
+    /// will not start without it.
+    pub unset_token: Option<String>,
+}
+
+/// The token a check uses for a variable that is not set. A check calls no backend, so
+/// the placeholder is never sent.
+const UNSET_TOKEN_PLACEHOLDER: &str = "not-set-for-check";
+
 impl Config {
     /// Reads the configuration file at `path`, following its includes.
     ///
@@ -527,6 +545,23 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let directives = conf::load_file(path)?;
         build(&directives, &|name| std::env::var(name).ok())
+    }
+
+    /// Reads the configuration file at `path` for a check that calls no backend, as
+    /// `-t`, `-T` and `test-request` do. A token variable that is not set is not an
+    /// error here: its name is returned in [`CheckedConfig::unset_token`], and the
+    /// check passes on the rest of the file. A variable that is set but blank is still
+    /// an error. [`Config::load`] is unchanged, so starting the router still needs it.
+    ///
+    /// This is for checks only. Never serve from the returned configuration: the token
+    /// may be a placeholder, and [`Config::load`] is the one to start the router with.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Config::load`], except for an unset token variable.
+    pub fn load_for_check(path: &Path) -> Result<CheckedConfig, ConfigError> {
+        let directives = conf::load_file(path)?;
+        check_directives(&directives, &|name| std::env::var(name).ok())
     }
 
     /// Parses configuration text, named `origin` in error messages. Includes are
@@ -1738,6 +1773,25 @@ where
     })
 }
 
+/// Builds the configuration for a check. A token variable that `lookup` does not give is
+/// replaced by [`UNSET_TOKEN_PLACEHOLDER`] and recorded, so the build goes on.
+fn check_directives<F>(directives: &[Directive], lookup: &F) -> Result<CheckedConfig, ConfigError>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let unset = RefCell::new(None);
+    let config = build(directives, &|name: &str| {
+        lookup(name).or_else(|| {
+            *unset.borrow_mut() = Some(name.to_owned());
+            Some(UNSET_TOKEN_PLACEHOLDER.to_owned())
+        })
+    })?;
+    Ok(CheckedConfig {
+        config,
+        unset_token: unset.into_inner(),
+    })
+}
+
 /// Reads the token from the variable `name`. A missing or blank value is an error at `directive`.
 fn read_token<F>(directive: &Directive, name: &str, lookup: &F) -> Result<ApiToken, ConfigError>
 where
@@ -2299,6 +2353,53 @@ mod tests {
         assert!(message(result).contains("is empty"));
     }
 
+    /// Reads `text` for a check, with the token variables read through `lookup`.
+    fn check(
+        text: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<CheckedConfig, ConfigError> {
+        let directives = conf::parse_source(text, "test.conf")?;
+        check_directives(&directives, &lookup)
+    }
+
+    const UNSET_TOKEN_TEXT: &str = "listen 127.0.0.1:8080;\ndecision {\n    api_token_env ABSENT;\n}\n\
+                                    site example.com {\n    upstream http://upstream:80;\n}\n";
+
+    #[test]
+    fn a_check_names_an_unset_token_variable_and_still_loads() -> Result<(), ConfigError> {
+        let checked = check(UNSET_TOKEN_TEXT, |_| None)?;
+        assert_eq!(checked.unset_token.as_deref(), Some("ABSENT"));
+        assert!(matches!(
+            &checked.config.decision.backend,
+            BackendConfig::Jev { token, .. } if token.expose() == UNSET_TOKEN_PLACEHOLDER
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_check_names_no_token_variable_when_the_variable_is_set() -> Result<(), ConfigError> {
+        let checked = check(UNSET_TOKEN_TEXT, |_| Some("tok-123".to_owned()))?;
+        assert_eq!(checked.unset_token, None);
+        assert!(matches!(
+            &checked.config.decision.backend,
+            BackendConfig::Jev { token, .. } if token.expose() == "tok-123"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_check_still_rejects_a_blank_token_variable() {
+        let result = check(UNSET_TOKEN_TEXT, |_| Some("   ".to_owned()));
+        assert!(message(result).contains("ABSENT (api_token_env) is empty"));
+    }
+
+    #[test]
+    fn a_check_still_reports_other_errors_with_their_line() {
+        let text = "listen 127.0.0.1:8080;\ndecision {\n    backend nope;\n}\n\
+                    site example.com {\n    upstream http://upstream:80;\n}\n";
+        assert!(message(check(text, |_| None)).contains("test.conf:3:"));
+    }
+
     #[rstest]
     #[case::clef_flash("clef-flash")]
     #[case::clef("clef")]
@@ -2620,6 +2721,13 @@ mod tests {
         assert_eq!(site.deny_paths, ["/.env", "/.git", "/xmlrpc.php"]);
         assert_eq!(site.fail_closed_paths, ["/wp-login.php"]);
         assert_eq!(site.static_extensions, ["css", "js"]);
+        Ok(())
+    }
+
+    #[test]
+    fn an_empty_static_extensions_list_turns_the_static_skip_off() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    static_extensions;\n"))?;
+        assert_eq!(first_site(&config)?.static_extensions, Vec::<String>::new());
         Ok(())
     }
 

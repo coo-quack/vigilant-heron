@@ -2,12 +2,43 @@
 
 ## Unreleased
 
+- Fixed: a static-looking path no longer takes the static skip when an upstream might
+  read it as something else. It goes to the backend instead. This covers an encoded
+  `?`, `#` or NUL (`%3F`, `%23`, `%00`, in any letter case), any encoded `%` (`%25`, so
+  double and triple encodings such as `%253F` and `%25253F`), the escapes `%u`, `%c0`
+  and `%c1`, and a script extension in any dot-separated part of a segment, such as
+  `/x.php.js` or `/x.phar/a.js`. Before, `/x.php%3Fa.js` and `/x.php%00.js` were
+  forwarded as static assets without calling the backend. The list of script
+  extensions also gains `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`,
+  `shtml`, `shtm`, `cfm`, `cfc`, `ashx`, `asmx` and `axd`.
+
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
   instructions to a reader, comment form submissions and search queries) and three
   `block` rows of prompt injection aimed at an AI. The router itself is unchanged.
   `eval/rules.py` reports them as rows without model results until the providers
   are measured again.
+
+- Added: each release archive holds `packaging/install.sh`, a systemd unit and a
+  logrotate file under `packaging/`, and the sample configuration in
+  `examples/vigilant-heron.conf`. Run `sudo sh packaging/install.sh` from the
+  extracted archive to install the binary, the unit, the logrotate file and the
+  configuration and token files, instead of copying each one by hand. The script
+  never overwrites an existing configuration or token file, and it does not start
+  the service. The install guide's "Run as a service with systemd" section has the
+  details. The unit runs the router with systemd's hardening options. The token file
+  is readable by root only, because systemd reads it as root. The script stops, before
+  it writes anything, when one of its target paths is a symbolic link, when the group
+  `adm` is missing, or when the user `vigilant-heron` has another primary group.
+
+- Added: `test-request --url <url>` checks one request given as a URL, so no file is
+  needed. `http://` and `https://` URLs set the Host header from the host name, and a
+  path (starting with `/`) needs `--host <name>`. `--method <m>` (GET by default) and
+  `--header 'Name: value'` (repeatable) complete the request.
+- Changed: `-t`, `-T` and `test-request` no longer fail when the token variable named
+  by `api_token_env` is not set. They print a warning that the router will not start
+  without it, and the check goes on. Starting the router, in the foreground or with
+  `start` or `restart`, still fails when the variable is not set.
 
 - Added: the `$block_query` log variable. It holds the query string of a blocked
   request (`$action` is `block`, or in shadow mode `$would_have` is `block`), redacted
@@ -49,6 +80,11 @@
   upstream. A request-id header that is longer than 64 characters, or contains a
   space or a non-ASCII character, is no longer logged as sent: the router logs its
   generated id instead. Before, a longer value was logged cut to 128 bytes.
+
+- Added: a "WordPress behind nginx" example in the installation guide. It puts the
+  router in the request path of a PHP site, with a second nginx server that runs PHP
+  behind the router and a `backup` server that keeps the site up while the router is
+  down. The example also shows how to take the router out of the path again.
 
 ## v0.4.1 (2026-10-29)
 

@@ -50,6 +50,7 @@ src/
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
   request_id.rs  # Request ids: the request-id header value or a generated id, and the X-Request-ID response header
+  request_url.rs # test-request --url: builds the raw request from a URL, --host, --method and --header
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   sanitize.rs    # Backend event: header drop, body redaction, truncation
   decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
@@ -77,6 +78,7 @@ tests/
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   block.rs       # block_status and block_page responses, including 444 and location overrides
   docs.rs        # Keeps docs/ in step with the parser's directive lists
+  packaging.rs   # install.sh with --root in a temp dir: files, modes, second run, symlinks, archive layout, unit and logrotate content
   error_log.rs   # The error log across SIGHUP and SIGUSR1, with the real binary
   rate_limits.rs # limit_req and limit_conn: locations, log variables, dry run and shadow, gated upstream
   common/        # Shared helpers: in-process upstream, stub and gated decision backends, client, fake System One endpoint
@@ -99,6 +101,11 @@ scripts/
   e2e-cli.sh     # Binary phase: the release binary run as docs/getting-started.md shows
   e2e-image.sh   # Image phase: the Compose-built image with the e2e configuration
   check-release-binaries.sh # glibc floor and version of the exported release binaries (release.yml and the release-build job)
+  check-install.sh # install.sh on the real paths: user, owners, modes, second run (release-build job, throwaway machine only)
+packaging/
+  install.sh     # Installer run as root from the release archive: binary, unit, logrotate file, config and token files
+  systemd/vigilant-heron.service  # The unit that install.sh installs; docs/install.md shows the same text
+  logrotate/vigilant-heron        # Daily log rotation that sends SIGUSR1 after each rotation
 eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
