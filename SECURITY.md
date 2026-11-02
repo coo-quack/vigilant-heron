@@ -241,7 +241,7 @@ failure and on the site settings:
   `success: false`, and malformed or out-of-range answers.
 - A client that already holds its `max_concurrency_per_client` share is in a
   group of its own, `client_busy`. It follows `on_client_busy`, which defaults to
-  `"block"`: the client gets 429 with an empty body, and the backend is not called.
+  `"block"`: the client gets 429 with an empty body and an `X-Request-ID` header, and the backend is not called.
 - `on_rate_limit` and `on_decision_error` set the outcome for each group:
   `"allow"` (the default) forwards the request, and `"block"` applies the site's
   `action`.

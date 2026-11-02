@@ -84,6 +84,12 @@ given location). An allowed request is forwarded to the upstream. The upstream
 receives the whole body; the router reads only the first `inspect_body` bytes
 for the decision and streams the rest as the upstream reads it.
 
+A block response carries the request id in an `X-Request-ID` header. Without a
+`block_page`, its body is one line of text with the same id, such as
+`Request blocked. Request ID: 3f9a0c17b2d4e8a1`. A site owner who was blocked by
+mistake can quote that id to the operator, who finds the request in the access log
+by it. A `block_status 444` closes the connection and sends nothing.
+
 ## Failure behavior
 
 A decision can fail in three ways, and each has its own site setting.
