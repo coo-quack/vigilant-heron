@@ -29,14 +29,28 @@ pub(crate) enum Screening {
 }
 
 /// Extensions of scripts that run for a path. A static skip never applies when one
-/// of them is in an earlier segment, as in `/index.php/x.css`.
-const DYNAMIC_EXTENSIONS: [&str; 10] = [
-    "php", "phtml", "jsp", "jspx", "asp", "aspx", "cgi", "pl", "py", "rb",
+/// of them is a dot-separated part of any segment after the segment's name, as in
+/// `/index.php/x.css`, `/x.php.js` or `/x.phar/a.js`. See [`has_dynamic_extension`].
+const DYNAMIC_EXTENSIONS: [&str; 25] = [
+    "php", "php3", "php4", "php5", "php7", "php8", "phar", "phps", "pht", "phtml", "shtml", "shtm",
+    "jsp", "jspx", "asp", "aspx", "ashx", "asmx", "axd", "cgi", "cfm", "cfc", "pl", "py", "rb",
 ];
 
-/// Raw path text that makes a path unsafe for a static skip: a parameter separator,
-/// a backslash, or an encoded `/`, `\` or `;`. Compared in lowercase.
-const UNSAFE_RAW_MARKERS: [&str; 5] = [";", "\\", "%2f", "%5c", "%3b"];
+/// Raw path text that makes a path unsafe for a static skip. Compared in lowercase.
+///
+/// - `;`, `\`, and `%2F`, `%5C`, `%3B`: parameters, and separators that an upstream may read.
+/// - `?`, `#`, NUL, and `%3F`, `%23`, `%00`: an upstream may end the path at them.
+///   A literal `?` or `#` cannot reach a path reading over HTTP, since the `http` crate
+///   ends the path there, so those two entries are defense in depth.
+/// - `%25`: an encoded `%`. A path with it may be encoded two or more times, so one decode
+///   does not show what the upstream sees. Every decoded `?`, `#`, NUL or separator that
+///   the readings can show comes from one of the escapes above, and only a `%25` lets
+///   such an escape survive a decode, so this entry covers the double and triple forms.
+/// - `%u`, `%c0`, `%c1`: escapes that some decoders accept (`%uXXXX`, and overlong UTF-8
+///   lead bytes that decode to `/` or `\`).
+const UNSAFE_RAW_MARKERS: [&str; 15] = [
+    ";", "\\", "%2f", "%5c", "%3b", "?", "#", "\0", "%3f", "%23", "%00", "%25", "%u", "%c0", "%c1",
+];
 
 /// The ways the request path is read by the security checks.
 ///
@@ -210,14 +224,14 @@ pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
 ///
 /// Every condition must hold:
 ///
-/// - a GET or HEAD with no body and the raw path free of `;`, `\`, `%2F`, `%5C` and
-///   `%3B` (case-insensitive);
+/// - a GET or HEAD with no body and the raw path free of every entry of
+///   [`UNSAFE_RAW_MARKERS`] (case-insensitive);
 /// - no query, or one made only of `static_query_params` parameters, see
 ///   [`cache_busters_only`], or, with `static_query_token on`, one bare token, see
 ///   [`query_keeps_static_skip`];
 /// - under a `static_location` prefix, when the site sets any: every view starts with one;
-/// - in every view, the last segment has a static extension and no earlier segment
-///   has a script extension;
+/// - in every view, the last segment has a static extension and no segment has a script
+///   extension, see [`is_static_view`];
 /// - no `fail_closed_path` matches any view.
 ///
 /// `views` must be the lowercase views of the request path.
@@ -291,20 +305,27 @@ fn is_cache_buster_value(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
-/// Returns true when a lowercase view ends in a static extension and no earlier segment
-/// ends in a script extension.
+/// Returns true when a lowercase view ends in a static extension and no segment of it
+/// has a script extension, see [`has_dynamic_extension`].
 fn is_static_view(site: &SiteConfig, path: &str) -> bool {
-    let mut segments = path.split('/').rev();
-    let last = segments.next().unwrap_or_default();
+    let last = path.rsplit('/').next().unwrap_or_default();
     let static_last = extension(last).is_some_and(|extension| {
         site.static_extensions
             .iter()
             .any(|allowed| allowed.eq_ignore_ascii_case(extension))
     });
-    let dynamic_earlier = segments.any(|segment| {
-        extension(segment).is_some_and(|extension| DYNAMIC_EXTENSIONS.contains(&extension))
-    });
-    static_last && !dynamic_earlier
+    static_last && !path.split('/').any(has_dynamic_extension)
+}
+
+/// Returns true when a dot-separated part of a segment, after its first part, is a script
+/// extension. The first part is the name, so `php.js` is not dynamic, while `x.php.js`,
+/// `x.phar` and `.php` are. Every part is checked, not only the last, because an upstream
+/// may run a script for any of them.
+fn has_dynamic_extension(segment: &str) -> bool {
+    segment
+        .split('.')
+        .skip(1)
+        .any(|part| DYNAMIC_EXTENSIONS.contains(&part))
 }
 
 /// The text after the last `.` of a segment.
@@ -519,6 +540,85 @@ mod tests {
     #[case::encoded_slash(Method::GET, "/a%2Fb.css", false, true, Screening::Inspect)]
     #[case::encoded_backslash(Method::GET, "/a%5cb.css", false, true, Screening::Inspect)]
     #[case::encoded_semicolon(Method::GET, "/a%3Bb.css", false, true, Screening::Inspect)]
+    // An encoded `?`, `#` or NUL can hide a script name from the extension check, as in
+    // `/x.php?a.js`, which an upstream may read as a script named `x.php`.
+    #[case::encoded_question_mark(Method::GET, "/x.php%3Fa.js", false, true, Screening::Inspect)]
+    #[case::encoded_question_mark_lowercase(
+        Method::GET,
+        "/x.php%3fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::encoded_hash(Method::GET, "/x.php%23a.js", false, true, Screening::Inspect)]
+    #[case::encoded_nul(Method::GET, "/x.php%00.js", false, true, Screening::Inspect)]
+    // Encoded twice: the first decode leaves `%3F`, `%23` or `%00` in the view.
+    #[case::double_encoded_question_mark(
+        Method::GET,
+        "/x.php%253Fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::double_encoded_hash(Method::GET, "/x.php%2523a.js", false, true, Screening::Inspect)]
+    #[case::double_encoded_nul(Method::GET, "/x.php%2500.js", false, true, Screening::Inspect)]
+    // A literal `?` or `#` in a reading is inspected too, even though the HTTP layer normally splits it off.
+    #[case::literal_question_mark_in_a_reading(
+        Method::GET,
+        "/x.php?a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::literal_hash_in_a_reading(Method::GET, "/x.php#a.js", false, true, Screening::Inspect)]
+    // Only the raw markers catch these: the `..` removes the escape in every reading.
+    #[case::encoded_question_mark_before_dot_dot(
+        Method::GET,
+        "/x.php%3F/../a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::encoded_hash_before_dot_dot(
+        Method::GET,
+        "/x.php%23/../a.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    // Any encoded percent sign makes the path inspected, so every multiple encoding is caught.
+    #[case::double_encoded_slash(Method::GET, "/a%252Fb.css", false, true, Screening::Inspect)]
+    #[case::triple_encoded_question_mark(
+        Method::GET,
+        "/x.php%25253Fa.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    // Escapes that some decoders accept.
+    #[case::iis_unicode_escape(Method::GET, "/a%u002fb.css", false, true, Screening::Inspect)]
+    #[case::overlong_slash(Method::GET, "/a%c0%afb.css", false, true, Screening::Inspect)]
+    #[case::overlong_backslash(Method::GET, "/a%c1%9cb.css", false, true, Screening::Inspect)]
+    // A script extension in any part of the file name, or of a segment before it.
+    #[case::script_extension_before_static_one(
+        Method::GET,
+        "/x.php.js",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    #[case::phar_directory(Method::GET, "/x.phar/a.js", false, true, Screening::Inspect)]
+    #[case::dynamic_extension_in_a_dotfile(
+        Method::GET,
+        "/.php/a.css",
+        false,
+        true,
+        Screening::Inspect
+    )]
+    // A name whose first part is `php` is not a script extension.
+    #[case::php_as_the_name_is_static(Method::GET, "/php.js", false, true, Screening::Skip)]
+    // A plain static path with none of these still skips.
+    #[case::plain_static_path_still_skips(Method::GET, "/a.js", false, true, Screening::Skip)]
     // A script earlier in the path serves the request as PATH_INFO.
     #[case::path_info_of_a_script(Method::GET, "/index.php/x.css", false, true, Screening::Inspect)]
     #[case::path_info_of_an_aspx_page(
@@ -541,6 +641,23 @@ mod tests {
             expected,
             "{raw_path}"
         );
+        Ok(())
+    }
+
+    /// Every script extension in the list makes a static-looking path inspected, as the last
+    /// part of a file name and as a directory name. The docs list the same extensions.
+    #[test]
+    fn every_dynamic_extension_makes_a_static_looking_path_inspected() -> Result<(), ConfigError> {
+        let config = site("")?;
+        for extension in DYNAMIC_EXTENSIONS {
+            for raw_path in [format!("/x.{extension}.js"), format!("/x.{extension}/a.js")] {
+                assert_eq!(
+                    screen_path(&config, &Method::GET, &raw_path, false, true),
+                    Screening::Inspect,
+                    "{raw_path}"
+                );
+            }
+        }
         Ok(())
     }
 
