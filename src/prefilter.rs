@@ -530,6 +530,16 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_static_extensions_list_skips_no_path() -> Result<(), ConfigError> {
+        let config = site("static_extensions;")?;
+        assert_eq!(
+            screen_path(&config, &Method::GET, "/style.css", false, true),
+            Screening::Inspect
+        );
+        Ok(())
+    }
+
+    #[test]
     fn a_fail_closed_path_ending_in_a_static_extension_is_inspected() -> Result<(), ConfigError> {
         let config = site("fail_closed_path /api/x.css;")?;
         assert_eq!(

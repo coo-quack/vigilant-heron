@@ -659,7 +659,7 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params)) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params)) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected. An empty list (`static_extensions;`) turns the static skip off for the site.
 
 ### `static_location`
 

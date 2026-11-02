@@ -206,13 +206,39 @@ server {
     index index.php;                       # a request for / is answered by index.php
     client_max_body_size 64m;              # the same limit as the router and the inner server
 
+    # Paths that are never served. This is a minimum, not a full list.
+    # Dotfiles are denied, except those under /.well-known/.
+    location ^~ /.well-known/ {
+        try_files $uri =404;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+
+    # wp-config.php and its backups, such as wp-config.php.bak or wp-config.php~.
+    location ~* /wp-config[^/]*$ {
+        deny all;
+    }
+
+    location ~* \.(log|sql|bak)$ {
+        deny all;
+    }
+
+    # Many sites do not use XML-RPC, and xmlrpc.php is a common target for password guessing.
+    # Remove this block if your site uses XML-RPC clients.
+    location = /xmlrpc.php {
+        deny all;
+    }
+
     location / {
-        try_files $uri $uri/ =404;
+        try_files $uri $uri/ /index.php?$args;
     }
 
     location ~ \.php$ {
         try_files $uri =404;               # a missing script is a 404 here, not a router request
         proxy_pass http://php_router$request_uri;
+        proxy_next_upstream error;         # not "error timeout": see the backup server below
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;
@@ -246,7 +272,7 @@ server {
     real_ip_header X-Real-IP;
 
     location / {
-        try_files $uri $uri/ =404;
+        try_files $uri $uri/ /index.php?$args;
     }
 
     location ~ \.php$ {
@@ -265,6 +291,7 @@ The router reads its own settings from its configuration file:
 listen 127.0.0.1:8090;                     # the upstream above names this address
 real_ip_from 127.0.0.1;                    # trust X-Real-IP only from the outer nginx
 real_ip_header X-Real-IP;
+real_ip_recursive off;
 
 decision {
     backend jev;                           # reads TYPESAFE_API_KEY, as in the example above
@@ -273,6 +300,7 @@ decision {
 site example.com {
     upstream http://127.0.0.1:8091;        # the inner server
     client_max_body_size 64m;              # the router's default is 1m
+    static_extensions;                     # no static skip: see "Missing files" below
 }
 ```
 
@@ -284,13 +312,21 @@ Each part has a reason:
 
 **Request size.** The router's `client_max_body_size` defaults to `1m`, so an upload above 1 MB gets 413 from the router. Set the same limit on the outer nginx, the router and the inner server. Otherwise the one with the smallest limit refuses the upload first.
 
-**The URI and the index redirect.** `index index.php;` makes nginx answer a request for `/` with `/index.php`. nginx makes this an internal redirect, so the request then matches `location ~ \.php$`. The default index is `index.html`, so without this line a request for `/` would not reach PHP. `$request_uri` is the URI the client sent, so the router receives `/`, not `/index.php`.
+**The URI and the index redirect.** `index index.php;` makes nginx answer a request for `/` with `/index.php`. nginx makes this an internal redirect, so the request then matches `location ~ \.php$`. The default index is `index.html`, so without this line a request for `/` would not reach PHP.
 
-**Static files.** A request for a file such as `/style.css` matches only `location /`, which has no `proxy_pass`. nginx serves the file itself, so the router never sees it and no model call is made for it.
+**Static files.** A request for a file that exists, such as `/style.css`, matches only `location /`, which has no `proxy_pass`. nginx serves the file itself, so the router never sees it.
 
-**The backup server.** nginx sends requests to the router, and sends them to the `backup` server only while the router is unavailable. With `max_fails=1 fail_timeout=10s`, one failed attempt marks the router unavailable for 10 seconds. nginx passes a request to the next server only on an error or a timeout, which is the default `proxy_next_upstream error timeout`. nginx does not send a POST to another server after it was sent to the router. A 403 or 429 from the router is a response, not an error, so nginx does not retry it.
+**Missing files.** A file that does not exist, such as `/missing.js`, falls back to `/index.php` and reaches the router. The router's static skip would let such a request skip the backend, because it trusts the file extension. Every request that reaches the router here runs PHP, so the router site sets `static_extensions;` with no extension, which turns the static skip off.
 
-**Switching back.** To take the router out of the request path, point the upstream at the inner server only, then reload nginx so that it re-reads its configuration:
+**Permalinks.** The fallback `/index.php?$args` lets a path such as `/about/` reach WordPress, which then finds the page. The outer nginx still sends the original URI to the router through `$request_uri`, so the router sees `/about/`, not `/index.php`.
+
+**The backup server.** nginx sends requests to the router, and sends them to the `backup` server only while the router is unavailable. With `max_fails=1 fail_timeout=10s`, one failed attempt marks the router unavailable for 10 seconds. The outer PHP location uses `proxy_next_upstream error;` instead of the default `error timeout`. With the default, a GET whose router sends nothing for longer than `proxy_read_timeout` (60 seconds by default) is sent again to the backup, which bypasses the router, and that timeout can also mark the router unavailable for `fail_timeout`. With `error`, only a router that cannot be reached, or that fails while nginx sends the request or reads the response header, moves the request to the backup. nginx does not send a POST to another server after it was sent to the router, and a 403 or 429 from the router is a response, not an error, so nginx does not retry it.
+
+**Failure settings.** `on_decision_error` and `on_rate_limit` both default to `allow`, so when the backend fails, the router forwards the request. Set `block` to refuse it instead. See [`on_decision_error`](/configuration#on-decision-error) and [`on_rate_limit`](/configuration#on-rate-limit).
+
+**Client address.** This example assumes that nginx faces the visitors directly. If Cloudflare or another proxy is in front of the outer nginx, first set the visitor's address on the outer nginx with `set_real_ip_from` and `real_ip_header`, as in [Cloudflare in front](#cloudflare-in-front). Otherwise `$remote_addr` is the proxy's address, and the router and WordPress see the proxy as the visitor.
+
+**Switching back.** To take the router out of the request path, point the upstream at the inner server only:
 
 ```nginx
 upstream php_router {
@@ -298,6 +334,8 @@ upstream php_router {
     keepalive 16;
 }
 ```
+
+Then run `nginx -s reload`. nginx checks the new configuration before it applies it, and keeps the old one if the check fails.
 
 ### Try shadow mode beside a live site with an nginx mirror
 
