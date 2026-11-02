@@ -72,6 +72,7 @@ tests/
   limits.rs      # Timers, header limits, body limit and upstream timeouts, with short timers
   logging.rs     # Access-log lines: fields, request id, causes, formats, access_log off
   rules.rs       # Access list and rule decisions in-process: order, shadow mode, logging, backend failures
+  wordpress_rules.rs # The optional WordPress rule file: each rule's matches and near misses, block precedence, the -t test
   clef_live.rs   # Ignored; calls Cloudflare Workers AI, never run in CI
   block.rs       # block_status and block_page responses, including 444 and location overrides
   docs.rs        # Keeps docs/ in step with the parser's directive lists
@@ -108,6 +109,7 @@ eval/
 examples/
   vigilant-heron.conf # Fully commented sample configuration
   rules.d/local.conf  # Commented sample rules, for an include
+  rules.d/wordpress.conf # Optional skip rules for WordPress sites: copied to rules.d/ and included by the site
 ```
 
 Top-level and documentation files:
