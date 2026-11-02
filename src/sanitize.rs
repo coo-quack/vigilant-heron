@@ -121,6 +121,8 @@ pub(crate) struct EventInput<'a> {
     pub(crate) redact_headers: &'a [String],
     /// Extra body field names to redact, lowercased (`redact_field`).
     pub(crate) redact_fields: &'a [String],
+    /// Whether the content of a multipart file part is replaced (`redact_file_parts`).
+    pub(crate) redact_file_parts: bool,
     /// Maximum number of body bytes sent to the backend.
     pub(crate) inspect_body_bytes: usize,
 }
@@ -131,7 +133,13 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
         .headers
         .get(http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
-    let redacted = redact_body(content_type, input.body, input.redact_fields);
+    let redacted = redact_body(
+        content_type,
+        input.body,
+        input.body_continues,
+        input.redact_fields,
+        input.redact_file_parts,
+    );
     let (body, cut) = truncate_utf8(redacted, input.inspect_body_bytes);
     let body_truncated = cut || input.body_continues;
     DecisionEvent {
@@ -375,21 +383,32 @@ fn is_redacted_key(key: &str, redact_fields: &[String]) -> bool {
 ///
 /// Form bodies are split into fields on `&` and `;`, as query strings are. Multipart
 /// bodies are split into parts, and a part is redacted by its `Content-Disposition`
-/// name. Other bodies are parsed as JSON when possible. Anything else, including
-/// malformed JSON and XML, gets lexical redaction. A multipart body that does not have
-/// the expected framing also gets lexical redaction.
+/// name, or by its file name when `redact_file_parts` is set. Other bodies are parsed as
+/// JSON when possible. Anything else, including malformed JSON and XML, gets lexical
+/// redaction. A multipart body that does not have the expected framing also gets lexical
+/// redaction.
+///
+/// `truncated` says that `body` is only the start of a longer body. See [`redact_multipart`].
 pub(crate) fn redact_body(
     content_type: Option<&str>,
     body: &[u8],
+    truncated: bool,
     redact_fields: &[String],
+    redact_file_parts: bool,
 ) -> String {
     let text = String::from_utf8_lossy(body);
     if is_form_content_type(content_type) {
         return redact_query(&text, redact_fields);
     }
-    if let Some(multipart) = multipart_boundary(content_type)
-        .and_then(|boundary| redact_multipart(&text, &boundary, redact_fields))
-    {
+    if let Some(multipart) = multipart_boundary(content_type).and_then(|boundary| {
+        redact_multipart(
+            &text,
+            &boundary,
+            truncated,
+            redact_fields,
+            redact_file_parts,
+        )
+    }) {
         return multipart;
     }
     if let Some(json) = redact_json(body, redact_fields) {
@@ -416,13 +435,26 @@ fn multipart_boundary(content_type: Option<&str>) -> Option<String> {
     })
 }
 
-/// Redacts the value of each `multipart/form-data` part whose `Content-Disposition` name is
-/// sensitive. Boundaries and part headers are copied as they were sent.
+/// Redacts the value of each `multipart/form-data` part that is sensitive: a part whose
+/// `Content-Disposition` name is sensitive, or a file part when `redact_file_parts` is set.
+/// Boundaries and part headers are copied as they were sent.
+///
+/// When `truncated` is set, `text` is only the start of a longer body. Its last part has no
+/// closing delimiter, and it is judged by its headers: they are copied, and its content is
+/// replaced when the part is redacted. The content is copied as it is otherwise. When the
+/// cut falls inside the part headers, what is there is copied as it is.
 ///
 /// Returns `None` when the framing is not as expected (no opening delimiter, a part without a
-/// blank line after its headers, or no closing delimiter). The caller then uses lexical
-/// redaction. Each part is searched only inside its own bytes, so the work is linear.
-fn redact_multipart(text: &str, boundary: &str, redact_fields: &[String]) -> Option<String> {
+/// blank line after its headers, or no closing delimiter in a body that was not truncated).
+/// The caller then uses lexical redaction. Each part is searched only inside its own bytes, so
+/// the work is linear.
+fn redact_multipart(
+    text: &str,
+    boundary: &str,
+    truncated: bool,
+    redact_fields: &[String],
+    redact_file_parts: bool,
+) -> Option<String> {
     let open = format!("--{boundary}");
     let sep = format!("\n{open}");
     let mut out = String::with_capacity(text.len());
@@ -434,25 +466,42 @@ fn redact_multipart(text: &str, boundary: &str, redact_fields: &[String]) -> Opt
             out.push_str(text.get(pos..)?);
             return Some(out);
         }
-        // The newline that ends the opening delimiter line.
-        let delim_nl = pos + open.len() + after_open.find('\n')?;
+        // The newline that ends the opening delimiter line. A cut before it leaves no part to judge.
+        let Some(nl) = after_open.find('\n') else {
+            return keep_cut_rest(out, text, pos, truncated);
+        };
+        let delim_nl = pos + open.len() + nl;
         let rest = text.get(delim_nl..)?;
         // The next delimiter starts with the newline that ends this part's content.
-        let part_len = rest.find(&sep)?;
-        let part = rest.get(..part_len)?;
-        let blank = match (part.find("\n\r\n"), part.find("\n\n")) {
-            (Some(crlf), Some(lf)) if lf < crlf => (lf, 2),
-            (Some(crlf), _) => (crlf, 3),
-            (None, Some(lf)) => (lf, 2),
-            (None, None) => return None,
+        let part_len = rest.find(&sep);
+        if part_len.is_none() && !truncated {
+            return None;
+        }
+        let part = match part_len {
+            Some(len) => rest.get(..len)?,
+            None => rest,
         };
-        let body_start = delim_nl + blank.0 + blank.1;
-        let body_end = delim_nl + part_len;
+        let Some((blank_at, blank_len)) = blank_line(part) else {
+            return keep_cut_rest(out, text, pos, part_len.is_none());
+        };
+        let body_start = delim_nl + blank_at + blank_len;
         let headers = text.get(delim_nl..body_start)?;
+        let redacted = part_is_redacted(headers, redact_fields, redact_file_parts);
+        let Some(len) = part_len else {
+            // The last part of a cut body: its headers are complete, so its content is judged.
+            out.push_str(text.get(pos..body_start)?);
+            if redacted {
+                out.push_str(REDACTED);
+            } else {
+                out.push_str(text.get(body_start..)?);
+            }
+            return Some(out);
+        };
+        let body_end = delim_nl + len;
         let content = text.get(body_start..body_end)?;
         let value = content.strip_suffix('\r').unwrap_or(content);
         out.push_str(text.get(pos..body_start)?);
-        if part_is_redacted(headers, redact_fields) {
+        if redacted {
             // Keep the line ending before the next delimiter, so the framing stays intact.
             out.push_str(REDACTED);
             out.push_str(text.get(body_start + value.len()..=body_end)?);
@@ -463,22 +512,54 @@ fn redact_multipart(text: &str, boundary: &str, redact_fields: &[String]) -> Opt
     }
 }
 
-/// Returns true when a part's `Content-Disposition` names a redacted field. Only the `name`
-/// parameter counts, so `filename` never names a field.
-fn part_is_redacted(headers: &str, redact_fields: &[String]) -> bool {
-    headers.lines().any(|line| {
-        let Some((field, value)) = line.split_once(':') else {
-            return false;
-        };
-        field.trim().eq_ignore_ascii_case("content-disposition")
-            && value
-                .split(';')
-                .filter_map(|param| param.trim().split_once('='))
-                .any(|(key, name)| {
-                    key.trim().eq_ignore_ascii_case("name")
-                        && is_redacted_key(name.trim().trim_matches('"'), redact_fields)
-                })
+/// Finds the blank line that ends the part headers in `part`. Returns its offset and its
+/// length, which is 2 for `\n\n` and 3 for `\n\r\n`.
+fn blank_line(part: &str) -> Option<(usize, usize)> {
+    match (part.find("\n\r\n"), part.find("\n\n")) {
+        (Some(crlf), Some(lf)) if lf < crlf => Some((lf, 2)),
+        (Some(crlf), _) => Some((crlf, 3)),
+        (None, Some(lf)) => Some((lf, 2)),
+        (None, None) => None,
+    }
+}
+
+/// Copies the rest of a cut body from `pos` as it is. This is only safe when the cut falls
+/// before the content of the last part, so `cut` must say that. When `cut` is false the
+/// framing is broken, and the result is `None`.
+fn keep_cut_rest(mut out: String, text: &str, pos: usize, cut: bool) -> Option<String> {
+    if !cut {
+        return None;
+    }
+    out.push_str(text.get(pos..)?);
+    Some(out)
+}
+
+/// Returns true when a part must be redacted: its `Content-Disposition` `name` is a redacted
+/// field, or `redact_file_parts` is set and the part is a file part (see [`is_file_part_key`]).
+fn part_is_redacted(headers: &str, redact_fields: &[String], redact_file_parts: bool) -> bool {
+    content_disposition_params(headers).any(|(key, value)| {
+        (key.eq_ignore_ascii_case("name")
+            && is_redacted_key(value.trim_matches('"'), redact_fields))
+            || (redact_file_parts && is_file_part_key(key))
     })
+}
+
+/// Returns the `(key, value)` pairs of the `Content-Disposition` header lines in a part's
+/// headers, with the spaces around each key and value removed. A `;` separates the pairs.
+fn content_disposition_params(headers: &str) -> impl Iterator<Item = (&str, &str)> {
+    headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(field, _)| field.trim().eq_ignore_ascii_case("content-disposition"))
+        .flat_map(|(_, value)| value.split(';'))
+        .filter_map(|param| param.split_once('='))
+        .map(|(key, value)| (key.trim(), value.trim()))
+}
+
+/// Returns true for the parameter names that make a part a file part: `filename` and
+/// `filename*`, in any letter case. The value is not decoded.
+fn is_file_part_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("filename") || key.eq_ignore_ascii_case("filename*")
 }
 
 fn is_form_content_type(content_type: Option<&str>) -> bool {
@@ -777,9 +858,19 @@ mod tests {
             .collect()
     }
 
-    /// Redacts a body with no extra field names.
+    /// Redacts a body with no extra field names, as a body that was not cut.
     fn redact(content_type: Option<&str>, body: &[u8]) -> String {
-        redact_body(content_type, body, &[])
+        redact_body(content_type, body, false, &[], true)
+    }
+
+    /// Redacts the start of a body that was cut, as `build_event` does.
+    fn redact_cut(
+        content_type: Option<&str>,
+        body: &[u8],
+        fields: &[String],
+        redact_file_parts: bool,
+    ) -> String {
+        redact_body(content_type, body, true, fields, redact_file_parts)
     }
 
     fn json_value(encoded: &str) -> Option<Value> {
@@ -1192,7 +1283,9 @@ mod tests {
         let form = redact_body(
             Some("application/x-www-form-urlencoded"),
             b"Ticket_Ref=T1&ticket=x",
+            false,
             &fields,
+            true,
         );
         let pairs = form_pairs(&form);
         assert!(pairs.contains(&("Ticket_Ref".to_owned(), REDACTED.to_owned())));
@@ -1201,21 +1294,25 @@ mod tests {
         let json = redact_body(
             Some("application/json"),
             br#"{"outer":{"ticket_ref":"T1"},"ticket":"x"}"#,
+            false,
             &fields,
+            true,
         );
         let value = json_value(&json).unwrap_or(Value::Null);
         assert_eq!(value["outer"]["ticket_ref"], REDACTED);
         assert_eq!(value["ticket"], "x");
 
         assert_eq!(
-            redact_body(None, b"ticket_ref=T1 ticket=x", &fields),
+            redact_body(None, b"ticket_ref=T1 ticket=x", false, &fields, true),
             "ticket_ref=[REDACTED] ticket=x"
         );
         assert_eq!(
             redact_body(
                 Some("application/json"),
                 br#"{"ticket_ref": "T1", "n": 1"#,
-                &fields
+                false,
+                &fields,
+                true
             ),
             r#"{"ticket_ref": "[REDACTED]", "n": 1"#
         );
@@ -1225,7 +1322,13 @@ mod tests {
     fn redact_field_names_match_the_whole_name_only() {
         let fields = vec!["ticket_ref".to_owned()];
         assert_eq!(
-            redact_body(None, b"my_ticket_ref=T1&ticket_refs=2", &fields),
+            redact_body(
+                None,
+                b"my_ticket_ref=T1&ticket_refs=2",
+                false,
+                &fields,
+                true
+            ),
             "my_ticket_ref=T1&ticket_refs=2"
         );
     }
@@ -1563,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn multipart_ordinary_part_is_kept_and_sensitive_part_redacted() {
+    fn multipart_ordinary_part_is_kept_and_sensitive_and_file_parts_are_redacted() {
         let body = "--BB\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n\
                     --BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n\
                     --BB\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"pw.png\"\r\n\
@@ -1574,7 +1677,7 @@ mod tests {
             "--BB\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n\
              --BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n\
              --BB\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"pw.png\"\r\n\
-             Content-Type: image/png\r\n\r\nbinary\r\n--BB--\r\n"
+             Content-Type: image/png\r\n\r\n[REDACTED]\r\n--BB--\r\n"
         );
     }
 
@@ -1587,7 +1690,9 @@ mod tests {
             redact_body(
                 Some("multipart/form-data; boundary=BB"),
                 body.as_bytes(),
-                &fields
+                false,
+                &fields,
+                true
             ),
             "--BB\r\nContent-Disposition: form-data; name=\"ticket_ref\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
         );
@@ -1628,6 +1733,217 @@ mod tests {
             redact(Some("multipart/form-data; boundary=BB"), body.as_bytes()),
             body
         );
+    }
+
+    #[rstest]
+    #[case::sensitive_part_before_the_cut(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB\r\nContent-Disposition: form-data; name=\"comment\"\r\n\r\nhel",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n--BB\r\nContent-Disposition: form-data; name=\"comment\"\r\n\r\nhel"
+    )]
+    #[case::ordinary_part_before_the_cut_is_kept(
+        "--BB\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhun",
+        "--BB\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\nalice\r\n--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]"
+    )]
+    #[case::cut_inside_part_headers_keeps_the_headers(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB\r\nContent-Disposition: form-data; na",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n--BB\r\nContent-Disposition: form-data; na"
+    )]
+    #[case::cut_right_after_the_delimiter_line(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--BB",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]\r\n--BB"
+    )]
+    #[case::partial_delimiter_stays_inside_the_cut_part(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2\r\n--B",
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\n[REDACTED]"
+    )]
+    #[case::file_part_cut_mid_content(
+        "--BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"pic.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nJFIF-data",
+        "--BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"pic.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n[REDACTED]"
+    )]
+    fn truncated_multipart_redacts_the_parts_before_and_at_the_cut(
+        #[case] body: &str,
+        #[case] expected: &str,
+    ) {
+        assert_eq!(
+            redact_cut(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                &[],
+                true
+            ),
+            expected
+        );
+    }
+
+    #[test]
+    fn truncated_multipart_redact_field_part_cut_mid_content_is_redacted() {
+        let fields = vec!["async-upload".to_owned()];
+        let body = "--BB\r\nContent-Disposition: form-data; name=\"async-upload\"; filename=\"a.jpg\"\r\n\r\nJFIF";
+        assert_eq!(
+            redact_cut(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                &fields,
+                false
+            ),
+            "--BB\r\nContent-Disposition: form-data; name=\"async-upload\"; filename=\"a.jpg\"\r\n\r\n[REDACTED]"
+        );
+    }
+
+    #[rstest]
+    #[case::no_opening_delimiter("password=hunter2")]
+    #[case::complete_part_without_blank_line(
+        "--BB\r\nContent-Disposition: form-data; name=\"password\"\r\nhunter2\r\n--BB\r\nContent-Disposition: form-data; name=\"x\"\r\n\r\nab"
+    )]
+    fn truncated_multipart_with_framing_broken_before_the_cut_is_lexical(#[case] body: &str) {
+        assert_eq!(
+            redact_cut(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                &[],
+                true
+            ),
+            redact_lexical(body, &[])
+        );
+    }
+
+    #[rstest]
+    #[case::filename("name=\"upload\"; filename=\"pic.jpg\"")]
+    #[case::filename_star("name=\"upload\"; filename*=UTF-8''%E5%86%99%E7%9C%9F.jpg")]
+    #[case::filename_in_upper_case("name=\"upload\"; FILENAME=\"a.txt\"")]
+    fn file_parts_are_redacted_with_their_headers_kept(#[case] disposition: &str) {
+        let body = format!(
+            "--BB\r\nContent-Disposition: form-data; {disposition}\r\nContent-Type: image/jpeg\r\n\r\nJFIF\r\n--BB--\r\n"
+        );
+        let expected = format!(
+            "--BB\r\nContent-Disposition: form-data; {disposition}\r\nContent-Type: image/jpeg\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+        );
+        assert_eq!(
+            redact(Some("multipart/form-data; boundary=BB"), body.as_bytes()),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_part_named_filename_without_a_filename_parameter_is_not_a_file_part() {
+        let body = "--BB\r\nContent-Disposition: form-data; name=\"filename\"\r\n\r\nreport.pdf\r\n--BB--\r\n";
+        assert_eq!(
+            redact(Some("multipart/form-data; boundary=BB"), body.as_bytes()),
+            body
+        );
+    }
+
+    #[test]
+    fn redact_file_parts_off_keeps_file_content() {
+        let body = "--BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"pic.jpg\"\r\nContent-Type: image/jpeg\r\n\r\nJFIF\r\n--BB--\r\n";
+        assert_eq!(
+            redact_body(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                false,
+                &[],
+                false
+            ),
+            body
+        );
+    }
+
+    #[test]
+    fn redact_file_parts_off_still_redacts_a_file_part_with_a_sensitive_name() {
+        let body = "--BB\r\nContent-Disposition: form-data; name=\"password\"; filename=\"x.txt\"\r\n\r\nhunter2\r\n--BB--\r\n";
+        assert_eq!(
+            redact_body(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                false,
+                &[],
+                false
+            ),
+            "--BB\r\nContent-Disposition: form-data; name=\"password\"; filename=\"x.txt\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+        );
+    }
+
+    #[test]
+    fn redact_file_parts_off_still_redacts_a_file_part_named_in_redact_field() {
+        let fields = vec!["async-upload".to_owned()];
+        let body = "--BB\r\nContent-Disposition: form-data; name=\"async-upload\"; filename=\"a.jpg\"\r\n\r\nJFIF\r\n--BB--\r\n";
+        assert_eq!(
+            redact_body(
+                Some("multipart/form-data; boundary=BB"),
+                body.as_bytes(),
+                false,
+                &fields,
+                false
+            ),
+            "--BB\r\nContent-Disposition: form-data; name=\"async-upload\"; filename=\"a.jpg\"\r\n\r\n[REDACTED]\r\n--BB--\r\n"
+        );
+    }
+
+    #[rstest]
+    #[case::continues(true, false)]
+    #[case::complete(false, true)]
+    fn build_event_passes_body_continues_to_the_multipart_redaction(
+        #[case] body_continues: bool,
+        #[case] hunter2_is_sent: bool,
+    ) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=BB"),
+        );
+        let event = build_event(&EventInput {
+            method: &Method::POST,
+            path: "/post",
+            query: None,
+            headers: &headers,
+            body: b"--BB\r\nContent-Disposition: form-data; name=\"password\"\r\n\r\nhunter2",
+            body_continues,
+            host: "example.com",
+            client_ip: "203.0.113.7",
+            redact_headers: &[],
+            redact_fields: &[],
+            redact_file_parts: true,
+            inspect_body_bytes: 1024,
+        });
+        let json = serde_json::to_value(&event).unwrap_or(Value::Null);
+        let body = json["event"]["untrusted"]["body"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(body.contains("hunter2"), hunter2_is_sent);
+        assert_eq!(json["event"]["meta"]["body_truncated"], body_continues);
+    }
+
+    #[rstest]
+    #[case::redacted(true, false)]
+    #[case::kept(false, true)]
+    fn build_event_passes_redact_file_parts_to_the_body(
+        #[case] redact_file_parts: bool,
+        #[case] jfif_is_sent: bool,
+    ) {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("multipart/form-data; boundary=BB"),
+        );
+        let event = build_event(&EventInput {
+            method: &Method::POST,
+            path: "/post",
+            query: None,
+            headers: &headers,
+            body: b"--BB\r\nContent-Disposition: form-data; name=\"upload\"; filename=\"a.jpg\"\r\n\r\nJFIF\r\n--BB--\r\n",
+            body_continues: false,
+            host: "example.com",
+            client_ip: "203.0.113.7",
+            redact_headers: &[],
+            redact_fields: &[],
+            redact_file_parts,
+            inspect_body_bytes: 1024,
+        });
+        let json = serde_json::to_value(&event).unwrap_or(Value::Null);
+        let body = json["event"]["untrusted"]["body"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(body.contains("JFIF"), jfif_is_sent);
     }
 
     #[rstest]
@@ -1765,6 +2081,7 @@ mod tests {
             client_ip: "203.0.113.7",
             redact_headers: &[],
             redact_fields: &[],
+            redact_file_parts: true,
             inspect_body_bytes: 4,
         });
         let json = serde_json::to_value(&event).unwrap_or(Value::Null);
@@ -1788,6 +2105,7 @@ mod tests {
             client_ip: "203.0.113.7",
             redact_headers: &[],
             redact_fields: &[],
+            redact_file_parts: true,
             inspect_body_bytes: 10,
         });
         let json = serde_json::to_value(&event).unwrap_or(Value::Null);

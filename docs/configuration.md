@@ -563,6 +563,14 @@ Extra header names removed before the event is sent to the backend. Repeatable. 
 
 Extra field names whose values are replaced by `[REDACTED]` before the event is sent to the backend. This applies to form, JSON, multipart and XML bodies, and to the query string. A name matches a whole field name, compared case-insensitively: `ticket_ref` redacts `Ticket_Ref` but not `my_ticket_ref`. For a multipart part, the name is the `name` in its `Content-Disposition`. For an XML element, it is the local name without the prefix, so `ticket_ref` also redacts `<ns:ticket_ref>`. Repeatable.
 
+### `redact_file_parts`
+
+- **Syntax:** `redact_file_parts on | off;`
+- **Default:** `on`.
+- **Context:** decision.
+
+Whether the content of a file part in a `multipart/form-data` body is replaced by `[REDACTED]` before the event is sent to the backend. A file part is a part whose `Content-Disposition` has a `filename` or `filename*` parameter. Its part headers, with the field name, the file name and the content type, are always sent, so the model still sees the file name and the content type, for example a `.php` file sent as `image/jpeg`. With `off`, the content is sent like any other part, up to `inspect_body`. A file part whose field name is sensitive or named in `redact_field` is redacted either way.
+
 ## Site block
 
 A `site` names the hosts it serves after the keyword. It is required to have at

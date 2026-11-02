@@ -16,6 +16,19 @@
   each such request went to the backend, and a post editor page could exceed
   `max_concurrency_per_client`. The other conditions of the static skip still apply.
 
+- Added: the decision directive `redact_file_parts on | off;`, default `on`. The
+  content of a file part in a `multipart/form-data` body, a part whose
+  `Content-Disposition` has a `filename` parameter, is now replaced by
+  `[REDACTED]` before the event is sent to the backend. Its part headers (field
+  name, file name, content type) are still sent. Before, file content was sent
+  unless the field name was sensitive or listed in `redact_field`. Set
+  `redact_file_parts off;` to send it as before.
+- Fixed: a `multipart/form-data` body longer than `inspect_body` was sent with
+  lexical redaction only, so a `password` part, or a part named in
+  `redact_field`, inside the first `inspect_body` bytes reached the backend as
+  it was. The parts before the cut are now redacted by name, and so is the cut
+  part when its headers are complete.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more
