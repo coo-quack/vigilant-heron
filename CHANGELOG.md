@@ -21,6 +21,20 @@
   it writes anything, when one of its target paths is a symbolic link, when the group
   `adm` is missing, or when the user `vigilant-heron` has another primary group.
 
+- Added: `examples/rules.d/wordpress.conf`, an optional rule file with four skip
+  rules for WordPress sites: `wp-public-pages`, `wp-login-page`, `wp-admin-assets`
+  and `wp-robots`. Copy it to `rules.d/` and include it to spare the decision model
+  the front-page views with numeric parameters, the login page, the admin script and
+  style loaders and `robots.txt`. Block rules still run first. The WordPress rules
+  section of docs/rules.md lists each rule.
+
+- Added: the site directive `static_query_token on | off;`, off by default. With `on`,
+  a static asset request whose whole query is one bare token, such as WordPress's
+  `?wp-mce-49110-20250317` on the TinyMCE editor files, skips the backend. The token
+  must be 1 to 64 letters, digits, `.`, `_` or `-`, with no `=`, `&` or escape. Before,
+  each such request went to the backend, and a post editor page could exceed
+  `max_concurrency_per_client`. The other conditions of the static skip still apply.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more
