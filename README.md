@@ -170,6 +170,8 @@ The full documentation is published at <https://coo-quack.github.io/vigilant-her
 - [Evaluation](docs/evaluation.md): measurements of the models and the built-in rules
 - [Changelog](docs/changelog.md)
 
+**Agent skill.** [`skills/vigilant-heron-rollout/`](skills/vigilant-heron-rollout/SKILL.md) is a skill that drives the rollout guide with an AI agent on your server, with the operator deciding every change to live traffic. Install it with `npx skills add coo-quack/vigilant-heron`.
+
 ## Security
 
 Read [SECURITY.md](SECURITY.md) before you enable a decision model. It explains what is sent to the model, and how the router limits the effect of a model that is wrong. To report a vulnerability, follow the steps in that file.

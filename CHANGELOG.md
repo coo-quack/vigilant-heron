@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added: `skills/vigilant-heron-rollout/SKILL.md`, an agent skill that drives the guide
+  [From shadow mode to enforce](docs/rollout.md) on a real server: the seven phases as a
+  checklist with the gate before each next phase, the commands to run and what to look
+  for in their output, and hard rules for the agent (ask the operator before any change
+  to live traffic or to enforce mode, never print tokens, test near misses with
+  `test-request` before widening a skip rule). Install it with
+  `npx skills add coo-quack/vigilant-heron`. A test in tests/docs.rs keeps its links and
+  command-line flags in step with `docs/`. The router itself is unchanged.
+
 - Added: the guide [From shadow mode to enforce](docs/rollout.md), which walks through a
   rollout in seven phases: the checks before a first install, a shadow trial beside the
   site, reading the shadow log, skip rules, putting the router in the request path,
@@ -75,6 +84,25 @@
   `--full-addresses` is given. It never calls a backend and never reads the
   configuration. See [Summarize a shadow log](/cli#summarize-a-shadow-log).
 
+- Changed: the content of a file part in a `multipart/form-data` body, a part whose
+  `Content-Disposition` has a `filename` or `filename*` parameter, is no longer sent
+  to the backend. It is replaced by `[REDACTED]`; the part headers (field name,
+  file name, content type) are still sent. Before, file content was sent unless the
+  field name was sensitive or listed in `redact_field`. The new decision directive
+  `redact_file_parts on | off;`, default `on`, controls this, and
+  `redact_file_parts off;` restores the old behavior.
+- Fixed: a `multipart/form-data` body longer than `inspect_body` was sent with
+  lexical redaction only, so a `password` part, or a part named in `redact_field`,
+  inside the first `inspect_body` bytes reached the backend as it was. The parts
+  before the cut are now redacted by name, and so is the cut part when its headers
+  are complete. Text that is not inside a part (before the first delimiter, after a
+  `--boundary--` line, or after a cut that leaves no complete part headers) is
+  scanned as text, the way a body without multipart framing is. A body whose
+  framing is broken, not just cut, still falls back to name-based lexical redaction
+  of the whole body. A delimiter now counts only at the start of a line, parts after
+  a `--boundary--` line are still read, a folded `Content-Disposition` line is read
+  as one line, and a quoted boundary may contain `;`.
+
 - Added: every request has a request id. When `request_id_header` is not set, or
   its value is missing, empty, longer than 64 characters, or contains a space or a
   non-ASCII character, the router makes a 16-character id for the request. Each
@@ -94,6 +122,14 @@
   upstream. A request-id header that is longer than 64 characters, or contains a
   space or a non-ASCII character, is no longer logged as sent: the router logs its
   generated id instead. Before, a longer value was logged cut to 128 bytes.
+- Changed: the default `timeout` is now 2000ms for every backend (it was 300ms). Without
+  a `timeout` line, a call to the backend may take up to 2 seconds, so a visitor can wait
+  that long for a judged request. The new default comes from measurements taken from a
+  server in Tokyo. In a shadow trial, Clef-flash answered 864 calls with a p99 of 1,780 ms
+  and a maximum of 1,985 ms, and none timed out at 2000ms (at 1000ms, 84 calls timed out
+  in 25.7 hours). Jev answered 300 calls with a p50 of 133 ms, a p99 of 185 ms and a
+  maximum of 307 ms, so a fast backend can set a shorter value. To keep the old behavior,
+  set `timeout 300ms;`.
 
 - Added: a "WordPress behind nginx" example in the installation guide. It puts the
   router in the request path of a PHP site, with a second nginx server that runs PHP

@@ -28,8 +28,10 @@ and of names with a whole word such as `pass`, `pin`, `otp`, `session`, `card`,
 `cvv` or `ssn`, and of the fields named in `redact_field`, with `[REDACTED]`
 before sending. Those short words match only as whole words, so `class_name`
 and `business_name` are sent. Multipart
-(`multipart/form-data`) bodies are only lexically redacted, so a sensitive field
-inside one can still reach the backend in some layouts. Everything else, which
+(`multipart/form-data`) bodies are split into parts and redacted by part name, and
+the content of a file part (a part with a `filename`) is replaced unless
+`redact_file_parts off;` is set. A multipart body whose framing is broken is
+scanned as text instead, so the part-name rule does not apply to it. Text outside the parts, such as a preamble before the first delimiter, is scanned as text too. Everything else, which
 can include personal data typed into forms, reaches the backend. Point the
 router at a backend you may disclose that data to, or run the decision model
 yourself.
