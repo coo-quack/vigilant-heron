@@ -51,6 +51,11 @@
   each such request went to the backend, and a post editor page could exceed
   `max_concurrency_per_client`. The other conditions of the static skip still apply.
 
+- Added: a "WordPress behind nginx" example in the installation guide. It puts the
+  router in the request path of a PHP site, with a second nginx server that runs PHP
+  behind the router and a `backup` server that keeps the site up while the router is
+  down. The example also shows how to take the router out of the path again.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more

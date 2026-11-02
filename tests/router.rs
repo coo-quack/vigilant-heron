@@ -389,6 +389,36 @@ async fn backend_timeout_fails_closed_on_a_fail_closed_path() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_backend_server_error_is_forwarded_with_the_default_failure_settings() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(StubBehavior {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        ..StubBehavior::default()
+    });
+    // No on_decision_error line: the default must forward the request.
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/articles",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn backend_server_error_fails_open() -> TestResult {
     let upstream = Upstream::start().await?;
     let stub = StubDecider::start().await?;
