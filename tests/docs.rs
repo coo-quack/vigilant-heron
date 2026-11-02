@@ -132,6 +132,35 @@ fn every_directive_the_parser_accepts_is_documented() -> TestResult {
 }
 
 #[test]
+fn the_wordpress_section_names_every_rule_and_the_include_line() -> TestResult {
+    let doc = read("docs/rules.md")?;
+    let text = section(&doc, "WordPress rules")
+        .ok_or("docs/rules.md has no \"## WordPress rules\" section")?;
+    let shipped = read("examples/rules.d/wordpress.conf")?;
+    let ids: Vec<&str> = shipped
+        .lines()
+        .filter_map(|line| line.strip_prefix("rule ")?.strip_suffix(" {"))
+        .collect();
+    assert!(
+        !ids.is_empty(),
+        "no rules found in examples/rules.d/wordpress.conf"
+    );
+    let missing: Vec<&&str> = ids
+        .iter()
+        .filter(|id| !text.contains(&format!("`{id}`")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "rules in examples/rules.d/wordpress.conf missing from the WordPress section: {missing:?}"
+    );
+    assert!(
+        text.contains("include rules.d/wordpress.conf;"),
+        "the WordPress section does not show the include line"
+    );
+    Ok(())
+}
+
+#[test]
 fn builtin_rule_table_lists_exactly_the_built_in_rules() -> TestResult {
     let conf_ids: BTreeSet<String> = read("src/rules/builtin.conf")?
         .lines()
