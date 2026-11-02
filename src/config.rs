@@ -2881,22 +2881,35 @@ mod tests {
     }
 
     #[test]
-    fn static_query_token_takes_on_or_off_and_is_off_by_default() -> Result<(), ConfigError> {
-        assert!(!first_site(&parse(&with_site(""))?)?.static_query_token);
-        assert!(
-            first_site(&parse(&with_site("    static_query_token on;\n"))?)?.static_query_token
-        );
+    fn static_query_token_is_off_when_the_directive_is_absent() -> Result<(), ConfigError> {
+        let config = parse(&with_site(""))?;
+        assert!(!first_site(&config)?.static_query_token);
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_token_set_to_on_is_enabled() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    static_query_token on;\n"))?;
+        assert!(first_site(&config)?.static_query_token);
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_token_refuses_a_value_other_than_on_or_off() {
         assert!(
             message(parse(&with_site("    static_query_token yes;\n")))
                 .contains("\"static_query_token\" must be \"on\" or \"off\"")
         );
+    }
+
+    #[test]
+    fn static_query_token_refuses_a_duplicate_directive() {
         assert!(
             message(parse(&with_site(
                 "    static_query_token on;\n    static_query_token off;\n"
             )))
             .contains("duplicate directive \"static_query_token\"")
         );
-        Ok(())
     }
 
     #[test]

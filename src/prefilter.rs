@@ -214,7 +214,7 @@ pub(crate) fn fails_closed(site: &SiteConfig, views: &[String]) -> bool {
 ///   `%3B` (case-insensitive);
 /// - no query, or one made only of `static_query_params` parameters, see
 ///   [`cache_busters_only`], or, with `static_query_token on`, one bare token, see
-///   [`bare_token`];
+///   [`query_keeps_static_skip`];
 /// - under a `static_location` prefix, when the site sets any: every view starts with one;
 /// - in every view, the last segment has a static extension and no earlier segment
 ///   has a script extension;
@@ -259,38 +259,34 @@ const MAX_CACHE_BUSTER_LEN: usize = 64;
 /// Returns true when a raw query may keep the static skip: the `static_query_params` form,
 /// or, when the site sets `static_query_token on`, one bare token.
 fn query_keeps_static_skip(site: &SiteConfig, query: &str) -> bool {
-    cache_busters_only(site, query) || (site.static_query_token && bare_token(query))
+    cache_busters_only(site, query) || (site.static_query_token && is_cache_buster_value(query))
 }
 
 /// Returns true when a raw query is made only of the site's `static_query_params`,
 /// such as the `?ver=6.8.3` that `WordPress` adds.
 ///
 /// Each `&`-separated part must be `name=value` with a listed name, compared as
-/// received, and a value of 1 to 64 ASCII letters, digits, `.`, `_` or `-`. The value
-/// is checked raw, so an escape (`%`) or a `+` makes the request inspected. An empty
-/// query, an empty part and any other parameter do too.
+/// received, and a value that [`is_cache_buster_value`] accepts. An empty query, an
+/// empty part and any other parameter make the request inspected.
 fn cache_busters_only(site: &SiteConfig, query: &str) -> bool {
     query.split('&').all(|part| {
         part.split_once('=').is_some_and(|(name, value)| {
             site.static_query_params
                 .iter()
                 .any(|allowed| allowed == name)
-                && (1..=MAX_CACHE_BUSTER_LEN).contains(&value.len())
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+                && is_cache_buster_value(value)
         })
     })
 }
 
-/// Returns true when a raw query is one bare token of 1 to 64 ASCII letters, digits, `.`,
-/// `_` or `-`, such as the `wp-mce-49110-20250317` that `WordPress`'s editor adds.
+/// Returns true when a raw value is 1 to 64 ASCII letters, digits, `.`, `_` or `-`.
 ///
-/// The token is checked raw. An `=` or `&` (a parameter form), a `%` or `+` (an escape)
-/// and an empty query all make the request inspected.
-fn bare_token(query: &str) -> bool {
-    (1..=MAX_CACHE_BUSTER_LEN).contains(&query.len())
-        && query
+/// The value is checked raw, so an escape (`%`), a `+`, an `=` or an `&` makes it
+/// fail, and so does an empty value. It is used for a `static_query_params` value and
+/// for a whole query that is one bare token, such as `wp-mce-49110-20250317`.
+fn is_cache_buster_value(value: &str) -> bool {
+    (1..=MAX_CACHE_BUSTER_LEN).contains(&value.len())
+        && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
@@ -675,11 +671,14 @@ mod tests {
     }
 
     #[rstest]
-    #[case::post(Method::POST, true)]
-    #[case::body(Method::GET, false)]
+    #[case::plain_get_is_skipped(Method::GET, true, Screening::Skip)]
+    #[case::head_is_skipped(Method::HEAD, true, Screening::Skip)]
+    #[case::post_is_inspected(Method::POST, true, Screening::Inspect)]
+    #[case::body_is_inspected(Method::GET, false, Screening::Inspect)]
     fn static_query_token_keeps_the_method_and_body_conditions(
         #[case] method: Method,
         #[case] body_is_empty: bool,
+        #[case] expected: Screening,
     ) -> Result<(), ConfigError> {
         let config = site("static_query_token on;\n    builtin_rules off;")?;
         let headers = HeaderMap::new();
@@ -699,7 +698,8 @@ mod tests {
                 &lower_views("/wp-tinymce.js"),
                 body_is_empty
             ),
-            Screening::Inspect
+            expected,
+            "{method} with body_is_empty={body_is_empty}"
         );
         Ok(())
     }

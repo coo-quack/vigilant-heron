@@ -279,6 +279,46 @@ async fn bare_cache_busting_token_skips_the_backend_only_when_static_query_token
     on.stop().await
 }
 
+#[tokio::test]
+async fn a_question_mark_with_an_empty_query_is_sent_to_the_backend_with_static_query_token_on()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = with_static_query_token(&config_text(
+        &stub.decide_url(),
+        &upstream.url(),
+        GENEROUS_TIMEOUT_MS,
+    ));
+    let proxy = start_proxy(&text).await?;
+
+    // Control: a bare token takes the static skip on this site.
+    let token = send(
+        &proxy.base(),
+        Method::GET,
+        "/app.js?wp-mce-1",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(token.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 0, "a bare token skips the backend");
+
+    // A `?` with nothing after it has an empty query, which is not a bare token.
+    let empty = send(
+        &proxy.base(),
+        Method::GET,
+        "/app.js?",
+        "example.com",
+        &[],
+        Bytes::new(),
+    )
+    .await?;
+    assert_eq!(empty.status, StatusCode::OK);
+    assert_eq!(stub.calls(), 1, "an empty query goes to the backend");
+    proxy.stop().await
+}
+
 /// Adds `on_rate_limit allow` and `on_decision_error allow` to the first site of `config_text`.
 fn fail_open(text: &str) -> String {
     text.replacen(
