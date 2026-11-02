@@ -1,113 +1,99 @@
 # From shadow mode to enforce
 
-This guide takes a site from a first install to blocking real traffic. It has seven phases. Each phase ends with a checklist, and you move on only when every item on it is true.
+This guide takes a site from a first install to blocking real traffic. It has seven phases, and each ends with a checklist. Move on only when every item is true.
 
-Run each site in `mode shadow;` until the log shows what the router would block, and change to `mode enforce;` only after that. In shadow mode the router forwards a request whatever its verdict. A few refusals, such as an invalid `Host`, apply in both modes. See [How it works](/how-it-works#shadow-mode).
+Run each site in `mode shadow;` until the log shows what the router would block, then change to `mode enforce;`. In shadow mode the router forwards a request whatever its verdict. A few refusals, such as an invalid `Host`, apply in both modes. See [How it works](/how-it-works#shadow-mode).
 
 ## 1. Before you start
 
-Answer these questions before you change any setting.
-
 ### What the site serves and who uses it
 
-1. List what the site serves: static files (images, CSS, JavaScript), scripts that run on the server, and forms and uploads.
-2. List the clients that are legitimate:
-   - visitors;
-   - the owner and admins, who log in, edit and upload;
-   - webhooks and partner services that call the site;
-   - the site itself, when it calls its own public URL;
-   - crawlers.
-
-   The site's own calls to its public URL show the server's public address in the log. Count them as legitimate, and check that no limit or deny rule on that address stops them.
+1. List what the site serves: static files (images, CSS, JavaScript), scripts, forms and uploads.
+2. List the legitimate clients: visitors, the owner and admins, webhooks and partner services, crawlers, and the site itself when it calls its own public URL. The site's own calls show the server's public address in the log. Make sure no limit or deny rule on that address stops them.
 
 ### What sits in front and how the client address arrives
 
-3. Note what runs in front of the router: a CDN, nginx, or both.
-4. Set `real_ip_from` to the addresses of every proxy in front of the router, and `real_ip_header` to the header that they send. See [Installation](/install#putting-it-behind-nginx-or-cloudflare). The router believes the header only from a listed peer, so a client that is not a trusted proxy cannot choose its own address by sending the header.
+3. Note what runs in front of the router: a CDN (a content delivery network, a service that stands in front of your site), nginx, or both.
+4. Set `real_ip_from` to every proxy in front of the router, and `real_ip_header` to the header it sends. See [Installation](/install#putting-it-behind-nginx-or-cloudflare). The router believes the header only from a listed peer, so a client cannot choose its address by sending it.
 
 ### Which backend, and how fast it answers
 
-5. Choose a decision backend. This is the model that judges each request, and [Decision backends](/decision-backends) lists the choices.
-6. Measure the backend's latency from the server that will run the router, not from your workstation. The p99 is the time that 99 in 100 answers beat; the slowest 1 in 100 take longer. In one rollout, two backends differed about tenfold when measured from the same server: one had a median of about 130 ms and a maximum under 200 ms, and the other had a p99 of about 1.8 s. The order was the reverse of the providers' published figures, so measure before you choose.
-7. Set `timeout` to a few times the slowest answer you measured:
+5. Choose a decision backend. This is the model that judges each request. [Decision backends](/decision-backends) lists the choices.
+6. Measure the backend's latency from the server that will run the router, not from your workstation. The p99 is the time that 99 in 100 answers beat. Two figures from one rollout, both measured from the router's server: one backend had a median of about 130 ms and a maximum under 200 ms, and the other had a p99 of about 1.8 s. With a p99 of 1.8 s, at least 1 request in 100 takes longer than the 1000 ms `timeout` in step 7, so those requests fall back to `on_decision_error`.
+7. Set `timeout` from your measurements. Every judged request waits for the backend, up to `timeout`, even when the answer is slow:
 
    ```nginx
    decision {
        backend jev;
-       timeout 1000ms;                 # a few times the slowest measured answer
+       timeout 1000ms;
    }
    ```
 
-8. Know what a slow backend does to the site. Every judged request waits for the backend, up to `timeout`, even when the answer is slow. If no answer arrives in time, the default `on_decision_error allow` forwards the request without a verdict.
+8. Know what a failed decision does. If no answer arrives in time, the default `on_decision_error allow` forwards the request without a verdict.
 
 ### What it costs
 
-9. Estimate the input tokens per call. In one rollout an ordinary request was about 1,000. Replace the estimate with your own `input_tokens` once the log has them.
+9. Estimate the input tokens per call. In one rollout an ordinary request was about 1,000. Replace the estimate with `input_tokens` from your log.
 10. Count the calls per day: the requests that reach the backend after the skip rules and the static skip. The static skip is the router's shortcut for a plain `GET` or `HEAD` of a static file, such as a `.css` or `.png`, which is forwarded without asking the backend. Multiply the calls by the tokens per call, then by your provider's price per input token. For example, 20,000 calls at about 1,000 tokens each is 20 million input tokens a day.
 
-### How good the backend is on your kind of traffic
+### How good the backend is on your traffic
 
-11. Run the labelled evaluation with your backend, as [Evaluation](/evaluation) describes. When the shadow log shows a request near the threshold, add it to the dataset as a row. The format is in [`eval/README.md`](https://github.com/coo-quack/vigilant-heron/blob/develop/eval/README.md).
+11. Run the labelled evaluation with your backend, as [Evaluation](/evaluation) describes. When the shadow log shows a request near the threshold, add it as a row. The format is in [`eval/README.md`](https://github.com/coo-quack/vigilant-heron/blob/develop/eval/README.md).
 
 **Before you move on:**
 
 - [ ] The site's files, scripts, uploads and legitimate clients are written down.
 - [ ] `real_ip_from` names every proxy in front of the router.
-- [ ] The backend's latency was measured from the router's server, and `timeout` is set from it.
+- [ ] Latency was measured from the router's server, and `timeout` is set from it.
 - [ ] The cost per day is estimated, and the labelled evaluation was run.
 
 ## 2. Shadow beside the site
 
-In this phase nginx copies each request to the router with its `mirror` module. The mirror has zero risk to responses: nginx serves the site as before and discards the router's answers. In one trial, requests that nginx answered itself did not reach the router through the mirror: a `return`, a 403 from a `deny` rule, and that trial's own 404 for missing files. Your setup may differ. Compare the nginx log with the router's log to see which requests the router does not see. See [Try shadow mode beside a live site with an nginx mirror](/install#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror).
+Nginx copies each request to the router with its `mirror` module, and the router's answer is discarded. The [Installation](/install#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror) page gives the nginx mirror and the sink, a local server that answers 204 so each copy ends there. Set those up and reload nginx. Then configure the router to listen on the mirror's target and send the site to the sink in shadow mode. Keep the `decision` block from phase 1:
 
-1. Add the `mirror` lines and the sink server from that section to nginx, and reload nginx.
-2. In the router's configuration, listen on the mirror's target address, and send the site to the sink in shadow mode. The sink is a local server that answers 204, so each copy ends there. Keep the `decision` block from phase 1, and reload the router:
+```nginx
+listen 127.0.0.1:8090;                  # the mirror in nginx sends its copies here
+real_ip_from 127.0.0.1;                 # trust X-Real-IP only from nginx
+real_ip_header X-Real-IP;
 
-   ```nginx
-   listen 127.0.0.1:8090;              # the mirror in nginx sends its copies here
+site example.com {
+    upstream http://127.0.0.1:8091;     # the sink
+    mode shadow;
+}
+```
 
-   site example.com {
-       upstream http://127.0.0.1:8091; # the sink
-       mode shadow;
-   }
-   ```
-3. Send one ordinary request to the site. Check that the router's access log has a line for it, with the client address and the path.
+Reload the router, and send one ordinary request. Its line should appear in the router's access log.
 
-Three things change what the router sees:
+The mirror does not change responses. But when it copies bodies (`mirror_request_body on`, the default), nginx reads the whole request body before it passes the request on, which can delay large uploads.
 
-- **Requests that nginx answers itself may not be copied.** In one trial, a `return`, a `deny` refusal and nginx's own 404 for missing files did not reach the router. The router's log then under-counts scanners that nginx turns away. Compare the nginx log with the router's log to see the difference on your setup.
-- **An internal redirect copies the request again.** The `index` directive is one: `/` becomes `/index.php`, and the mirror runs twice. Two log lines with the same time, client, method and path show it. The fix for PHP is in [Installation](/install#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror).
-- **A secret header that the CDN adds is copied too.** The router drops a header whose name looks like a credential, such as `x-csrf-token`, `x-session-id` or `x-functions-key`, before it calls the backend. Strip any other secret header in the mirror block, as [Installation](/install#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror) shows.
+Three more things change what the router sees:
 
-Watch the trial for several days that include the owner's admin work, scheduled jobs, backups and crawler peaks. Schedule the stop, with a systemd timer or a similar scheduler, to remove the mirror lines and reload nginx, so the trial does not run on unnoticed.
+- **Requests that nginx answers itself may not be copied.** In one trial, a `return`, a 403 from a `deny` rule and nginx's own 404 for missing files did not reach the router. Compare the nginx log with the router's log to see what the router does not see on your setup.
+- **An internal redirect, which nginx handles again under another path, copies the request again.** The `index` directive is one: `/` becomes `/index.php`, and the mirror runs twice. Two log lines with the same time, client, method and path show it. The fix for PHP is in [Installation](/install#try-shadow-mode-beside-a-live-site-with-an-nginx-mirror).
+- **A secret header that the CDN adds is copied too.** The router drops a header whose name looks like a credential, such as `x-csrf-token` or `x-functions-key`, before it calls the backend. Strip any other secret header in the mirror block.
+
+Watch the trial for several days, including the owner's admin work, scheduled jobs, backups and crawler peaks. Schedule the stop with a systemd timer or a similar scheduler. It removes the mirror lines and the sink, then reloads nginx.
 
 **Before you move on:**
 
-- [ ] The mirror and the sink are in place, and the router's log shows requests from the site.
-- [ ] The log has no double lines on `/`, and you know which requests nginx answers before the mirror runs.
+- [ ] The router's log shows requests from the site, with no double lines on `/`.
 - [ ] A secret header that the CDN adds is dropped by name or stripped in nginx.
 - [ ] The trial covers several days, and the stop is scheduled.
 
 ## 3. Reading the shadow log
 
-Each request gets one JSON line, with each value written as a string. So the field reads `"would_have":"block"`, with no space after the colon. [Logging](/logging#the-built-in-formats) describes the fields.
+Each request gets one JSON line, and every value is a string. A `would_have` block therefore appears as `"would_have":"block"`, with no space after the colon. [Logging](/logging#the-built-in-formats) describes the fields.
 
 Look at these things:
 
-1. **Counts by `reason` and `decision_error`.** A large count in one reason shows where most of the traffic goes.
-2. **Every `would_have=block` line.** Find them with `grep`:
-
-   ```console
-   $ grep -c '"would_have":"block"' access.json
-   $ grep '"would_have":"block"' access.json | tail -n 20
-   ```
-
+1. **Counts by `reason` and `decision_error`.** A large count in one reason shows where most traffic goes.
+2. **Every `would_have=block` line.** Find them with `grep -c '"would_have":"block"' access.json`, then read the last few lines with `tail`.
 3. **Decision errors per hour.** Timeouts in an hour with little load point to the provider, not to the site.
-4. **`client_busy` bursts per minute and per client.** One browser that loads many assets at once can cause them. The fixes are in phases 4 and 5.
+4. **`client_busy` bursts per minute and per client.** `client_busy` is the router's refusal when one client already has its share of backend calls in flight. One browser that loads many assets at once can cause it. Phases 4 and 5 show the fixes.
 5. **The p99 of `latency_ms`**, compared with your `timeout`.
 6. **`input_tokens`**, to replace the estimate from phase 1.
 
-Tell your own traffic from attacks by what the requests do, not by IP address. To see the User-Agent, add a second log beside the JSON log. Keep the JSON log, because `suggest-skip-rules` reads only that format. Both lines go in the router's configuration, at the top level, where `log_format` and `access_log` are written:
+Tell your own traffic from attacks by what the requests do, not by IP address. Your browsers send recognizable User-Agent values, and an admin workflow has a recognizable order: a login, an edit, then an upload. IP addresses change, and a cloud provider's address shows no partner, since anyone can rent one. To see the User-Agent, add a second log beside the JSON log. Keep the JSON log too, because `suggest-skip-rules` reads only that format. Both lines go at the top level of the router's configuration:
 
 ```nginx
 # the router's configuration, at the top level
@@ -117,21 +103,26 @@ access_log /var/log/vigilant-heron/access.json json;   # for suggest-skip-rules
 access_log /var/log/vigilant-heron/review.log review;  # adds the User-Agent
 ```
 
-Your own browsers send recognizable User-Agent values, and an admin workflow has a recognizable order: a login, an edit, then an upload. IP addresses change, and a cloud provider's address shows no partner, since anyone can rent one.
+By default the log keeps only `query_shape`, such as `id=<num>&s=<text>`, never the values. The `$path` field is different: the router logs the path as the client sent it, so a token in a path, such as a password-reset link, appears in the log. Keep the logs private. The log directory should be `750` and owned by the router's user and the `adm` group, and the files `640`, as the `packaging/` install script and logrotate file set them:
 
-By default the log keeps only `query_shape`, such as `id=<num>&s=<text>`, and never the values. The `$path` field is different: the router logs the path as the client sent it. So a token in a path, such as a password-reset link, appears in the log. Keep the log files readable only by root and the operators. To review a block, find the web server's own log line for the same second, client and path.
+```console
+$ sudo install -d -m 750 -o vigilant-heron -g adm /var/log/vigilant-heron
+$ ls -ld /var/log/vigilant-heron    # expect drwxr-x---
+$ ls -l /var/log/vigilant-heron     # expect -rw-r----- for each log file
+```
+
+To review a block, find the web server's own log line for the same second, client and path.
 
 **Before you move on:**
 
-- [ ] The counts by `reason` and `decision_error` are reviewed.
-- [ ] Each `would_have=block` line is reviewed, with its User-Agent.
-- [ ] The decision errors per hour are compared with the load.
-- [ ] The `client_busy` bursts are found and explained.
+- [ ] The counts by `reason` and `decision_error` are reviewed, and each `would_have=block` line has been read.
+- [ ] `client_busy` bursts and decision errors per hour are explained.
 - [ ] The p99 of `latency_ms` and the `input_tokens` are recorded.
+- [ ] The log directory is `750`, and its files are `640`.
 
 ## 4. Writing skip rules
 
-A skip rule forwards a request without calling the backend. It saves calls and time. Write each one narrow:
+A skip rule forwards a request without calling the backend. Write each one narrow:
 
 1. Limit the method to `GET` and `HEAD`.
 2. Match one exact path.
@@ -151,17 +142,14 @@ rule skip-product-page {
 
 The `site` line limits the rule to `example.com`. A rule without a `site` line applies to every site, so add one unless you mean that.
 
-Put the rule in a file under `rules.d/`, include that file, and check the configuration with `vigilant-heron -t`. `-t` reports the file and line of any error. `-t` and `test-request` read the configuration the way the router does, so `TYPESAFE_API_KEY` must be set to any value. See [Rules](/rules#write-your-own-rule).
+Put the rule in a file under `rules.d/`, include that file, and check the configuration with `vigilant-heron -t`. It reports the file and line of any error. `-t` and [`test-request`](/cli#check-a-request-with-test-request), which reports what the router would do with a saved request, print a warning when `TYPESAFE_API_KEY` is not set, and do not fail. The router itself does not start without the variable, so set it before you start the router. See [Rules](/rules#write-your-own-rule).
 
-Keep these facts in mind:
+Keep these facts in mind. A skip rule never overrides a block rule, because the built-in block rules run first. A skipped request is not seen by the model at all, headers and cookies included.
 
-- A skip rule never overrides a block rule. The built-in block rules still run first.
-- A skipped request is not seen by the model at all, headers and cookies included.
-
-Test each rule before you reload. Run `test-request` on a request that the rule must skip. Its `rules:` line then reads `matched (skip)` with the rule's description. Then run it on near misses: a quote in the value, a `<script>` tag, an extra parameter, an encoded newline, a `POST`, and a longer path. A near miss is a request the rule must not skip. If `test-request` reports `matched (skip)` for one, the rule is too wide. In the access log, the same decision appears as `reason` `skip_rule`.
+Test each rule before you reload. Run `test-request` on a request the rule must skip, and check that its `rules:` line reads `matched (skip)` with the rule's description. Then run it on near misses: a quote in the value, a `<script>` tag, an extra parameter, an encoded newline, a `POST`, and a longer path. A near miss that reports `matched (skip)` means the rule is too wide. In the access log, the same decision appears as `reason` `skip_rule`.
 
 ```console
-$ vigilant-heron -c vigilant-heron.conf test-request near-miss-extra.http
+$ vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf test-request near-miss-extra.http
 ```
 
 `suggest-skip-rules` lists candidates from the JSON log. Its thresholds are strict, so on a small site it may print nothing. It changes no file, so review each candidate before you copy it. See [Learn skip rules from the access log](/cli#learn-skip-rules-from-the-access-log).
@@ -179,22 +167,21 @@ The better fix is to let the web server serve static files, as phase 5 shows.
 
 **Before you move on:**
 
-- [ ] Each rule has a method, an exact path and a narrow query regex.
-- [ ] No skip rule matches a `POST` that carries credentials.
+- [ ] Each rule has a method, an exact path and a narrow query regex, and no skip rule matches a credential-carrying `POST`.
 - [ ] `test-request` was run on the matching request and on each near miss.
-- [ ] Each candidate from `suggest-skip-rules` was reviewed before it was copied, and the file passes `vigilant-heron -t`.
+- [ ] Each `suggest-skip-rules` candidate was reviewed, and the file passes `vigilant-heron -t`.
 
 ## 5. Putting the router in the request path
 
-Until now the router only watched a copy of the traffic. In this phase the site's scripts go through it, and visitors receive its answers. Each step keeps a way back in place before it changes live traffic.
+In this phase the site's scripts go through the router, and visitors receive its answers. Each step keeps a way back in place before it changes live traffic.
 
-1. **Set up the inner server and check it directly.** The inner server is a second, local server block that runs the scripts. It has the same `root` as the public site, and it takes the client address from `X-Real-IP`, which the outer nginx sends and the router forwards unchanged:
+1. **Set up the inner server and check it directly.** The inner server is a second, local server block. It runs the scripts from the same root as the public site, and it takes the client address from `X-Real-IP`, which the outer nginx sends and the router forwards unchanged. Other processes on the same host can reach `127.0.0.1:8081` without the router, so keep it on the loopback address:
 
    ```nginx
    # inner server: runs the scripts, reached through the router or the fallback
    server {
        listen 127.0.0.1:8081;
-       root /var/www/example.com;       # the same root as the public site
+       root /var/www/example.com;
        index index.php;
        set_real_ip_from 127.0.0.1;      # the outer nginx is local
        real_ip_header X-Real-IP;
@@ -204,59 +191,78 @@ Until now the router only watched a copy of the traffic. In this phase the site'
            fastcgi_param HTTPS on;      # the visitor used HTTPS
            fastcgi_pass unix:/run/php/php-fpm.sock;   # your PHP-FPM setup
        }
-       location / { try_files $uri $uri/ =404; }
+       location / { try_files $uri $uri/ /index.php?$args; }
    }
    ```
 
-   Before you go on, send a request straight to the inner server, bypassing the router, and check that a script answers: `curl -i -H 'Host: example.com' http://127.0.0.1:8081/index.php`.
+   Send a request straight to it: `curl -i -H 'Host: example.com' http://127.0.0.1:8081/index.php`. A script must answer before you go on.
 
-2. **Prepare the switch back.** Save an outer upstream that names only the inner server, next to the live one, and write down where it is. Do not use it yet:
+2. **Prepare the switch back, and test it once.** Keep the two upstream blocks in separate files. Nginx includes whichever one the symlink `upstream.conf` points to, so only one is active, and the name `vigilant_heron` is never defined twice:
 
    ```nginx
-   # the switch back: copy this over the upstream block of step 3, then reload nginx
+   # /etc/nginx/vh/direct.conf: the switch back, with no router
    upstream vigilant_heron {
        server 127.0.0.1:8081;
    }
    ```
 
-3. **Put the router in the path with `mode shadow;`.** Nginx keeps its deny rules and serves static files itself, and it sends only scripts to the router. Behind a CDN, nginx must also take the visitor's address from the CDN's header. Without that, every visitor looks like the CDN, and `client_busy` refuses them all. Use the CDN's published ranges, one line each:
+   ```nginx
+   # /etc/nginx/vh/router.conf: the router, with the inner server as the fallback
+   upstream vigilant_heron {
+       server 127.0.0.1:8080;
+       server 127.0.0.1:8081 backup;
+   }
+   ```
+
+   In the `http` block, add `include /etc/nginx/vh/upstream.conf;`. Then add the outer server block. It serves static files itself, sends scripts to the router, and takes the visitor's address from the CDN header if a CDN is in front. It uses WordPress-style permalinks: a missing file falls back to `/index.php`, so a pretty URL such as `/2026/11/post-name/` runs as a script. For a site with plain files and no fallback, use `try_files $uri $uri/ =404;`.
 
    ```nginx
-   # outer nginx, in front of the router
-   upstream vigilant_heron {
-       server 127.0.0.1:8080;          # the router
-       server 127.0.0.1:8081 backup;   # the inner server, used only when the router cannot be reached
-   }
-
    server {
        listen 443 ssl;
        server_name example.com;
        root /var/www/example.com;
        index index.php;
+       ssl_certificate /etc/ssl/example.com/fullchain.pem;     # or your existing TLS lines
+       ssl_certificate_key /etc/ssl/example.com/privkey.pem;
 
-       set_real_ip_from 173.245.48.0/20;   # behind a CDN only: one line per CDN range
-       real_ip_header CF-Connecting-IP;    # behind a CDN only: or your CDN's header
+       # Behind a CDN only: the visitor's address comes from the CDN header, from the CDN's ranges only.
+       # Without this, every visitor looks like the CDN, and client_busy refuses them all.
+       set_real_ip_from 173.245.48.0/20;   # one line per CDN range; use the CDN's published list
+       real_ip_header CF-Connecting-IP;    # or your CDN's header
 
        location ~ /\.(?!well-known) { deny all; }   # hidden files, before the other locations
 
        location ~ \.php$ {                 # scripts go through the router
-           proxy_pass http://vigilant_heron;
+           try_files $uri =404;            # a missing script is a 404 here, not a model call
+           proxy_pass http://vigilant_heron$request_uri;   # the original URI, also after the permalink fallback
            proxy_next_upstream error;      # not "error timeout", see step 4
            proxy_set_header Host $host;
            proxy_set_header X-Real-IP $remote_addr;
            proxy_set_header X-Forwarded-Proto https;
        }
 
-       location / {                        # static files, served by nginx
-           try_files $uri $uri/ =404;
+       location / {                        # static files, and permalinks that fall back to a script
+           try_files $uri $uri/ /index.php?$args;
        }
    }
    ```
 
-   The full layout, with keep-alive and WebSocket headers, is in [Installation](/install#putting-it-behind-nginx-or-cloudflare). The router trusts the address that nginx sends, and it forwards the site to the inner server:
+   Point the symlink at the switch back, reload nginx, and check that the site answers. Traffic now goes straight to the inner server:
+
+   ```console
+   $ sudo ln -sfn /etc/nginx/vh/direct.conf /etc/nginx/vh/upstream.conf && sudo nginx -t && sudo nginx -s reload
+   ```
+
+3. **Put the router in the path, in shadow mode.** First remove the mirror lines and the sink from phase 2, and cancel the stop timer. Otherwise each request is judged twice, and the timer would stop the router that is now in the path. Then point the symlink at the router:
+
+   ```console
+   $ sudo ln -sfn /etc/nginx/vh/router.conf /etc/nginx/vh/upstream.conf && sudo nginx -t && sudo nginx -s reload
+   ```
+
+   The router trusts the address nginx sends, and forwards the site to the inner server. Keep the decision block from phase 1:
 
    ```nginx
-   # the router's configuration (keep the decision block from phase 1)
+   # the router's configuration
    listen 127.0.0.1:8080;
    real_ip_from 127.0.0.1;             # trust X-Real-IP only from the outer nginx
    real_ip_header X-Real-IP;
@@ -265,31 +271,38 @@ Until now the router only watched a copy of the traffic. In this phase the site'
    site example.com {
        upstream http://127.0.0.1:8081; # the inner server
        mode shadow;
+       static_extensions;              # only for permalink sites: see below
    }
    ```
 
-   Check the file with `-t`, then reload the router and nginx. Compare `latency_ms` in the log with nginx's request time to measure the latency the router adds.
+   Reload the router. Check that a page and a login load, and that each has a line in the router's log. Compare `latency_ms` with nginx's request time to measure the latency the router adds.
 
-   Permalink sites need one more setting. WordPress, for example, falls back to `/index.php` for a missing file, so a request for a missing `/x.css` reaches the router as a script request. The static skip, the router's shortcut from phase 1, would then forward it without a verdict. On such a site, add `static_extensions;` with no extensions to the site block. An empty list turns the static skip off.
+   On a permalink site, a missing `/x.css` falls back to `/index.php` and reaches the router as a script request. The static skip, the router's shortcut from phase 1, would forward it without a verdict. An empty `static_extensions;` turns the static skip off, so keep that line on such a site.
 
-4. **Stop the router, and check the fallback.** Stop the router with `sudo systemctl stop vigilant-heron`, or with `vigilant-heron stop -c` for a background router. Send a request to the site, and expect the page from the inner server. Then start the router again.
+4. **Stop the router, and check the fallback.** Stop the router with `sudo systemctl stop vigilant-heron`, or, for a background router, `vigilant-heron stop -c /etc/vigilant-heron/vigilant-heron.conf`. Send a request to the site, and expect the page from the inner server. Then start the router again.
 
-   While requests go to the backup, nothing is judged. The router never sees them, so its rules, limits and `fail_closed_path` (a path prefix that is blocked whenever the decision fails) do not apply. The fallback is for a router that cannot be reached. With `proxy_next_upstream error;`, a router that accepts connections but does not answer gives 504 instead of being bypassed. The nginx default, `error timeout`, would send a slow request past the router, so slowness could be used to get around it. When the router is up but not answering, the switch back from step 2 is the way out.
+   While requests go to the backup, nothing is judged. The router never sees them, so its rules, limits and `fail_closed_path` (a path prefix that is blocked whenever the decision fails) do not apply. With `proxy_next_upstream error;`, a router that accepts connections but does not answer gives 504 instead of being bypassed. The nginx default, `error timeout`, would send a slow request past the router. When the router is up but not answering, the switch back is the way out.
 
 **Before you move on:**
 
-- [ ] The inner server answers a script directly, with the client address and the scheme from the outer nginx.
-- [ ] The switch back is saved in a file, and you know where it is.
+- [ ] The inner server answers a script directly, and the switch back was tested once.
 - [ ] Behind a CDN, nginx takes the visitor's address from the CDN header.
-- [ ] The router ran in the path in shadow mode, and you measured the latency it adds.
+- [ ] The router ran in shadow mode in the path, and you measured the latency it adds.
 - [ ] With the router stopped, the site still answers through the inner server.
-- [ ] On a permalink site, `static_extensions;` is set.
 
 ## 6. Switching to enforce
 
-1. **Raise the upload limit in both places, then test uploads.** Choose the largest upload the site must accept, for example `10m`. Set `client_max_body_size` to that in nginx's server block and in the router's configuration, and reload both. Upload a file within the limit, which must work, and a file over it, which must get 413.
-2. **Rehearse the way back.** Change `mode shadow;` to `mode enforce;`, reload the router, then change it back to `mode shadow;` and reload again. Check the log: requests are forwarded again, and the ones that would be blocked show `would_have`. Only then set `mode enforce;` for real.
-3. **Switch to enforce.** Change `mode shadow;` to `mode enforce;`, check the file, and reload. A reload applies the new file to new requests, and requests already in flight finish with the configuration they started with:
+The way back is rehearsed before enforce, while the router is still in shadow mode.
+
+1. **Raise the upload limit in both places, then test uploads.** Choose the largest upload the site must accept, for example `10m`. Set `client_max_body_size` to that in nginx's server block and in the router's configuration, and reload both. A file within the limit must upload, and a file over it must get 413.
+2. **Rehearse the way back.** Point the symlink at `direct.conf`, reload nginx, and check that the site answers. The router's log gets no new line for that request, because the router is out of the path. Then point the symlink back at `router.conf`, reload, and check that the site answers and that the router's log has a new line:
+
+   ```console
+   $ sudo ln -sfn /etc/nginx/vh/direct.conf /etc/nginx/vh/upstream.conf && sudo nginx -t && sudo nginx -s reload
+   $ sudo ln -sfn /etc/nginx/vh/router.conf /etc/nginx/vh/upstream.conf && sudo nginx -t && sudo nginx -s reload
+   ```
+
+3. **Switch to enforce.** Only after step 2 passes, change `mode shadow;` to `mode enforce;`, check the file, and reload. A reload applies the new file to new requests, and requests already in flight finish with the configuration they started with:
 
    ```console
    $ vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf
@@ -298,33 +311,30 @@ Until now the router only watched a copy of the traffic. In this phase the site'
 
    With the systemd unit from [Installation](/install#run-as-a-service-with-systemd), run `sudo systemctl reload vigilant-heron` instead.
 
-4. **Check right after the reload.**
-   - Send a known attack, such as a query with `UNION SELECT`. The answer should be `403 Forbidden`:
+4. **Check right after the reload.** Send a known attack, such as a query with `UNION SELECT`. The answer should be `403 Forbidden`:
 
-     ```console
-     $ curl -i "https://example.com/?id=1%20UNION%20SELECT%20password%20FROM%20users"
-     ```
+   ```console
+   $ curl -i "https://example.com/?id=1%20UNION%20SELECT%20password%20FROM%20users"
+   ```
 
-   - Have the owner log in, save a post, upload a file within the limit, and use the admin screens.
-   - Check the log for any block or 429 from these actions. A 429 is the `client_busy` refusal, which `on_client_busy` sends by default.
+   Have the owner log in, save a post, upload a file within the limit, and use the admin screens. Check the log for any block or 429 from these actions. A 429 is the `client_busy` refusal, which `on_client_busy` sends by default.
 
-5. **Know the two ways back.** `mode shadow;` and reload keeps the router in the path and recording. The switch back from phase 5 takes the router out of the path.
+5. **Know the two ways back after enforce.** Set `mode shadow;` and reload, which keeps the router in the path and recording. Or point the symlink at `direct.conf` and reload nginx, which takes the router out of the path.
 
-6. **Review regularly.** Look at every block and 429, at allowed requests whose `attack` score was close to `block_threshold`, at decision errors per hour, and at the cost per day. Change a rule only after `test-request` has checked it.
+6. **Review regularly.** Look at every block and 429, at allowed requests whose `attack` score was close to `block_threshold` (the score at which the router blocks, 0.87 by default), at decision errors per hour, and at the cost per day. Change a rule only after `test-request` has checked it.
 
 **Before you move on:**
 
 - [ ] Uploads within the limit work, and a file over it gets 413.
-- [ ] The way back was rehearsed, and the log confirmed it.
+- [ ] The way back was rehearsed in shadow mode, and the log confirmed it.
 - [ ] The `403` test attack was seen, and the owner's actions gave no unexpected block or 429.
-- [ ] The way back is written down, and you know which one you would use.
-- [ ] The review schedule is set: blocks, 429s, near-threshold allows, decision errors and cost.
+- [ ] The review schedule is set.
 
 ## 7. Principles for running it safely
 
-- **Layers.** Put a CDN or an edge web application firewall (WAF, a filter of attack patterns) first, then the web server's deny rules, the router's rules and the model. The model only adds blocks. No model answer can turn a rule block into an allow.
-- **What the backend receives.** The router removes credential headers, redacts sensitive fields, and sends only the first `inspect_body` bytes of a body. Uploads can still carry personal data, such as a location in a photo's metadata. Name such fields with `redact_field` in the `decision` block, for example `redact_field gps_position;`. For a body within `inspect_body`, the whole content of a part with that field name is replaced by `[REDACTED]`. An upload under that name is therefore sent without its file bytes or metadata.
-- **Defaults that favor availability.** A failed decision forwards the request, and a client over its share is refused, as phase 1 explains. For the few paths where a missed attack costs more than a refused visitor, such as a login page, set `fail_closed_path`. A request on those paths is blocked whenever the decision fails, whatever the other settings say:
+- **Layers.** Put a CDN or an edge web application firewall (WAF, a filter of attack patterns) first, then the web server's deny rules, the router's rules and the model. The model only adds blocks, and no model answer can turn a rule block into an allow.
+- **What the backend receives.** The router removes credential headers, redacts sensitive fields, and sends only the first `inspect_body` bytes of a body. Uploads can still carry personal data, such as a location in a photo's metadata. Name such fields with `redact_field` in the `decision` block, for example `redact_field gps_position;`. For a body within `inspect_body`, the part's value is replaced by `[REDACTED]`. For a file upload, that value is the file bytes. The part's headers, including the file name and content type, are still sent.
+- **Defaults that favor availability.** A failed decision forwards the request, and a client over its share is refused, as phase 1 explains. For the few paths where a missed attack costs more than a refused visitor, such as a login page, set `fail_closed_path`. A request on those paths is blocked whenever the decision fails:
 
   ```nginx
   site example.com {
@@ -333,13 +343,12 @@ Until now the router only watched a copy of the traffic. In this phase the site'
   }
   ```
 
-  The cost of forwarding failed decisions is that an attacker who makes the backend unavailable can get requests past the model. Limit each client with `limit_req` and `limit_conn` too. See [Security](/security#failure-behavior).
+  Forwarding failed decisions means that an attacker who makes the backend unavailable can get requests past the model. Limit each client too, with `limit_req` (a limit on how fast a client may send requests) and `limit_conn` (a limit on how many requests a client may have open at once). See [Security](/security#failure-behavior).
 - **Configuration under version control.** Keep the router's configuration in the same version control as the server setup. Pin the release binary, and check it against `SHA256SUMS` before you install it, as [Installation](/install#download-a-release-binary) shows.
 
 **Before you move on:**
 
 - [ ] The layers are in place, and the model is only one of them.
 - [ ] Fields that carry personal data are listed in `redact_field`, and an upload was checked against the log.
-- [ ] `fail_closed_path` covers the login and admin paths.
-- [ ] `limit_req` and `limit_conn` limit each client.
+- [ ] `fail_closed_path` covers the login and admin paths, and `limit_req` and `limit_conn` limit each client.
 - [ ] The configuration and the pinned binary are under version control.
