@@ -174,6 +174,7 @@ pub const SITE_DIRECTIVES: &[&str] = &[
     "static_extensions",
     "static_location",
     "static_query_params",
+    "static_query_token",
     "debug_headers",
     "access_log",
     "allow",
@@ -394,6 +395,10 @@ pub enum BackendConfig {
 
 /// Configuration for one site, selected by the request `Host`.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each site switch is its own on/off directive, read and checked independently"
+)]
 pub struct SiteConfig {
     /// Host names that select this site, as written in the configuration (normalized).
     pub hosts: Vec<String>,
@@ -437,6 +442,8 @@ pub struct SiteConfig {
     pub static_locations: Vec<String>,
     /// Query parameters, such as `ver`, that a static asset request may carry and still skip.
     pub static_query_params: Vec<String>,
+    /// Whether a static asset request whose query is one bare token (`?wp-mce-49110-20250317`) may skip.
+    pub static_query_token: bool,
     /// Whether responses carry the `x-vigilant-heron` header.
     pub debug_headers: bool,
     /// The site's own access logs. `None` inherits the top-level ones; `Some(empty)` is `access_log off`.
@@ -1895,6 +1902,7 @@ fn parse_site(
     let mut static_extensions: Option<Vec<String>> = None;
     let mut static_locations: Vec<String> = Vec::new();
     let mut static_query_params: Vec<String> = Vec::new();
+    let mut static_query_token = false;
     let mut debug_headers = false;
     let mut access_logs: Option<Vec<AccessLogConfig>> = None;
     let mut access_off = false;
@@ -2051,6 +2059,10 @@ fn parse_site(
                 }
                 static_query_params.extend(child.args.iter().cloned());
             }
+            "static_query_token" => {
+                once(&mut seen, child)?;
+                static_query_token = parse_bool(child, one_arg(child)?)?;
+            }
             "debug_headers" => {
                 once(&mut seen, child)?;
                 debug_headers = parse_bool(child, one_arg(child)?)?;
@@ -2193,6 +2205,7 @@ fn parse_site(
         }),
         static_locations,
         static_query_params,
+        static_query_token,
         debug_headers,
         access_logs,
         timeouts,
@@ -2966,6 +2979,38 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn static_query_token_is_off_when_the_directive_is_absent() -> Result<(), ConfigError> {
+        let config = parse(&with_site(""))?;
+        assert!(!first_site(&config)?.static_query_token);
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_token_set_to_on_is_enabled() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    static_query_token on;\n"))?;
+        assert!(first_site(&config)?.static_query_token);
+        Ok(())
+    }
+
+    #[test]
+    fn static_query_token_refuses_a_value_other_than_on_or_off() {
+        assert!(
+            message(parse(&with_site("    static_query_token yes;\n")))
+                .contains("\"static_query_token\" must be \"on\" or \"off\"")
+        );
+    }
+
+    #[test]
+    fn static_query_token_refuses_a_duplicate_directive() {
+        assert!(
+            message(parse(&with_site(
+                "    static_query_token on;\n    static_query_token off;\n"
+            )))
+            .contains("duplicate directive \"static_query_token\"")
+        );
     }
 
     #[test]

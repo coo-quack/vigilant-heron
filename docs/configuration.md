@@ -659,7 +659,7 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params)) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params) or, when [`static_query_token`](#static-query-token) `on` is set, only one bare token) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
 
 ### `static_location`
 
@@ -683,6 +683,23 @@ A page view loads many such assets at once. Without this directive each of them 
 site example.com {
     upstream http://127.0.0.1:8081;
     static_query_params ver;    # WordPress: /wp-includes/js/jquery/jquery.min.js?ver=3.7.1
+}
+```
+
+### `static_query_token`
+
+- **Syntax:** `static_query_token on | off;`
+- **Default:** `off`.
+- **Context:** site.
+
+With `on`, a static asset request whose whole query is one bare token, a value with no `=` or `&`, can skip the backend. The token must be 1 to 64 ASCII letters, digits, `.`, `_` or `-`, and it is checked as received, so an escape (`%`), a `+` or an empty query sends the request to the backend. The other conditions of the static skip still apply, and block rules run before it. A query of `name=value` pairs is handled by [`static_query_params`](#static-query-params) instead.
+
+WordPress's TinyMCE editor requests its files with a query such as `?wp-mce-49110-20250317`.
+
+```nginx
+site example.com {
+    upstream http://127.0.0.1:8081;
+    static_query_token on;    # WordPress: /wp-includes/js/tinymce/wp-tinymce.js?wp-mce-49110-20250317
 }
 ```
 
