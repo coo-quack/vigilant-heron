@@ -25,6 +25,7 @@ mod prefilter;
 mod proxy;
 mod realip;
 mod request_check;
+mod request_id;
 mod router;
 mod rules;
 mod sanitize;

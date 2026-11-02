@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::system_one::{FakeSpec, FakeSystemOne, start_fake};
 use common::{
-    BoxError, GatedDecider, Reply, TestResult, Upstream, closed_port_url, send, start_proxy_config,
+    BoxError, GatedDecider, Reply, TestResult, Upstream, closed_port_url, request_id_header, send,
+    start_proxy_config,
 };
 use http::{Method, StatusCode};
 use rstest::rstest;
@@ -554,10 +555,11 @@ async fn one_client_flooding_cannot_push_another_client_into_busy(
     proxy.stop().await
 }
 
-/// Without failure directives, a client over its share is answered 429 and the backend is
-/// not called.
+/// Without failure directives, a client over its share is answered 429 with its request id and an
+/// empty body, and the backend is not called.
 #[tokio::test]
-async fn client_busy_defaults_to_429_without_calling_the_backend() -> TestResult {
+async fn client_busy_defaults_to_429_with_the_request_id_without_calling_the_backend() -> TestResult
+{
     let fake = start_jev_fake().await?;
     let upstream = Upstream::start().await?;
     let mut setup = Setup::new(fake.url.clone(), upstream.url());
@@ -585,6 +587,7 @@ async fn client_busy_defaults_to_429_without_calling_the_backend() -> TestResult
 
     assert_eq!(excess.status, StatusCode::TOO_MANY_REQUESTS);
     assert!(excess.text().is_empty(), "the 429 has an empty body");
+    assert_eq!(request_id_header(&excess), "default-excess");
     assert_eq!(
         fake.calls.load(Ordering::SeqCst),
         calls_before,

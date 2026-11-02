@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{
-    StubBehavior, StubDecider, TestResult, Upstream, closed_port_url, config_text, send,
-    start_proxy,
+    StubBehavior, StubDecider, TestResult, Upstream, assert_plain_block, closed_port_url,
+    config_text, request_id_header, send, start_proxy,
 };
 use http::{Method, StatusCode};
 
@@ -72,7 +72,7 @@ async fn attack_is_blocked_with_403_and_no_detail() -> TestResult {
     .await?;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
-    assert_eq!(reply.text(), "Forbidden\n");
+    assert_plain_block(&reply);
     proxy.stop().await
 }
 
@@ -958,5 +958,84 @@ async fn malformed_json_with_an_attack_is_blocked() -> TestResult {
     .await?;
 
     assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_redirect_carries_the_request_id_header() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    stub.set_behavior(attack_behavior());
+    let text = format!(
+        "request_id_header x-request-id;\n{}",
+        config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS)
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/?q=x",
+        "redirect.test",
+        &[("x-request-id", "redirect-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::FOUND);
+    assert_eq!(request_id_header(&reply), "redirect-id-1");
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn a_forwarded_response_has_no_request_id_header_added() -> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    let text = format!(
+        "request_id_header x-request-id;\n{}",
+        config_text(&stub.decide_url(), &upstream.url(), GENEROUS_TIMEOUT_MS)
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/articles",
+        "example.com",
+        &[("x-request-id", "forward-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply.headers.get("x-request-id").is_none(),
+        "a forwarded response is passed unchanged, without X-Request-ID"
+    );
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_upstream_failure_carries_the_request_id_header() -> TestResult {
+    let stub = StubDecider::start().await?;
+    let dead_upstream = closed_port_url().await?;
+    let text = format!(
+        "request_id_header x-request-id;\n{}",
+        config_text(&stub.decide_url(), &dead_upstream, GENEROUS_TIMEOUT_MS)
+    );
+    let proxy = start_proxy(&text).await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/",
+        "example.com",
+        &[("x-request-id", "failure-id-1")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(request_id_header(&reply), "failure-id-1");
     proxy.stop().await
 }

@@ -113,6 +113,8 @@ Status for a request whose `Host` matches no site. Must be a 4xx or 5xx code.
 
 Request header whose value is logged as `$request_id`. The value is not sent to the decision backend.
 
+When the header is missing, empty, longer than 64 characters, or contains a space or a non-ASCII character, the router makes a 16-character id for the request instead, such as `3f9a0c17b2d4e8a1`. That id is logged in the same way. Each response that the router writes itself, after it has read the request, carries the id in an `X-Request-ID` header, so a client can quote it. A forwarded upstream response does not get the header.
+
 ### `real_ip_from`
 
 - **Syntax:** `real_ip_from <address|CIDR> ...;`
@@ -287,7 +289,7 @@ Status for a blocked request: any 4xx or 5xx code, or `444`, which closes the co
 ### `block_page`
 
 - **Syntax:** `block_page <file>;`
-- **Default:** none. The body is `Forbidden`.
+- **Default:** none. The body is one line of plain text with the request id, such as `Request blocked. Request ID: 3f9a0c17b2d4e8a1`.
 - **Context:** top level, site, location.
 
 HTML served for blocked requests, with `Content-Type: text/html; charset=utf-8`. The file is read when the configuration loads and must be at most 64 KiB. A relative path is relative to the file that holds the directive.

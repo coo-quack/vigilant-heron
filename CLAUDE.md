@@ -49,6 +49,7 @@ src/
   rules/tests.rs # Unit tests of the rule parser, built-in signatures, normalization and matching
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  request_id.rs  # Request ids: the request-id header value or a generated id, and the X-Request-ID response header
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   sanitize.rs    # Backend event: header drop, body redaction, truncation
   decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
