@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use http::header::HOST;
+use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -298,6 +298,36 @@ impl Reply {
     pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
+}
+
+/// The value of the `X-Request-ID` header of a reply, or an empty string when it is missing.
+pub(crate) fn request_id_header(reply: &Reply) -> String {
+    reply
+        .headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Checks a block response that has no block page: a plain-text body that repeats the request id.
+///
+/// Returns the request id, so that a test can compare it with the access log.
+pub(crate) fn assert_plain_block(reply: &Reply) -> String {
+    let id = request_id_header(reply);
+    assert!(
+        !id.is_empty(),
+        "the block response has no X-Request-ID header"
+    );
+    assert_eq!(reply.text(), format!("Request blocked. Request ID: {id}\n"));
+    assert_eq!(
+        reply
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    id
 }
 
 /// Sends one request to `base` with the given `Host` and extra headers.

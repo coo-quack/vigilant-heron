@@ -28,7 +28,10 @@ access_log off;                                  # disables access logs; alone o
 these keys in this order: `time`, `request_id`, `client_ip`, `site`, `host`,
 `method`, `path`, `query_shape`, `status`, `action`, `reason`, `rule_id`,
 `would_have`, `attack`, `ai_instruction`, `category`, `decision_error`,
-`retry_after`, `input_tokens` and `latency_ms`.
+`retry_after`, `input_tokens`, `latency_ms` and `user_agent`. `user_agent` is the
+`User-Agent` request header. It is escaped like the other values, so a quote or a
+backslash in it does not break the line, and it is empty when the request has no
+`User-Agent`.
 
 `main` writes a text line that starts with the time, the client address, the site
 and the request line, followed by `status`, `action`, `reason`, `would_have`,
@@ -65,7 +68,7 @@ written as `$name` or `${name}`.
 | `$time_iso8601` | Time of the request, ISO 8601 with offset |
 | `$time_local` | Time of the request, in the `dd/Mon/yyyy:hh:mm:ss +0000` form. The router uses UTC, since it has no timezone database |
 | `$msec` | Unix time of the request, with milliseconds |
-| `$request_id` | Value of the `request_id_header`, or empty |
+| `$request_id` | Value of the `request_id_header`, or a generated 16-character id when that header is missing or unusable (see [`request_id_header`](/configuration#request-id-header)) |
 | `$rule_id` | Id of the rule that decided the request, or empty |
 | `$client_ip` | Client address after realip selection |
 | `$remote_addr` | TCP peer address |

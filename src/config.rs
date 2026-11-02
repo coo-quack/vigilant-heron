@@ -79,8 +79,6 @@ const JEV_MODEL: &str = "jev-latest";
 const JEV_TOKEN_ENV: &str = "TYPESAFE_API_KEY";
 /// The model used when `model` is omitted with backend strands.
 const STRANDS_MODEL: &str = "strands-decider";
-/// Longest request id that is logged; longer values are cut.
-pub(crate) const MAX_REQUEST_ID_BYTES: usize = 128;
 /// File extensions that skip the backend when `static_extensions` is not given.
 const DEFAULT_STATIC_EXTENSIONS: [&str; 13] = [
     "css", "js", "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "woff", "woff2", "ttf", "map",
@@ -245,6 +243,7 @@ pub struct Config {
     /// closing them. `None` waits for them indefinitely, as nginx does by default.
     pub worker_shutdown_timeout: Option<Duration>,
     /// Header whose value is logged as `$request_id`. It is not sent to the decision backend.
+    /// A missing or unusable value is replaced by a generated id.
     pub request_id_header: Option<HeaderName>,
     /// How the client address is chosen.
     pub realip: RealIp,
