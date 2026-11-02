@@ -25,7 +25,7 @@ sudo install -m 755 "vigilant-heron-$ARCH-unknown-linux-gnu/vigilant-heron" /usr
 vigilant-heron --version
 ```
 
-Each archive holds the binary, `LICENSE` and `README.md`. To install a particular version, replace `latest/download` with `download/v0.1.0`, for example.
+Each archive holds the binary, `LICENSE`, `README.md`, the `packaging/` folder with the service files and `install.sh`, and the sample configuration `examples/vigilant-heron.conf`. To install a particular version, replace `latest/download` with `download/v0.1.0`, for example.
 
 ## Build from source
 
@@ -254,15 +254,37 @@ The status in the router's log is the sink's 204, not the site's. To stop the tr
 
 ## Run as a service with systemd
 
-To run the router as a service, run it in the foreground under systemd, not with `start`. systemd then restarts it when it crashes, reloads it on `systemctl reload`, and stops it gracefully. This unit assumes a system user `vigilant-heron`, a binary in `/usr/local/bin`, and the configuration in `/etc/vigilant-heron`. The configuration must set the pid file in the runtime directory:
+To run the router as a service, run it in the foreground under systemd, not with `start`. systemd then restarts it when it crashes, reloads it on `systemctl reload`, and stops it gracefully.
 
-```nginx
-pid /run/vigilant-heron/vigilant-heron.pid;
+The release archive holds a script that sets up the service. Check the archive first, as the Download section shows. Then, as root, extract it into a directory that only root can read or write, and run the script from there:
+
+```bash
+sudo install -d -m 700 /root/vh-install
+sudo tar -xzf "vigilant-heron-$ARCH-unknown-linux-gnu.tar.gz" -C /root/vh-install
+sudo sh /root/vh-install/vigilant-heron-$ARCH-unknown-linux-gnu/packaging/install.sh
 ```
 
+The script installs these:
+
+- `/usr/local/bin/vigilant-heron`, the binary.
+- `/etc/systemd/system/vigilant-heron.service`, the unit shown below.
+- `/etc/logrotate.d/vigilant-heron`, the log rotation described below.
+- `/etc/vigilant-heron/vigilant-heron.conf`, a copy of `examples/vigilant-heron.conf`, and `/etc/vigilant-heron/env`, a token file with a commented template. Only root can read the token file.
+- `/var/log/vigilant-heron`, the directory for the log files.
+- The system user and group `vigilant-heron`, when they do not exist.
+
+The script stops before it writes anything when one of the paths it writes is a symbolic link.
+
+The script copies the sample configuration and the token template only when those files are missing. Running it again replaces the binary, the unit and the logrotate file, and keeps the configuration and the token file. After a re-run that replaces the binary, restart the service with `sudo systemctl restart vigilant-heron`, so that it runs the new program.
+
+The script does not start the service. It prints the next steps. Two of them are easy to miss:
+
+- Add `pid /run/vigilant-heron/vigilant-heron.pid;` to the configuration. The unit creates `/run/vigilant-heron`, and the router writes its pid file there.
+- Add `access_log /var/log/vigilant-heron/access.log main;` to the configuration. The logrotate file rotates the files in `/var/log/vigilant-heron`, so point the access log at that directory.
+
+The unit that the script installs is shown here, and the repository has the same file at `packaging/systemd/vigilant-heron.service`:
 
 ```ini
-# /etc/systemd/system/vigilant-heron.service
 [Unit]
 Description=vigilant-heron router
 After=network-online.target
@@ -271,16 +293,27 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=vigilant-heron
-# systemd creates /run/vigilant-heron and gives it to the service user.
-# The configuration names a pid file in that directory: pid /run/vigilant-heron/vigilant-heron.pid;
+# Creates /run/vigilant-heron, the directory of the pid file that the configuration names.
 RuntimeDirectory=vigilant-heron
-# A file of KEY=value lines, readable only by root and the service: TYPESAFE_API_KEY=...
+# KEY=value lines with the API tokens. systemd reads this file as root, so only root can read it.
 EnvironmentFile=/etc/vigilant-heron/env
 ExecStart=/usr/local/bin/vigilant-heron -c /etc/vigilant-heron/vigilant-heron.conf
 ExecReload=/usr/local/bin/vigilant-heron -s reload -c /etc/vigilant-heron/vigilant-heron.conf
 # SIGTERM already stops the router gracefully; this makes it explicit.
 KillSignal=SIGTERM
 Restart=on-failure
+# Hardening. The router writes only to its runtime directory and its log directory.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/log/vigilant-heron
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target
@@ -296,6 +329,10 @@ systemctl status vigilant-heron
 ```
 
 A reload keeps connections open. Use `sudo systemctl restart vigilant-heron` only for a setting that is read at startup, or after you install a new binary. Check the file before you reload with `vigilant-heron -t -c /etc/vigilant-heron/vigilant-heron.conf`.
+
+The unit runs the router with systemd's hardening options, so it can write only to its runtime directory and to `/var/log/vigilant-heron`.
+
+The logrotate file rotates each `/var/log/vigilant-heron/*.log` file daily, as the `vigilant-heron` user, and keeps 14 rotated files. After each rotation it sends SIGUSR1, so the router opens its log files again.
 
 ## Updating
 
@@ -336,6 +373,6 @@ Read the [Changelog](/changelog) before you update.
   docker image rm ghcr.io/coo-quack/vigilant-heron:latest
   ```
 
-- **systemd:** run `sudo systemctl disable --now vigilant-heron`, then delete the unit file.
+- **systemd:** run `sudo systemctl disable --now vigilant-heron`, then delete `/etc/systemd/system/vigilant-heron.service` and `/etc/logrotate.d/vigilant-heron`. Delete `/etc/vigilant-heron` and `/var/log/vigilant-heron` only when you no longer need the configuration and the logs. Then remove the user and the group with `sudo userdel vigilant-heron` and `sudo groupdel vigilant-heron`.
 
-The router installs nothing else on the system. The pid file is removed when the router exits. If the router stopped without removing it, delete the file named by your `pid` directive. Your configuration file and logs stay where you put them.
+Apart from the files that `install.sh` copies and the system user and group it creates, the router installs nothing on the system. The pid file is removed when the router exits. If the router stopped without removing it, delete the file named by your `pid` directive. Your configuration file and logs stay where you put them.

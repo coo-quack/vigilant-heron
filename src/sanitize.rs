@@ -162,6 +162,14 @@ pub(crate) fn build_event(input: &EventInput<'_>) -> DecisionEvent {
     }
 }
 
+/// The query that the access log shows for a blocked request (`$block_query`).
+///
+/// It is the same text that [`build_event`] sends to the backend, so the log and the
+/// backend see the same redaction. Returns `None` when the request has no query.
+pub(crate) fn block_query(query: Option<&str>, redact_fields: &[String]) -> Option<String> {
+    query.map(|query| redact_query(query, redact_fields))
+}
+
 /// Redacts the values of sensitive parameters in a query string.
 ///
 /// Both `&` and `;` separate parameters, because some upstreams split on `;` too. A
@@ -1180,6 +1188,64 @@ mod tests {
     fn redact_field_names_also_redact_query_parameters() {
         let fields = ["lang".to_owned()];
         assert_eq!(redact_query("lang=ja&q=x", &fields), "lang=[REDACTED]&q=x");
+    }
+
+    #[test]
+    fn block_query_redacts_sensitive_parameters_as_the_backend_event_does() {
+        let query = "password=hunter2&token=abc&q=x";
+        assert_eq!(
+            block_query(Some(query), &[]).as_deref(),
+            Some("password=[REDACTED]&token=[REDACTED]&q=x")
+        );
+        let event = build_event(&EventInput {
+            method: &Method::GET,
+            path: "/search",
+            query: Some(query),
+            headers: &HeaderMap::new(),
+            body: b"",
+            body_continues: false,
+            host: "example.com",
+            client_ip: "203.0.113.7",
+            redact_headers: &[],
+            redact_fields: &[],
+            inspect_body_bytes: 0,
+        });
+        assert_eq!(
+            event.event.untrusted.query,
+            block_query(Some(query), &[]),
+            "the log and the backend must see the same query"
+        );
+    }
+
+    #[test]
+    fn block_query_redacts_names_from_redact_field() {
+        let fields = ["ticket_ref".to_owned()];
+        assert_eq!(
+            block_query(Some("ticket_ref=T-1&q=x"), &fields).as_deref(),
+            Some("ticket_ref=[REDACTED]&q=x")
+        );
+    }
+
+    #[test]
+    fn block_query_is_none_when_the_request_has_no_query() {
+        assert_eq!(block_query(None, &[]), None);
+    }
+
+    #[test]
+    fn block_query_keeps_a_long_query_whole() {
+        let query = format!("q={}", "a".repeat(4000));
+        assert_eq!(
+            block_query(Some(&query), &[]).as_deref(),
+            Some(query.as_str())
+        );
+    }
+
+    #[test]
+    fn block_query_keeps_ordinary_names_and_bare_values_as_received() {
+        // Redaction works by parameter name, so a secret under an ordinary name or with no
+        // `=` is logged as it was sent.
+        let query = "code=123456&key=abc&s3cr3tbare";
+        assert_eq!(block_query(Some(query), &[]).as_deref(), Some(query));
     }
 
     #[test]
