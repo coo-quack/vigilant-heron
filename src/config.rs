@@ -2735,6 +2735,13 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_static_extensions_list_turns_the_static_skip_off() -> Result<(), ConfigError> {
+        let config = parse(&with_site("    static_extensions;\n"))?;
+        assert_eq!(first_site(&config)?.static_extensions, Vec::<String>::new());
+        Ok(())
+    }
+
+    #[test]
     fn debug_headers_takes_on_or_off() -> Result<(), ConfigError> {
         let config = parse(&with_site("    debug_headers on;\n"))?;
         assert!(first_site(&config)?.debug_headers);

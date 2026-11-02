@@ -667,7 +667,18 @@ Path prefixes that are blocked whenever the decision fails, whatever `on_rate_li
 - **Default:** `css js png jpg jpeg gif svg webp ico woff woff2 ttf map`.
 - **Context:** site.
 
-File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params) or, when [`static_query_token`](#static-query-token) `on` is set, only one bare token) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. A path is skipped only when every [path reading](/how-it-works#path-readings) ends in one of these extensions with no earlier script extension (`php`, `phtml`, `jsp`, `jspx`, `asp`, `aspx`, `cgi`, `pl`, `py`, `rb`), so `/index.php/x.css` and `/x;.css` are inspected.
+File extensions of plain GET or HEAD requests with no query (or only [`static_query_params`](#static-query-params) or, when [`static_query_token`](#static-query-token) `on` is set, only one bare token) and no body that skip the backend. When given, the list replaces the defaults. Repeatable. An empty list (`static_extensions;`) turns the static skip off for the site.
+
+A static-looking path is inspected, and goes to the backend, when any of these holds:
+
+- the request is not a GET or HEAD, has a body, or has a query other than the ones above;
+- the last segment does not end in one of these extensions;
+- the raw path has `;`, `\`, `%2F`, `%5C` or `%3B`, in any letter case, so `/x;.css` is inspected;
+- the raw path has `?`, `#` or a NUL, written as `%3F`, `%23` or `%00`, in any letter case, so `/x.php%3Fa.js` and `/x.php%00.js` are inspected;
+- the raw path has `%25`, which is an encoded `%`, so the path may be encoded more than once; this covers `/x.php%253Fa.js` and `/x.php%25253Fa.js`. It also has `%u`, `%c0` or `%c1`, escapes that some decoders accept, such as `/a%u002fb.css` and `/a%c0%afb.css`;
+- a dot-separated part of any segment after the segment's name is a script extension (`php`, `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`, `phtml`, `shtml`, `shtm`, `jsp`, `jspx`, `asp`, `aspx`, `ashx`, `asmx`, `axd`, `cgi`, `cfm`, `cfc`, `pl`, `py`, `rb`), so `/index.php/x.css`, `/x.php.js` and `/x.phar/a.js` are inspected;
+- a [`static_location`](#static-location) prefix is set and a [path reading](/how-it-works#path-readings) is not under one of them;
+- a [`fail_closed_path`](#fail-closed-path) matches a path reading.
 
 ### `static_location`
 

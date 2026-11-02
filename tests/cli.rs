@@ -1701,6 +1701,51 @@ fn test_request_reports_a_request_that_would_go_to_the_backend() -> Result<(), s
 }
 
 #[test]
+fn test_request_reports_an_encoded_question_mark_in_a_static_path_as_sent_to_the_backend()
+-> Result<(), std::io::Error> {
+    let dir = test_dir("test-request-encoded-static")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let encoded = test_request(
+        &dir,
+        "encoded.txt",
+        "GET /x.php%3Fa.js HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&encoded);
+    assert_eq!(encoded.status.code(), Some(0), "{}", text(&encoded));
+    assert!(
+        stdout.contains("static asset skip: does not apply"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "result: would be sent to the decision backend (http); the verdict is not known without calling it"
+        ),
+        "{stdout}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_request_reports_a_plain_static_path_as_taking_the_static_skip() -> Result<(), std::io::Error>
+{
+    let dir = test_dir("test-request-plain-static")?;
+    let conf = write_file(&dir, "router.conf", &config("127.0.0.1:8080", ""))?;
+    let plain = test_request(
+        &dir,
+        "plain.txt",
+        "GET /a.js HTTP/1.1\nHost: example.com\n\n",
+        &conf,
+        &[],
+    )?;
+    let stdout = stdout_of(&plain);
+    assert_eq!(plain.status.code(), Some(0), "{}", text(&plain));
+    assert!(stdout.contains("static asset skip: applies"), "{stdout}");
+    Ok(())
+}
+
+#[test]
 fn test_request_reports_an_access_list_denial_for_the_given_client() -> Result<(), std::io::Error> {
     let dir = test_dir("test-request-access")?;
     let access = "allow 10.0.0.0/8;\ndeny all;\n";

@@ -30,8 +30,10 @@ decides the request ends the evaluation.
 6. **Static assets.** A plain GET or HEAD for a path with a static extension and
    no query and no body is forwarded without calling the backend (reason `skip`).
    It is skipped only when every [path reading](#path-readings) ends in a static
-   extension with no earlier script extension, the raw path has no `;`, `\`, `%2F`,
-   `%5C` or `%3B`, and no `fail_closed_path` matches. A `static_location` restricts
+   extension with no script extension in any dot-separated part of a segment, the
+   raw path has none of the markers in [`static_extensions`](/configuration#static-extensions)
+   (encoded separators, `?`, `#`, NUL, `%25`, `%u`, `%c0` and `%c1`), and no
+   `fail_closed_path` matches. A `static_location` restricts
    it to some prefixes. A query made only of `static_query_params` parameters with
    plain values, such as `?ver=6.8.3`, counts as no query. With
    `static_query_token on`, a query that is one bare token, such as

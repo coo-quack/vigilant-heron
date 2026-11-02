@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Fixed: a static-looking path no longer takes the static skip when an upstream might
+  read it as something else. It goes to the backend instead. This covers an encoded
+  `?`, `#` or NUL (`%3F`, `%23`, `%00`, in any letter case), any encoded `%` (`%25`, so
+  double and triple encodings such as `%253F` and `%25253F`), the escapes `%u`, `%c0`
+  and `%c1`, and a script extension in any dot-separated part of a segment, such as
+  `/x.php.js` or `/x.phar/a.js`. Before, `/x.php%3Fa.js` and `/x.php%00.js` were
+  forwarded as static assets without calling the backend. The list of script
+  extensions also gains `php3`, `php4`, `php5`, `php7`, `php8`, `phar`, `phps`, `pht`,
+  `shtml`, `shtm`, `cfm`, `cfc`, `ashx`, `asmx` and `axd`.
+
 - Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
   Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
   instructions to a reader, comment form submissions and search queries) and three
@@ -69,6 +79,11 @@
   of the whole body. A delimiter now counts only at the start of a line, parts after
   a `--boundary--` line are still read, a folded `Content-Disposition` line is read
   as one line, and a quoted boundary may contain `;`.
+
+- Added: a "WordPress behind nginx" example in the installation guide. It puts the
+  router in the request path of a PHP site, with a second nginx server that runs PHP
+  behind the router and a `backup` server that keeps the site up while the router is
+  down. The example also shows how to take the router out of the path again.
 
 ## v0.4.1 (2026-10-29)
 
