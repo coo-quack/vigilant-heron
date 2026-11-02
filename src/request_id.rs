@@ -71,6 +71,15 @@ mod tests {
 
     use super::*;
 
+    #[rstest]
+    #[case::first_output_of_seed_zero(0x9e37_79b9_7f4a_7c15, 0xe220_a839_7b1d_cdaf)]
+    #[case::second_output_of_seed_zero(0x3c6e_f372_fe94_f82a, 0x6e78_9e6a_a1b9_65f4)]
+    fn mix_is_the_splitmix64_finalizer(#[case] input: u64, #[case] expected: u64) {
+        // splitmix64 seeded with 0 adds 0x9e3779b97f4a7c15 before each output; these are its
+        // first two published outputs.
+        assert_eq!(mix(input), expected);
+    }
+
     #[test]
     fn a_generated_id_is_sixteen_lowercase_hex_digits() {
         let id = generate();
