@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added: the evaluation's dev and holdout splits (`eval/dataset/`) each have 11
+  Japanese rows: eight `allow` rows (WordPress post saves with sentences that give
+  instructions to a reader, a comment form and search queries) and three `block`
+  rows of prompt injection aimed at an AI. The router itself is unchanged.
+
 ## v0.4.1 (2026-10-29)
 
 - Changed: the evaluation's field split (`eval/dataset/field.jsonl`) has two more
