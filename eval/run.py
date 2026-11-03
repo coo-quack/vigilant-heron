@@ -51,6 +51,10 @@ BACKENDS = {
         "offline_url": "http://127.0.0.1:9000/v1/systemone",
     },
 }
+# Dataset files under dataset/. `--split both` runs BOTH_SPLITS; the others run
+# only when named.
+BOTH_SPLITS = ("dev", "holdout")
+OTHER_SPLITS = ("field", "adversarial")
 # Used for the budget check before the first request, when no average exists yet.
 FIRST_REQUEST_TOKEN_ESTIMATE = 1500
 THRESHOLDS = (0.5, 0.7, 0.9)
@@ -122,7 +126,7 @@ def start_upstream(port):
 
 def load_rows(split):
     rows = []
-    for name in ("dev", "holdout") if split == "both" else (split,):
+    for name in splits_to_run(split):
         path = DATASET_DIR / f"{name}.jsonl"
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -134,7 +138,7 @@ def load_rows(split):
 
 
 def splits_to_run(split):
-    return ["dev", "holdout"] if split == "both" else [split]
+    return list(BOTH_SPLITS) if split == "both" else [split]
 
 
 def send_row(port, row):
@@ -472,10 +476,10 @@ def start_stub_if_needed():
     return process
 
 
-def main():
+def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--backend", choices=sorted(BACKENDS), default="clef")
-    parser.add_argument("--split", choices=["dev", "holdout", "both", "field", "adversarial"], default="both")
+    parser.add_argument("--split", choices=[*BOTH_SPLITS, "both", *OTHER_SPLITS], default="both")
     parser.add_argument("--offline", action="store_true", help="use the stub decider instead of the provider")
     parser.add_argument("--clef-url", help="full clef-flash endpoint URL (Clef, without --offline)")
     parser.add_argument("--jev-url", default=JEV_DEFAULT_URL, help="System One endpoint for Jev")
@@ -485,7 +489,11 @@ def main():
     parser.add_argument("--limit", type=int, help="send at most N rows of each split")
     parser.add_argument("--concurrency", type=int, default=4, help="rows in flight at the same time")
     parser.add_argument("--router", type=pathlib.Path, default=ROUTER_BIN)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = build_parser().parse_args()
     if args.concurrency < 1:
         raise SystemExit("--concurrency must be at least 1")
 
