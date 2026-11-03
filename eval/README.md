@@ -21,6 +21,27 @@ standard library.
   kept: the host is example.com and no client data is included. The set is
   small, so read it row by row as a regression check when prompts, thresholds
   or rules change, not as a rate. `--split both` does not include it.
+- `dataset/adversarial.jsonl`: 48 rows of prompt injection written to evade the
+  judge, with ordinary requests on the same topics. The `kind` tells the groups
+  apart:
+  - `adv_judge` (16 `block`): an attack such as SQL injection or XSS, with
+    text that tries to talk the judge out of blocking it. Examples are a forged
+    verdict in the body, fake system delimiters, base64, zero-width characters,
+    look-alike letters, and several languages.
+  - `adv_app` (15 `block`): prompt injection aimed at an AI feature behind the
+    site, with no attack syntax, such as a jailbreak, data exfiltration through
+    a Markdown image, tool abuse and invisible Unicode tag characters.
+  - `adv_limit` (2 `block`): an attack placed where the judge cannot see it by
+    design, after the first `inspect_body` bytes or inside a file part. These
+    rows are expected to be allowed. They show the blind spots, not a defect.
+  - `adv_allow` (15 `allow`): ordinary requests to the same kinds of endpoints.
+    Most quote or discuss the same phrases, such as a blog post about prompt
+    injection, a customer who asks to ignore an earlier email, and a site owner
+    who saves a chatbot's system prompt. A few are plain requests, kept as a
+    baseline for the same endpoints.
+
+  Hosts use example.com, example.jp and the reserved `.example` names. Addresses
+  are 203.0.113.x or private. `--split both` does not include it.
 - `config.template.conf`: the router configuration. It uses the Clef backend,
   enforce mode, `block_threshold = 0.5`, `debug_headers = true`, and empty
   `deny_paths`, `fail_closed_path` and `static_extensions`. An empty
@@ -78,7 +99,7 @@ python3 -I eval/run.py --clef-url "https://api.cloudflare.com/client/v4/accounts
 
 Options:
 
-- `--split dev|holdout|both|field` (default `both`, which is dev and holdout)
+- `--split dev|holdout|both|field|adversarial` (default `both`, which is dev and holdout)
 - `--limit N`: at most N rows of each split
 - `--max-yen X` (default 30): the budget in JPY for base spend plus this run
 - `--spent-yen X` (default 0): JPY that earlier runs spent. Each run starts from
