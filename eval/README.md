@@ -48,6 +48,16 @@ standard library.
   `static_extensions` means no row can skip the backend.
 - `results/`: per-row results and router logs. Git-ignored.
 
+## Tests
+
+`eval/tests/` checks the scripts and the datasets without the router or the
+network: row shape, the counts this README states, the split choices, log
+parsing, the budget guard and the report. The CI `test` job runs it.
+
+```bash
+python3 -I -m unittest discover -s eval/tests
+```
+
 ## Backends
 
 `--backend clef` (default) uses Clef-flash at `$0.038` per million input tokens

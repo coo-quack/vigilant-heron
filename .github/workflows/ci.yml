@@ -91,6 +91,8 @@ jobs:
       # fewer than 90% of the lines run, so new code comes with its tests.
       - run: rustup component add llvm-tools
       - run: cargo llvm-cov --workspace --locked --fail-under-lines 90
+      # The eval scripts and datasets, with the Python standard library only.
+      - run: python3 -I -m unittest discover -s eval/tests
 
   # Timings on shared runners are too noisy to gate on, so this job only proves
   # that the benchmarks build and run once. bench.yml records the timings weekly.

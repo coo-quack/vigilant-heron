@@ -21,6 +21,7 @@ Shadow mode records what it would have done without blocking.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — lint
 - `cargo test --workspace --locked` — unit and integration tests
 - `cargo llvm-cov --workspace --locked --fail-under-lines 90` — the tests with line coverage; CI fails below 90%
+- `python3 -I -m unittest discover -s eval/tests` — tests of the eval scripts and datasets (stdlib only; part of the `test` job)
 - `bash scripts/e2e.sh` — e2e suite against the Compose stack in `e2e/`
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
@@ -114,6 +115,7 @@ eval/
   rules.py       # Built-in rules on dev and holdout, and the combined pipeline (stdlib only)
   dataset/       # Labelled sets (JSON lines): dev and holdout, field (rows from a shadow trial), adversarial (prompt injection that tries to evade the judge)
   config.template.conf # Router configuration template; run.py fills the @PLACEHOLDERS@
+  tests/         # unittest suite for run.py, rules.py, load.py and the datasets (row shape, counts the README states)
   README.md      # The Clef-flash evaluation: what it measures and how to run it
   reports/       # Written reports of each measurement
 examples/

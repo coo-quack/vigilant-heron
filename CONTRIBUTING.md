@@ -20,6 +20,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings  # lint job
 RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked  # lint job
 cargo test --workspace --locked                            # Tests
 cargo llvm-cov --workspace --locked --fail-under-lines 90  # test job: tests and line coverage
+python3 -I -m unittest discover -s eval/tests              # test job: tests of the eval scripts and datasets
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
@@ -63,6 +64,8 @@ tools, and `rustup component add llvm-tools` adds what `cargo llvm-cov` needs.
 - `tests/e2e.rs` runs against the Compose stack in `e2e/` (nginx in front, the
   router image, the stub decider, an upstream). Its tests are `#[ignore]`d in
   the normal run; `scripts/e2e.sh` starts the stack and runs them.
+- `eval/tests/` checks the evaluation scripts and the labelled datasets with
+  the Python standard library. It needs no router build and no network.
 - Expected values are never changed to match what the code happens to do.
 
 ## Mutation testing
