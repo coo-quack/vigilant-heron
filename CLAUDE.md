@@ -112,7 +112,7 @@ eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
   rules.py       # Built-in rules on dev and holdout, and the combined pipeline (stdlib only)
-  dataset/       # Labelled dev and holdout sets (JSON lines)
+  dataset/       # Labelled sets (JSON lines): dev and holdout, field (rows from a shadow trial), adversarial (prompt injection that tries to evade the judge)
   config.template.conf # Router configuration template; run.py fills the @PLACEHOLDERS@
   README.md      # The Clef-flash evaluation: what it measures and how to run it
   reports/       # Written reports of each measurement
