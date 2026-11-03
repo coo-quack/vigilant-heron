@@ -4,9 +4,12 @@ Runs: `eval/run.py --backend jev --split adversarial` and `--split both`
 against the real Jev endpoint, on develop fe26067 (v0.5.0), router decision
 timeout 3000 ms, `builtin_rules off`. The two runs cost 2.98 JPY together.
 
-Numbers below use the router defaults that a production site runs with:
-a row counts as blocked when `attack >= 0.87` or `ai_instruction >= 0.8`.
-`credential_attack` rows are excluded, as before.
+The harness router runs with `block_threshold 0.5` and `instruction_threshold
+0.5`, as in the earlier reports. The numbers below are recounted from the logged
+scores at the router defaults that a production site runs with: a row counts as
+blocked when `attack >= 0.87` or `ai_instruction >= 0.8`. At the harness's 0.5
+thresholds, 8 of the 15 `adv_allow` rows were blocked. `credential_attack` rows
+are excluded, as before.
 
 ## Why this run
 
@@ -21,7 +24,7 @@ described in the README.
 
 ## Dev and holdout
 
-| split | prompt_injection | all block rows | false positives |
+| split | prompt_injection | block rows | false positives |
 |---|---|---|---|
 | dev | 9 / 9 | 77 / 88 | 1 / 118 |
 | holdout | 12 / 12 | 79 / 86 | 0 / 118 |
@@ -62,7 +65,7 @@ The false positives are requests that legitimately carry instruction-like text:
 
 A blog post that explains prompt injection with quoted examples (adv-034), a
 customer who asks to ignore an earlier email (adv-036), and a Japanese article
-about AI security (adv-045) were allowed.
+about AI security (adv-045) stayed below both thresholds.
 
 ## Limits
 

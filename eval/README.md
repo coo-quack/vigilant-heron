@@ -34,13 +34,14 @@ standard library.
   - `adv_limit` (2 `block`): an attack placed where the judge cannot see it by
     design, after the first `inspect_body` bytes or inside a file part. These
     rows are expected to be allowed. They show the blind spots, not a defect.
-  - `adv_allow` (15 `allow`): ordinary requests that quote or discuss the same
-    phrases, such as a blog post about prompt injection, a customer who asks to
-    ignore an earlier email, and a site owner who saves a chatbot's system
-    prompt.
+  - `adv_allow` (15 `allow`): ordinary requests to the same kinds of endpoints.
+    Most quote or discuss the same phrases, such as a blog post about prompt
+    injection, a customer who asks to ignore an earlier email, and a site owner
+    who saves a chatbot's system prompt. A few are plain requests, kept as a
+    baseline for the same endpoints.
 
-  Hosts use the reserved `.example` names and example.com. Addresses are
-  203.0.113.x or private. `--split both` does not include it.
+  Hosts use example.com, example.jp and the reserved `.example` names. Addresses
+  are 203.0.113.x or private. `--split both` does not include it.
 - `config.template.conf`: the router configuration. It uses the Clef backend,
   enforce mode, `block_threshold = 0.5`, `debug_headers = true`, and empty
   `deny_paths`, `fail_closed_path` and `static_extensions`. An empty
