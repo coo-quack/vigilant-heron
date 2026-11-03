@@ -1,9 +1,12 @@
 """eval/run.py: split selection, log parsing, the budget guard and the report."""
 
+import contextlib
+import io
 import json
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 from support import DATASET_DIR, load_script
 
@@ -30,9 +33,13 @@ def result(row_id, label, kind, attack, instruction, blocked=False):
 
 class Splits(unittest.TestCase):
     def test_every_dataset_file_is_a_split_choice(self):
-        choices = next(action.choices for action in run.build_parser()._actions if action.dest == "split")
-        files = {path.stem for path in DATASET_DIR.glob("*.jsonl")}
-        self.assertEqual(set(choices), files | {"both"})
+        for name in [path.stem for path in DATASET_DIR.glob("*.jsonl")] + ["both"]:
+            with self.subTest(split=name):
+                self.assertEqual(run.build_parser().parse_args(["--split", name]).split, name)
+
+    def test_an_unknown_split_is_refused(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            run.build_parser().parse_args(["--split", "nope"])
 
     def test_default_split_is_both(self):
         self.assertEqual(run.build_parser().parse_args([]).split, "both")
@@ -124,6 +131,13 @@ class BudgetGuard(unittest.TestCase):
             budget.settle(budget.reserve(), tokens)
         self.assertAlmostEqual(budget.reserve(), 1000)
 
+    def test_a_reservation_that_reaches_the_limit_exactly_is_allowed(self):
+        estimate = run.Budget(base_yen=0, max_yen=100, usd_per_mtok=0.0375).reserve()
+        budget = run.Budget(base_yen=0, max_yen=2 * estimate, usd_per_mtok=0.0375)
+        self.assertIsNotNone(budget.reserve())
+        self.assertIsNotNone(budget.reserve())
+        self.assertIsNone(budget.reserve())
+
     def test_in_flight_reservations_count_against_the_limit(self):
         budget = run.Budget(base_yen=0, max_yen=3500, usd_per_mtok=1_000_000 / run.JPY_PER_USD)
         self.assertIsNotNone(budget.reserve())
@@ -144,6 +158,78 @@ class BudgetGuard(unittest.TestCase):
         # The first reservation at the Jev price is 1500 tokens, about 0.0089 JPY.
         self.assertIsNotNone(run.Budget(base_yen=29.99, max_yen=30, usd_per_mtok=0.0375).reserve())
         self.assertIsNone(run.Budget(base_yen=29.995, max_yen=30, usd_per_mtok=0.0375).reserve())
+
+
+class FakeLog:
+    def __init__(self, events):
+        self.events = events
+
+    def wait_for(self, request_id, timeout=30):
+        return list(self.events.get(request_id, []))
+
+
+def event(method="GET", path="/", tokens=900, attack=0.1):
+    return {"method": method, "path": path, "action": "allow", "reason": "model", "attack": attack,
+            "ai_instruction": 0.0, "category": None, "input_tokens": tokens, "latency_ms": 50}
+
+
+def row(row_id, method="GET", path="/"):
+    return {"id": row_id, "label": "allow", "kind": "search",
+            "request": {"method": method, "path": path, "query": None, "headers": {},
+                        "content_type": None, "body": None}}
+
+
+class Join(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch.object(run, "send_row", return_value=(200, "action=allow"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.budget = run.Budget(base_yen=0, max_yen=100, usd_per_mtok=0.0375)
+
+    def test_one_matching_event_is_joined_and_its_tokens_settled(self):
+        result = run.run_row(row("dev-001"), 0, FakeLog({"dev-001": [event()]}), self.budget, "dev")
+        self.assertTrue(result["join_ok"])
+        self.assertEqual(result["attack"], 0.1)
+        self.assertEqual(self.budget.run_tokens(), 900)
+        self.assertAlmostEqual(self.budget.reserved_yen, 0)
+
+    def test_a_missing_duplicated_or_different_event_stops_the_run(self):
+        cases = {
+            "none": [],
+            "two": [event(), event()],
+            "other method": [event(method="POST")],
+            "other path": [event(path="/other")],
+        }
+        for name, events in cases.items():
+            with self.subTest(case=name):
+                budget = run.Budget(base_yen=0, max_yen=100, usd_per_mtok=0.0375)
+                with self.assertRaises(run.JoinError):
+                    run.run_row(row("dev-001"), 0, FakeLog({"dev-001": events}), budget, "dev")
+                self.assertTrue(budget.stopped)
+                self.assertAlmostEqual(budget.reserved_yen, 0)
+
+    def test_a_send_error_releases_the_reservation(self):
+        run.send_row.side_effect = OSError("refused")
+        with self.assertRaises(OSError):
+            run.run_row(row("dev-001"), 0, FakeLog({}), self.budget, "dev")
+        self.assertAlmostEqual(self.budget.reserved_yen, 0)
+        self.assertFalse(self.budget.stopped)
+
+    def test_run_split_aborts_at_the_first_row_without_an_event(self):
+        # eval/README.md: the run aborts with a clear error if any row has no
+        # decision event, and rows after it are not sent.
+        rows = [row("dev-001"), row("dev-002"), row("dev-003")]
+        log = FakeLog({"dev-001": [event()], "dev-003": [event()]})
+        with self.assertRaises(run.JoinError) as raised:
+            run.run_split("dev", rows, 0, log, self.budget, 1)
+        self.assertIn("dev-002", str(raised.exception))
+        self.assertEqual(run.send_row.call_count, 2)
+
+    def test_run_split_returns_results_in_dataset_order(self):
+        rows = [row("dev-001"), row("dev-002"), row("dev-003")]
+        log = FakeLog({row_id: [event()] for row_id in ("dev-001", "dev-002", "dev-003")})
+        results = run.run_split("dev", rows, 0, log, self.budget, 3)
+        self.assertEqual([item["id"] for item in results], ["dev-001", "dev-002", "dev-003"])
 
 
 class Report(unittest.TestCase):

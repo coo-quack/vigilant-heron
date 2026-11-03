@@ -17,6 +17,12 @@ def read_split(name):
         return [json.loads(line) for line in handle if line.strip()]
 
 
+def all_rows():
+    for split in ID_PREFIX:
+        for row in read_split(split):
+            yield split, row
+
+
 def inspect_body_bytes():
     template = (EVAL_DIR / "config.template.conf").read_text(encoding="utf-8")
     return int(re.search(r"^\s*inspect_body\s+(\d+);", template, re.MULTILINE).group(1))
@@ -48,32 +54,33 @@ class EveryRow(unittest.TestCase):
         # run.py sends rows with http.client, which encodes header values as Latin-1
         # and sets Host, X-Request-Id and Content-Length itself.
         reserved = {"host", "x-request-id", "content-length", "content-type"}
-        for split in ID_PREFIX:
-            for row in read_split(split):
-                for name, value in row["request"]["headers"].items():
-                    with self.subTest(split=split, id=row["id"], header=name):
-                        self.assertNotIn(name.lower(), reserved)
-                        self.assertIsNotNone(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name))
-                        self.assertIsInstance(value, str)
-                        value.encode("latin-1")
-                        self.assertNotRegex(value, r"[\r\n]")
+        for split, row in all_rows():
+            for name, value in row["request"]["headers"].items():
+                with self.subTest(split=split, id=row["id"], header=name):
+                    self.assertNotIn(name.lower(), reserved)
+                    self.assertIsNotNone(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name))
+                    self.assertIsInstance(value, str)
+                    value.encode("latin-1")
+                    self.assertNotRegex(value, r"[\r\n]")
 
     def test_ids_are_unique_across_all_splits(self):
-        ids = [row["id"] for split in ID_PREFIX for row in read_split(split)]
+        ids = [row["id"] for _, row in all_rows()]
         duplicates = [item for item, count in collections.Counter(ids).items() if count > 1]
         self.assertEqual(duplicates, [])
 
     def test_multipart_bodies_use_their_boundary(self):
-        for split in ID_PREFIX:
-            for row in read_split(split):
-                content_type = row["request"]["content_type"] or ""
-                if not content_type.startswith("multipart/form-data"):
-                    continue
-                with self.subTest(split=split, id=row["id"]):
-                    boundary = re.search(r"boundary=([^;]+)", content_type).group(1)
-                    body = row["request"]["body"]
-                    self.assertTrue(body.startswith(f"--{boundary}\r\n"))
-                    self.assertTrue(body.endswith(f"--{boundary}--\r\n"))
+        multipart = 0
+        for split, row in all_rows():
+            content_type = row["request"]["content_type"] or ""
+            if not content_type.startswith("multipart/form-data"):
+                continue
+            multipart += 1
+            with self.subTest(split=split, id=row["id"]):
+                boundary = re.search(r"boundary=([^;]+)", content_type).group(1)
+                body = row["request"]["body"]
+                self.assertTrue(body.startswith(f"--{boundary}\r\n"))
+                self.assertTrue(body.endswith(f"--{boundary}--\r\n"))
+        self.assertGreater(multipart, 0)
 
 
 class DevAndHoldout(unittest.TestCase):
@@ -87,7 +94,8 @@ class DevAndHoldout(unittest.TestCase):
     def test_the_japanese_rows_are_the_last_eleven(self):
         # eval/README.md: ids ending in 201 to 211, eight allow rows and three
         # prompt-injection block rows.
-        for split, prefix in (("dev", "dev-"), ("holdout", "hold-")):
+        for split in ("dev", "holdout"):
+            prefix = ID_PREFIX[split]
             rows = {row["id"]: row for row in read_split(split)}
             japanese = [rows[f"{prefix}{number}"] for number in range(201, 212)]
             with self.subTest(split=split):
@@ -111,21 +119,26 @@ class Adversarial(unittest.TestCase):
             },
         )
 
-    def test_limit_rows_are_out_of_the_judges_sight(self):
-        limit = inspect_body_bytes()
+    def padded_and_file_part_rows(self):
         rows = [row for row in self.rows if row["kind"] == "adv_limit"]
-        beyond = [row for row in rows if "filename=" not in row["request"]["body"]]
+        padded = [row for row in rows if "filename=" not in row["request"]["body"]]
         file_part = [row for row in rows if "filename=" in row["request"]["body"]]
-        self.assertEqual((len(beyond), len(file_part)), (1, 1))
-        body = beyond[0]["request"]["body"].encode("utf-8")
-        self.assertGreater(body.index(b"UNION"), limit)
+        return padded, file_part
 
-    def test_attack_rows_keep_their_payload_within_the_inspected_bytes(self):
+    def test_limit_rows_are_out_of_the_judges_sight(self):
+        padded, file_part = self.padded_and_file_part_rows()
+        self.assertEqual((len(padded), len(file_part)), (1, 1))
+        body = padded[0]["request"]["body"].encode("utf-8")
+        self.assertGreater(body.index(b"UNION"), inspect_body_bytes())
+
+    def test_every_other_body_fits_in_the_inspected_bytes(self):
         limit = inspect_body_bytes()
-        for row in self.rows:
-            if row["kind"] in ("adv_judge", "adv_app") and row["request"]["body"] is not None:
-                with self.subTest(id=row["id"]):
-                    self.assertLessEqual(len(row["request"]["body"].encode("utf-8")), limit)
+        padded, _ = self.padded_and_file_part_rows()
+        others = [row for row in self.rows if row is not padded[0] and row["request"]["body"] is not None]
+        self.assertGreater(len(others), 30)
+        for row in others:
+            with self.subTest(id=row["id"]):
+                self.assertLessEqual(len(row["request"]["body"].encode("utf-8")), limit)
 
 
 if __name__ == "__main__":
