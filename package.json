@@ -12,7 +12,7 @@
     "dup": "jscpd"
   },
   "devDependencies": {
-    "jscpd": "5.4.2",
+    "jscpd": "5.4.3",
     "vitepress": "2.0.0-alpha.19"
   },
   "packageManager": "pnpm@12.18.0"
