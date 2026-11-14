@@ -269,7 +269,7 @@ pub(crate) fn restart(config_path: &Path) -> anyhow::Result<ExitCode> {
     let settings = vigilant_heron::process_settings(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     if live_pid(&settings.pid_file)?.is_some() {
-        stop(config_path)?;
+        let _ = stop(config_path)?;
     }
     start(config_path)
 }
@@ -373,10 +373,7 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
 
-        let message = result
-            .err()
-            .map(|error| error.to_string())
-            .unwrap_or_default();
+        let message = result.err().map_or_default(|error| error.to_string());
         assert!(message.contains("did not write"), "{message}");
         assert!(message.contains("still loading"), "{message}");
         assert!(ended, "the child was left running after the start timeout");

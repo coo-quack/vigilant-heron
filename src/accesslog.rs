@@ -550,8 +550,7 @@ mod tests {
         headers: &HeaderMap,
     ) -> String {
         LogFormat::compile("test", escape, text, &[])
-            .map(|format| format.render(record, headers))
-            .unwrap_or_default()
+            .map_or_default(|format| format.render(record, headers))
     }
 
     /// A record of a blocked request whose block query is `query`.

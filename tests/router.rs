@@ -537,8 +537,7 @@ async fn backend_never_receives_credentials_and_sees_the_form_password_redacted(
     let untrusted = &event["event"]["untrusted"];
     let header_names: Vec<&str> = untrusted["headers"]
         .as_array()
-        .map(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect());
     assert!(!header_names.contains(&"cookie"));
     assert!(!header_names.contains(&"authorization"));
     let forwarded_body = untrusted["body"].as_str().unwrap_or_default();
@@ -586,8 +585,7 @@ async fn backend_receives_the_query_with_sensitive_parameters_redacted() -> Test
     );
     let header_names: Vec<&str> = untrusted["headers"]
         .as_array()
-        .map(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect());
     assert!(!header_names.contains(&"x-csrf-token"));
     proxy.stop().await
 }

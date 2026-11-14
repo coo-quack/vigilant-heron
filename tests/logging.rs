@@ -514,8 +514,7 @@ async fn the_request_id_header_is_not_sent_to_the_decision_backend() -> TestResu
     assert!(!event.is_null(), "the decision backend was not called");
     let names: Vec<&str> = event["event"]["untrusted"]["headers"]
         .as_array()
-        .map(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect())
-        .unwrap_or_default();
+        .map_or_default(|pairs| pairs.iter().filter_map(|pair| pair[0].as_str()).collect());
     assert!(
         !names.contains(&"x-request-id"),
         "the request id must not reach the backend"

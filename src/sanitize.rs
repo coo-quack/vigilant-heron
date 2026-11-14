@@ -2560,8 +2560,7 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap_or(Value::Null);
         let top_keys: Vec<&str> = json["event"]
             .as_object()
-            .map(|map| map.keys().map(String::as_str).collect())
-            .unwrap_or_default();
+            .map_or_default(|map| map.keys().map(String::as_str).collect());
         assert_eq!(top_keys.len(), 2);
         assert!(top_keys.contains(&"untrusted"));
         assert!(top_keys.contains(&"meta"));

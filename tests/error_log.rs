@@ -383,5 +383,5 @@ fn an_error_log_destination_of_stdout_writes_to_standard_output() -> TestResult 
 }
 
 fn read_buffer(buffer: &std::sync::Arc<std::sync::Mutex<String>>) -> String {
-    buffer.lock().map(|text| text.clone()).unwrap_or_default()
+    buffer.lock().map_or_default(|text| text.clone())
 }
