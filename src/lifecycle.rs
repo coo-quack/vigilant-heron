@@ -269,7 +269,7 @@ pub(crate) fn restart(config_path: &Path) -> anyhow::Result<ExitCode> {
     let settings = vigilant_heron::process_settings(config_path)
         .with_context(|| format!("loading {}", config_path.display()))?;
     if live_pid(&settings.pid_file)?.is_some() {
-        let _ = stop(config_path)?;
+        let _: ExitCode = stop(config_path)?;
     }
     start(config_path)
 }
