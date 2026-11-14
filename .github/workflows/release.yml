@@ -50,7 +50,7 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # Tests and the advisory check (the same tools and steps as the ci.yml audit
+  # Tests and the advisory check (the same tools and steps as the audit.yml audit
   # job) run without write access, and the checkout keeps no credential.
   verify:
     needs: check
@@ -60,7 +60,7 @@ jobs:
     permissions:
       contents: read
     env:
-      # Keep in step with ci.yml.
+      # Keep in step with audit.yml.
       CARGO_DENY_VERSION: 0.20.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

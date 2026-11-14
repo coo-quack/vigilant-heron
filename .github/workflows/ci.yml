@@ -13,36 +13,12 @@ env:
   CARGO_TERM_COLOR: always
   # rust-toolchain.toml pins the toolchain; rustup on the runner installs it
   # on the first cargo call, so no third-party toolchain action is needed.
-  CARGO_DENY_VERSION: 0.20.2
   CARGO_MACHETE_VERSION: 0.9.2
   CARGO_LLVM_COV_VERSION: 0.9.1
   # Keep in step with mutants.yml.
   CARGO_MUTANTS_VERSION: 27.1.0
 
 jobs:
-  # Advisories, licenses, banned crates and registry sources (deny.toml).
-  audit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/bin/cargo-deny
-          key: cargo-deny-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}
-      - run: command -v cargo-deny || cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
-      - run: cargo deny --locked check
-      # The documentation site's dependencies (docs/, package.json). pnpm comes
-      # from corepack, which reads the packageManager field.
-      - run: corepack enable pnpm
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '26.13.1'
-          cache: 'pnpm'
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level=high
-
   lint:
     runs-on: ubuntu-latest
     permissions:
@@ -146,7 +122,7 @@ jobs:
 
   # Copy/paste duplication in src/ (jscpd, configured by .jscpd.json). The
   # threshold there keeps duplicated Rust code from growing; `pnpm run dup`
-  # lists the clones. pnpm comes from corepack, as in the audit job.
+  # lists the clones. pnpm comes from corepack, as in audit.yml.
   duplication:
     runs-on: ubuntu-latest
     permissions:
