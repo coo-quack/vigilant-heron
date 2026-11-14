@@ -9,6 +9,10 @@ exclude_globs = ["src/test_support.rs"]
 test_tool = "nextest"
 additional_cargo_test_args = ["--profile=mutants"]
 
+# Build in the "mutants" Cargo profile of Cargo.toml, which leaves out debug info.
+# It shares a name with the nextest profile above and is otherwise unrelated.
+profile = "mutants"
+
 # The workspace denies lints such as unused imports, so a mutant that leaves an
 # import or a parameter unused would fail to build and count as unviable instead
 # of being tested. Lints are turned off for mutant builds only.

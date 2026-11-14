@@ -78,7 +78,7 @@ passes, that change is a **missed mutant**, which means a test is missing or
 too weak.
 
 `.github/workflows/mutants.yml` runs it every Sunday night (Monday 03:17 JST)
-in 32 shards. When the run finds missed mutants, timed-out mutants, or fails,
+in 20 shards. When the run finds missed mutants, timed-out mutants, or fails,
 it opens or updates the issue "Weekly mutation testing: findings". When a later
 run is clean, it closes that issue. The full output is in the `mutants-*`
 artifacts of the run. The settings are in `.cargo/mutants.toml`.

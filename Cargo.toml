@@ -85,3 +85,10 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 [[bench]]
 name = "hot_path"
 harness = false
+
+# The Cargo profile cargo-mutants builds with (`profile` in .cargo/mutants.toml).
+# Every mutant relinks all the test binaries, and without debug info that link is
+# faster. A failing test's backtrace has no line numbers in this profile.
+[profile.mutants]
+inherits = "test"
+debug = "none"
