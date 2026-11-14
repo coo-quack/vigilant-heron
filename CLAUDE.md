@@ -129,7 +129,7 @@ Top-level and documentation files:
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
 skills/          # Agent skills (npx skills add coo-quack/vigilant-heron): vigilant-heron-rollout drives docs/rollout.md on a real server
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, audit.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
