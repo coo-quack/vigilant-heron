@@ -150,12 +150,8 @@ fn strands_config(
     token_env: Option<&str>,
     access_log: Option<&Path>,
 ) -> Result<Config, BoxError> {
-    let token_line = token_env
-        .map(|name| format!("api_token_env {name};"))
-        .unwrap_or_default();
-    let log_line = access_log
-        .map(|path| format!("access_log {} json;", path.display()))
-        .unwrap_or_default();
+    let token_line = token_env.map_or_default(|name| format!("api_token_env {name};"));
+    let log_line = access_log.map_or_default(|path| format!("access_log {} json;", path.display()));
     let text = format!(
         r#"
 listen 127.0.0.1:0;

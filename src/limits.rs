@@ -1890,8 +1890,7 @@ mod tests {
         config
             .ok()
             .and_then(|config| config.zones.into_iter().next())
-            .map(|zone| zone.key)
-            .unwrap_or_default()
+            .map_or_default(|zone| zone.key)
     }
 
     #[rstest]
