@@ -83,6 +83,12 @@ it opens or updates the issue "Weekly mutation testing: findings". When a later
 run is clean, it closes that issue. The full output is in the `mutants-*`
 artifacts of the run. The settings are in `.cargo/mutants.toml`.
 
+cargo-mutants runs the tests with cargo-nextest, in the `mutants` profile of
+`.config/nextest.toml`. A test that runs for 60 s is stopped and counts as
+failed, so a mutant that makes one test loop forever is caught, not timed out.
+Install both tools to run it yourself: `cargo install --locked cargo-mutants cargo-nextest`.
+nextest does not run doctests, and the workspace has none.
+
 Every PR also runs the `mutants-diff` check. It mutates only the lines the PR
 changes (`cargo mutants --in-diff`), split over parallel shards: 8 shards for a PR
 to `develop`, and 32 shards for a PR to `main`, which is a release PR and covers

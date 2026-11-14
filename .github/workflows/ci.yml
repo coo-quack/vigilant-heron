@@ -15,8 +15,9 @@ env:
   # on the first cargo call, so no third-party toolchain action is needed.
   CARGO_MACHETE_VERSION: 0.9.2
   CARGO_LLVM_COV_VERSION: 0.9.1
-  # Keep in step with mutants.yml.
+  # Keep these two in step with mutants.yml.
   CARGO_MUTANTS_VERSION: 27.1.0
+  CARGO_NEXTEST_VERSION: 0.9.152
 
 jobs:
   lint:
@@ -210,6 +211,11 @@ jobs:
           path: ~/.cargo/bin/cargo-mutants
           key: cargo-mutants-${{ runner.os }}-${{ env.CARGO_MUTANTS_VERSION }}
       - run: command -v cargo-mutants || cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ env.CARGO_NEXTEST_VERSION }}
+      - run: command -v cargo-nextest || cargo install --locked cargo-nextest --version "$CARGO_NEXTEST_VERSION"
       - name: Diff against the base branch
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -217,7 +223,8 @@ jobs:
       # Every shard computes the same mutant list from the same diff, then runs its own slice.
       # --baseline=skip: the required `test` job already runs the unmutated suite, so a shard
       # does not repeat it. With no baseline there is no measured test time to scale, so the
-      # test timeout is fixed at 300 s, as in mutants.yml.
+      # test timeout is fixed at 300 s, as in mutants.yml. nextest stops a single test
+      # that runs for 60 s (the "mutants" profile in .config/nextest.toml).
       # --jobs 2 runs two mutants at a time on the runner's 4 vCPUs, as the single job did.
       # Without --in-place, cargo-mutants builds each mutant in a copy of the tree, so the
       # checked-out source is never changed.

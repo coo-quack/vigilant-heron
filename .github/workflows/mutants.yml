@@ -13,13 +13,15 @@ env:
   CARGO_TERM_COLOR: always
   # Pinned so the cache key changes when the version does.
   CARGO_MUTANTS_VERSION: 27.1.0
+  CARGO_NEXTEST_VERSION: 0.9.152
   # cargo runs the test binaries through prlimit (6 GiB of address space, 4 GiB
   # per file), so a mutant that loops while allocating or writing is killed, and
   # counts as caught, instead of taking the runner down. The compiler is not limited.
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=6442450944 --fsize=4294967296 --
 
 jobs:
-  # cargo-mutants runs with --baseline=skip, so the unmutated tests run here first.
+  # cargo-mutants runs with --baseline=skip, so the unmutated tests run here first,
+  # with the same test runner and profile that cargo-mutants uses (.cargo/mutants.toml).
   baseline:
     runs-on: ubuntu-latest
     permissions:
@@ -35,7 +37,12 @@ jobs:
             ~/.cargo/git
             target
           key: mutants-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-      - run: cargo test --workspace --locked
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ env.CARGO_NEXTEST_VERSION }}
+      - run: command -v cargo-nextest || cargo install --locked cargo-nextest --version "$CARGO_NEXTEST_VERSION"
+      - run: cargo nextest run --workspace --locked --profile mutants
 
   mutants:
     needs: baseline
@@ -64,9 +71,17 @@ jobs:
           path: ~/.cargo/bin/cargo-mutants
           key: cargo-mutants-${{ runner.os }}-${{ env.CARGO_MUTANTS_VERSION }}
       - run: command -v cargo-mutants || cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ env.CARGO_NEXTEST_VERSION }}
+      - run: command -v cargo-nextest || cargo install --locked cargo-nextest --version "$CARGO_NEXTEST_VERSION"
       # A non-zero exit code is recorded, not raised here, so the upload step still runs.
       # With --baseline=skip there is no measured test time to scale, so the test
       # timeout is fixed at 300 s (one full test run takes about 60 s on a laptop).
+      # Within that, nextest stops a single test that runs for 60 s and fails it (the
+      # "mutants" profile in .config/nextest.toml), so one test that never returns
+      # does not hold the mutant until the 300 s limit.
       - id: run
         run: |
           cargo mutants --no-shuffle --shard ${{ matrix.shard }}/32 --baseline=skip --timeout 300 --cargo-arg=--locked --in-place --output mutants-out-${{ matrix.shard }} || echo "status=$?" >> "$GITHUB_OUTPUT"

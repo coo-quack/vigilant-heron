@@ -3,8 +3,11 @@
 # src/test_support.rs builds test fixtures; mutating it only tests the test helper.
 exclude_globs = ["src/test_support.rs"]
 
-# The tests use real short timers, so a mutant that slows the code gets extra time before it counts as a timeout.
-timeout_multiplier = 3.0
+# Run the tests with cargo-nextest, in the "mutants" profile of .config/nextest.toml,
+# so a test that never returns is stopped and failed after 60 s. nextest does not run
+# doctests; the workspace has none.
+test_tool = "nextest"
+additional_cargo_test_args = ["--profile=mutants"]
 
 # The workspace denies lints such as unused imports, so a mutant that leaves an
 # import or a parameter unused would fail to build and count as unviable instead

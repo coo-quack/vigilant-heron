@@ -135,7 +135,8 @@ package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
 deny.toml        # cargo-deny policy: advisories, licenses, sources
 .jscpd.json      # jscpd settings for the duplication check (pnpm run dup)
-.cargo/mutants.toml # cargo-mutants settings (exclusions, timeout multiplier)
+.cargo/mutants.toml # cargo-mutants settings (exclusions, test tool)
+.config/nextest.toml # cargo-nextest settings: the mutants profile stops a test that runs for 60 s
 clippy.toml      # Clippy settings (allow the lints in tests)
 rust-toolchain.toml # Toolchain pin
 README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents

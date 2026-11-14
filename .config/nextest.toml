@@ -1,0 +1,12 @@
+# cargo-nextest settings. Only the "mutants" profile is defined, so a plain
+# `cargo nextest run` keeps nextest's defaults.
+
+# Used by cargo-mutants (test_tool and additional_cargo_test_args in
+# .cargo/mutants.toml). A mutant can turn a loop or a wait into one that never
+# ends, and nextest has a time limit per test, so it stops that one test and
+# fails it, which counts the mutant as caught. cargo test has no such limit.
+# The slowest test takes about 9 s when the whole suite runs on a laptop, so 60 s
+# leaves room for a slower CI runner. cargo-mutants' --timeout stays as the limit
+# for the whole run.
+[profile.mutants]
+slow-timeout = { period = "60s", terminate-after = 1 }
