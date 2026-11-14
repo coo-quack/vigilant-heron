@@ -1220,8 +1220,7 @@ fn host_name(parts: &Parts) -> String {
         .headers
         .get(HOST)
         .and_then(|value| value.to_str().ok())
-        .map(normalize_host)
-        .unwrap_or_default()
+        .map_or_default(normalize_host)
 }
 
 /// The request id: the configured request-id header when its value is usable, else a generated id.

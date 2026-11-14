@@ -521,8 +521,7 @@ mod tests {
     fn query_regex(rule: &str) -> String {
         rule.split_once("query ~ \"")
             .and_then(|(_, rest)| rest.split_once("\";"))
-            .map(|(regex, _)| regex.to_owned())
-            .unwrap_or_default()
+            .map_or_default(|(regex, _)| regex.to_owned())
     }
 
     #[rstest]

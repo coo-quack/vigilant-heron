@@ -123,10 +123,7 @@ fn invalid_rule_directives_are_rejected_with_their_line(
     #[case] body: &str,
     #[case] expected: &str,
 ) {
-    let error = parse_top_rule(body)
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+    let error = parse_top_rule(body).err().map_or_default(|e| e.to_string());
     assert!(error.starts_with("test.conf:"), "{error}");
     assert!(error.contains(expected), "{error}");
 }
@@ -291,8 +288,7 @@ fn an_oversized_regex_is_a_configuration_error() {
     );
     let text = parse_top_rule(&body)
         .err()
-        .map(|e| e.to_string())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string());
     assert!(text.starts_with("test.conf:"), "{text}");
     assert!(text.contains("regex is longer than 512 bytes"), "{text}");
 }
@@ -1164,8 +1160,7 @@ fn default_is_read_only_in_the_built_in_file(#[case] body: &str, #[case] accepte
 fn default_on_is_refused_in_the_built_in_file() {
     let text = parse_builtin_rule("description \"d\";\ndefault on;\naction block;\npath /x;")
         .err()
-        .map(|error| error.to_string())
-        .unwrap_or_default();
+        .map_or_default(|error| error.to_string());
     assert!(text.contains("\"default\" must be \"off\""), "{text}");
 }
 
