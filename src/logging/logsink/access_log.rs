@@ -18,8 +18,8 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 
 use super::append_options;
-use crate::accesslog;
 use crate::config::Destination;
+use crate::logging::accesslog;
 
 /// Lines the queue holds before new lines are dropped.
 pub(crate) const QUEUE_CAPACITY: usize = 4096;

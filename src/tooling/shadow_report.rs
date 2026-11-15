@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use serde_json::Value;
 
-use crate::log_lines::{
+use crate::tooling::log_lines::{
     Line, for_each_line, is_block, number_field, object_line, text_field, whole_field,
 };
 

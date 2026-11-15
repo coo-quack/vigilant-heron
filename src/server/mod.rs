@@ -35,7 +35,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
 use crate::access;
-use crate::accesslog::AccessRecord;
 use crate::backend::sanitize::{self, EventInput};
 use crate::block::BlockResponse;
 use crate::body::{ClientBody, Sniffed};
@@ -43,6 +42,7 @@ use crate::config::{Config, Mode, SiteConfig};
 use crate::error::{ConfigError, DecisionError, ServeError};
 use crate::finish::Finish;
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus};
+use crate::logging::accesslog::AccessRecord;
 use crate::phase::{Phase, PhaseCell};
 use crate::policy::{self, Action, Assessment};
 use crate::prefilter::{self, Screening};

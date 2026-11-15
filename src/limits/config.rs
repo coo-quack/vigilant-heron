@@ -4,9 +4,9 @@ use std::collections::HashSet;
 
 use http::{HeaderName, StatusCode};
 
-use crate::accesslog::FORBIDDEN_HEADERS;
 use crate::conf::{Directive, invalid, once, one_arg, parse_size};
 use crate::error::ConfigError;
+use crate::logging::accesslog::FORBIDDEN_HEADERS;
 
 /// Bytes of memory per `limit_req` state, as in nginx.
 const REQ_STATE_BYTES: usize = 128;

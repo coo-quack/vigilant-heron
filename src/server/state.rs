@@ -9,14 +9,14 @@ use http::header::HeaderName;
 use tokio::sync::Semaphore;
 
 use crate::access::AccessEntry;
-use crate::accesslog::LogFormat;
 use crate::backend::Backend;
 use crate::backend::decision::{ClientSlots, HttpDecisionBackend, Limits, decision_client};
 use crate::backend::system_one::SystemOneBackend;
 use crate::config::{AccessLogConfig, BackendConfig, Config, SiteConfig};
 use crate::error::ServeError;
 use crate::limits::{LimitSet, LimitZone, ZoneStore};
-use crate::logsink::{Writer, spawn_writer};
+use crate::logging::accesslog::LogFormat;
+use crate::logging::logsink::{Writer, spawn_writer};
 use crate::proxy::Proxy;
 use crate::realip::RealIp;
 use crate::router::Router;

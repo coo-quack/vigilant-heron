@@ -6,7 +6,7 @@
 //! only handle that `stop` and `restart` use, as `-s` uses it. Under Docker or systemd,
 //! run the router in the foreground instead.
 //!
-//! Signals go through `rustix`, as in [`crate::cli`].
+//! Signals go through `rustix`, as in [`crate::command::cli`].
 
 use std::io::{ErrorKind, Write};
 use std::os::unix::process::CommandExt;
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::pidfile;
+use crate::command::pidfile;
 use anyhow::{Context, anyhow, bail};
 use rustix::io::Errno;
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
