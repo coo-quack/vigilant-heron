@@ -30,9 +30,9 @@ exclude_re = [
     'src/sanitize/body/lexical\.rs:42:21: replace \+ with \* in redact_xml_elements$',
     # With `<=`, a retry at the end of the text moves `t` past the end and fails on the next
     # literal as before. A trailing `*`, the only way to match there, never retries.
-    'src/conf/mod\.rs:261:38: replace < with <= in wildcard_matches$',
+    'src/conf/mod\.rs:280:38: replace < with <= in wildcard_matches$',
     # `p = sp * 1` points at the `*` again, and its arm sets the same `star`, `p` and `t`.
-    'src/conf/mod\.rs:263:28: replace \+ with \* in wildcard_matches$',
+    'src/conf/mod\.rs:282:28: replace \+ with \* in wildcard_matches$',
     # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
     # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
     # `HYPER_DEFAULT_BUFFER` copies). This stops holding if hyper changes that default.

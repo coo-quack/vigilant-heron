@@ -57,12 +57,25 @@ pub(crate) fn dump_file(path: &Path) -> Result<String, ConfigError> {
     Ok(out)
 }
 
-fn dump_recursive(
-    path: &Path,
-    depth: usize,
-    stack: &mut Vec<PathBuf>,
-    out: &mut String,
-) -> Result<(), ConfigError> {
+/// One configuration file that has been read and parsed, and entered on the include stack.
+struct Entered {
+    /// The text of the file.
+    source: String,
+    /// The directives of the file, with its includes not yet expanded.
+    directives: Vec<Directive>,
+    /// The directory that the relative includes of the file start from.
+    base: PathBuf,
+}
+
+/// Reads and parses the file at `path`, and enters it on `stack`, the files that are being
+/// included. The caller pops the stack once it has finished with the file.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Read`] when the file cannot be read, [`ConfigError::Syntax`] when
+/// it does not parse, and [`ConfigError::Include`] when the file is already on the stack,
+/// which is an include cycle.
+fn enter(path: &Path, stack: &mut Vec<PathBuf>) -> Result<Entered, ConfigError> {
     let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
         source,
@@ -80,6 +93,34 @@ fn dump_recursive(
     let base = path
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    Ok(Entered {
+        source,
+        directives,
+        base,
+    })
+}
+
+/// The path that an include `pattern` names: as written when it is absolute, and under
+/// `base`, the directory of the including file, when it is relative.
+fn include_target(base: &Path, pattern: &str) -> PathBuf {
+    if Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        base.join(pattern)
+    }
+}
+
+fn dump_recursive(
+    path: &Path,
+    depth: usize,
+    stack: &mut Vec<PathBuf>,
+    out: &mut String,
+) -> Result<(), ConfigError> {
+    let Entered {
+        source,
+        directives,
+        base,
+    } = enter(path, stack)?;
     let includes: Vec<&Directive> = directives
         .iter()
         .filter(|directive| directive.name == "include")
@@ -111,11 +152,7 @@ fn dump_recursive(
                 "includes are nested deeper than {MAX_INCLUDE_DEPTH} levels"
             )));
         }
-        let target = if Path::new(pattern).is_absolute() {
-            PathBuf::from(pattern)
-        } else {
-            base.join(pattern)
-        };
+        let target = include_target(&base, pattern);
         let _ = writeln!(out, "# {}", text.trim());
         for included in resolve_include(&target, pattern).map_err(include_error)? {
             dump_recursive(&included, depth + 1, stack, out)?;
@@ -130,23 +167,9 @@ fn load_recursive(
     depth: usize,
     stack: &mut Vec<PathBuf>,
 ) -> Result<Vec<Directive>, ConfigError> {
-    let source = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let directives = parse_text(&source, &path.display().to_string())?;
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if stack.contains(&canonical) {
-        return Err(ConfigError::Include {
-            file: path.display().to_string(),
-            line: 1,
-            message: "include cycle".to_owned(),
-        });
-    }
-    stack.push(canonical);
-    let base = path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let Entered {
+        directives, base, ..
+    } = enter(path, stack)?;
     let expanded = expand_includes(directives, &base, depth, stack);
     stack.pop();
     expanded
@@ -194,11 +217,7 @@ fn expand_includes(
                 "includes are nested deeper than {MAX_INCLUDE_DEPTH} levels"
             )));
         }
-        let target = if Path::new(pattern).is_absolute() {
-            PathBuf::from(pattern)
-        } else {
-            base.join(pattern)
-        };
+        let target = include_target(base, pattern);
         for path in resolve_include(&target, pattern).map_err(include_error)? {
             let loaded = load_recursive(&path, depth + 1, stack)?;
             expanded.extend(loaded);
@@ -319,6 +338,62 @@ mod tests {
         let mut stack = Vec::new();
         let result = expand_includes(directives, Path::new("."), MAX_INCLUDE_DEPTH, &mut stack);
         assert!(matches!(result, Err(ConfigError::Include { .. })));
+    }
+
+    #[test]
+    fn an_absolute_include_is_used_as_written() {
+        assert_eq!(
+            include_target(Path::new("/etc/vigilant-heron"), "/srv/sites.d/a.conf"),
+            PathBuf::from("/srv/sites.d/a.conf")
+        );
+    }
+
+    #[test]
+    fn a_relative_include_is_put_under_the_directory_of_the_including_file() {
+        assert_eq!(
+            include_target(Path::new("/etc/vigilant-heron"), "sites.d/a.conf"),
+            PathBuf::from("/etc/vigilant-heron/sites.d/a.conf")
+        );
+    }
+
+    /// Writes `text` to `main.conf` in a directory of its own and returns the file's path.
+    fn config_file(name: &str, text: &str) -> std::io::Result<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("vh-enter-{name}-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        let path = dir.join("main.conf");
+        fs::write(&path, text)?;
+        Ok(path)
+    }
+
+    #[test]
+    fn a_file_that_includes_itself_is_an_include_cycle() -> std::io::Result<()> {
+        let path = config_file("cycle", "include main.conf;\n")?;
+        let is_cycle = |error: Option<ConfigError>| {
+            matches!(
+                error,
+                Some(ConfigError::Include { ref message, .. }) if message == "include cycle"
+            )
+        };
+        assert!(is_cycle(load_file(&path).err()));
+        assert!(is_cycle(dump_file(&path).err()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_is_a_read_error() {
+        let path = std::env::temp_dir()
+            .join(format!("vh-enter-missing-{}", std::process::id()))
+            .join("main.conf");
+        assert!(matches!(load_file(&path), Err(ConfigError::Read { .. })));
+        assert!(matches!(dump_file(&path), Err(ConfigError::Read { .. })));
+    }
+
+    #[test]
+    fn a_file_that_does_not_parse_is_a_syntax_error() -> std::io::Result<()> {
+        let path = config_file("syntax", "site {\n")?;
+        assert!(matches!(load_file(&path), Err(ConfigError::Syntax { .. })));
+        assert!(matches!(dump_file(&path), Err(ConfigError::Syntax { .. })));
+        Ok(())
     }
 
     proptest::proptest! {
