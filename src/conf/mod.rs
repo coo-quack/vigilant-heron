@@ -1,12 +1,19 @@
-//! The configuration language: lexer, parser and file includes.
+//! The configuration language: lexer, parser, file includes, and the helpers that read
+//! the value of a directive.
 //!
 //! The syntax follows nginx: `name arg ...;` directives, `name arg ... { ... }`
 //! blocks, `#` comments, and `include` at the top level. [`load_file`] reads a
 //! file and expands its includes. [`parse_source`] does the same for text that
 //! is not in a file; its includes are relative to the current directory.
+//!
+//! What a directive means is decided by the modules that read the tree. They share the
+//! helpers of `value.rs`: [`invalid`] for an error at a directive, [`one_arg`] and [`block`]
+//! for its arguments and children, [`once`] for a directive that may appear once, and the
+//! parsers of times, sizes, numbers and on/off.
 
 mod lexer;
 mod parser;
+mod value;
 
 use std::fmt::Write as _;
 use std::fs;
@@ -14,6 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub(crate) use parser::Directive;
+pub(crate) use value::{
+    block, invalid, invalid_at_top, once, one_arg, parse_bool, parse_number, parse_positive_time,
+    parse_size, parse_time,
+};
 
 use crate::error::ConfigError;
 

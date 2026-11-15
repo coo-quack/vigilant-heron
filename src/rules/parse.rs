@@ -7,8 +7,7 @@ use http::{HeaderName, Method};
 
 use super::matching::{PathMatch, Pattern};
 use super::{ParsedRule, Rule, RuleAction, Scope};
-use crate::conf::Directive;
-use crate::config::{block, invalid, one_arg};
+use crate::conf::{Directive, block, invalid, one_arg};
 use crate::error::ConfigError;
 use crate::realip::IpNet;
 use crate::router::normalize_host;

@@ -9,14 +9,11 @@ use http::{HeaderValue, Uri};
 use super::decision::parse_absolute_uri;
 use super::logs::{Formats, parse_access};
 use super::names::SITE_DIRECTIVES;
-use super::value::{
-    block, invalid, once, one_arg, parse_body_limit, parse_bool, parse_failure,
-    parse_positive_time, parse_threshold,
-};
+use super::value::{parse_body_limit, parse_failure, parse_threshold};
 use super::{AccessLogConfig, FailureAction, Mode, SiteAction, SiteConfig, SiteTimeouts};
 use crate::access::AccessEntry;
 use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
-use crate::conf::Directive;
+use crate::conf::{Directive, block, invalid, once, one_arg, parse_bool, parse_positive_time};
 use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig, PendingLocation};
 use crate::proxy::HeaderOp;

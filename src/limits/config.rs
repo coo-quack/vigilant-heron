@@ -5,8 +5,7 @@ use std::collections::HashSet;
 use http::{HeaderName, StatusCode};
 
 use crate::accesslog::FORBIDDEN_HEADERS;
-use crate::conf::Directive;
-use crate::config::{invalid, once, one_arg, parse_size};
+use crate::conf::{Directive, invalid, once, one_arg, parse_size};
 use crate::error::ConfigError;
 
 /// Bytes of memory per `limit_req` state, as in nginx.

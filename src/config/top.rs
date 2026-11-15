@@ -16,10 +16,7 @@ use super::logs::{
 };
 use super::names::TOP_LEVEL_DIRECTIVES;
 use super::site::{Top, access_entry, parse_site, set_site_timeout};
-use super::value::{
-    block, invalid, invalid_at_top, once, one_arg, parse_bool, parse_header_buffers,
-    parse_lingering_close, parse_number, parse_positive_time, parse_time,
-};
+use super::value::{parse_header_buffers, parse_lingering_close};
 use super::{
     Config, ConnectionConfig, DEFAULT_CLIENT_BODY_TIMEOUT, DEFAULT_CLIENT_HEADER_TIMEOUT,
     DEFAULT_CLIENT_MAX_BODY, DEFAULT_HEADER_BUFFER_COUNT, DEFAULT_HEADER_BUFFER_SIZE,
@@ -31,7 +28,10 @@ use super::{
 };
 use crate::access::AccessEntry;
 use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
-use crate::conf::Directive;
+use crate::conf::{
+    Directive, block, invalid, invalid_at_top, once, one_arg, parse_bool, parse_number,
+    parse_positive_time, parse_time,
+};
 use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone};
 use crate::proxy::HeaderOp;

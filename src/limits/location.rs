@@ -5,8 +5,7 @@ use std::fmt;
 
 use super::config::{LIMIT_NAMES, LimitOverrides, LimitSet, LimitZone};
 use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
-use crate::conf::Directive;
-use crate::config::{block, invalid, once, one_arg, parse_bool};
+use crate::conf::{Directive, block, invalid, once, one_arg, parse_bool};
 use crate::error::ConfigError;
 use crate::proxy::HeaderOp;
 
