@@ -13,7 +13,7 @@ use crate::accesslog::LogFormat;
 use crate::config::{AccessLogConfig, BackendConfig, Config, SiteConfig};
 use crate::decision::{Backend, ClientSlots, HttpDecisionBackend, Limits, decision_client};
 use crate::error::ServeError;
-use crate::limits::{LimitSet, ZoneStore};
+use crate::limits::{LimitSet, LimitZone, ZoneStore};
 use crate::logsink::{Writer, spawn_writer};
 use crate::proxy::Proxy;
 use crate::realip::RealIp;
@@ -104,30 +104,7 @@ impl AppState {
         if let Some(name) = &config.request_id_header {
             backend_redact.push(name.as_str().to_owned());
         }
-        let mut writers: HashMap<String, Writer> = HashMap::new();
-        let mut sinks_for = |logs: &[AccessLogConfig]| -> Vec<Sink> {
-            logs.iter()
-                .map(|log| {
-                    let writer = writers
-                        .entry(log.destination.label())
-                        .or_insert_with(|| spawn_writer(log.destination.clone()))
-                        .clone();
-                    Sink {
-                        writer,
-                        format: log.format.clone(),
-                    }
-                })
-                .collect()
-        };
-        let global_sinks = sinks_for(&config.access_logs);
-        let site_sinks = config
-            .sites
-            .iter()
-            .map(|site| {
-                let logs = site.access_logs.as_deref().unwrap_or(&config.access_logs);
-                sinks_for(logs)
-            })
-            .collect();
+        let (global_sinks, site_sinks) = access_sinks(&config);
         let proxies = config
             .sites
             .iter()
@@ -151,22 +128,58 @@ impl AppState {
             request_id_header: config.request_id_header,
             site_sinks,
             global_sinks,
-            zones: config
-                .zones
-                .into_iter()
-                .map(|zone| {
-                    let shared = previous_zones.iter().find(|old| {
-                        old.name() == zone.name.as_str() && old.capacity() == zone.capacity
-                    });
-                    Arc::new(match shared {
-                        Some(old) => ZoneStore::sharing(zone, old),
-                        None => ZoneStore::new(zone),
-                    })
-                })
-                .collect(),
+            zones: zone_stores(config.zones, previous_zones),
             top_limits: config.limits,
         })
     }
+}
+
+/// The access-log sinks of `config`: those of requests that match no site, and those of
+/// each site, in the order of `config.sites`. Sinks with the same destination share one
+/// writer.
+fn access_sinks(config: &Config) -> (Vec<Sink>, Vec<Vec<Sink>>) {
+    let mut writers: HashMap<String, Writer> = HashMap::new();
+    let mut sinks_for = |logs: &[AccessLogConfig]| -> Vec<Sink> {
+        logs.iter()
+            .map(|log| {
+                let writer = writers
+                    .entry(log.destination.label())
+                    .or_insert_with(|| spawn_writer(log.destination.clone()))
+                    .clone();
+                Sink {
+                    writer,
+                    format: log.format.clone(),
+                }
+            })
+            .collect()
+    };
+    let global_sinks = sinks_for(&config.access_logs);
+    let site_sinks: Vec<Vec<Sink>> = config
+        .sites
+        .iter()
+        .map(|site| {
+            let logs = site.access_logs.as_deref().unwrap_or(&config.access_logs);
+            sinks_for(logs)
+        })
+        .collect();
+    (global_sinks, site_sinks)
+}
+
+/// The stores of `zones`. A zone named like one of `previous`, with the same size, shares
+/// its counts.
+fn zone_stores(zones: Vec<LimitZone>, previous: &[Arc<ZoneStore>]) -> Vec<Arc<ZoneStore>> {
+    zones
+        .into_iter()
+        .map(|zone| {
+            let shared = previous
+                .iter()
+                .find(|old| old.name() == zone.name.as_str() && old.capacity() == zone.capacity);
+            Arc::new(match shared {
+                Some(old) => ZoneStore::sharing(zone, old),
+                None => ZoneStore::new(zone),
+            })
+        })
+        .collect()
 }
 
 /// The decision slots of a state built from `config`. A reload reuses the previous
