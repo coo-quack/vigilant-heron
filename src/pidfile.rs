@@ -461,8 +461,8 @@ mod tests {
             second.as_ref().map(std::io::Error::kind),
             Some(ErrorKind::WouldBlock)
         );
-        // One wait between each pair of attempts, and none after the last one.
-        // The timer rounds each wait up to the next millisecond, so allow a few.
+        // One wait between each pair of attempts, and none after the last one: a wait
+        // after it would add one more interval.
         let between_attempts = LOCK_RETRY_INTERVAL * (LOCK_ATTEMPTS - 1);
         assert!(
             waited >= between_attempts && waited < between_attempts + LOCK_RETRY_INTERVAL,

@@ -111,8 +111,8 @@ the tests did not catch.
 
 A mutant that no test can tell from the original code is hidden with an
 `exclude_re` pattern in `.cargo/mutants.toml`, with a comment that says why. The
-pattern names one function and one replacement, as `cargo mutants --list`
-prints it, so it hides nothing else.
+pattern names one mutant, or the mutants of one replacement in one function, as
+`cargo mutants --list` prints them, so it hides nothing else.
 
 ## Benchmarks
 

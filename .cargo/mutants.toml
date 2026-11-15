@@ -11,14 +11,16 @@ timeout_multiplier = 3.0
 # of being tested. Lints are turned off for mutant builds only.
 cap_lints = true
 
-# Mutants that no test can tell from the original code. Each pattern names one function
-# and one replacement, as `cargo mutants --list` prints them, so it hides nothing else.
-# `--list` names carry line and column, so a pattern that needs them (to tell apart
-# two mutants of the same kind in one function) stops matching when its line moves.
-# The mutant is then reported as missed again, and the pattern is updated.
+# Mutants that no test can tell from the original code. Each pattern names one mutant,
+# or the mutants of one replacement in one function, as `cargo mutants --list` prints
+# them, so it hides nothing else. A name carries its line and column, so a pattern that
+# pins them stops matching when the line moves. The mutant is then reported as missed
+# again, and the pattern is updated.
 exclude_re = [
     # The OFlags are separate bits (RDONLY is 0), so `a | b` and `a ^ b` are the same value.
-    'replace \| with \^ in (open_lock_file|lock_held|read_pid)$',
+    'replace \| with \^ in open_lock_file$',
+    'replace \| with \^ in lock_held$',
+    'replace \| with \^ in read_pid$',
     # `high << 64` and the widened 64-bit `low` occupy different bits, so `|` and `^` agree.
     'replace \| with \^ in Table::digest$',
     # Two prefix locations that both match a path and have the same length have the same
@@ -28,15 +30,17 @@ exclude_re = [
     'src/sanitize\.rs:761:21: replace \+ with \* in redact_xml_elements$',
     # With `<=`, a retry at the end of the text moves `t` past the end and fails on the next
     # literal as before. A trailing `*`, the only way to match there, never retries.
-    'replace < with <= in wildcard_matches$',
+    'src/conf/mod\.rs:261:38: replace < with <= in wildcard_matches$',
     # `p = sp * 1` points at the `*` again, and its arm sets the same `star`, `p` and `t`.
     'src/conf/mod\.rs:263:28: replace \+ with \* in wildcard_matches$',
     # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
-    # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`).
+    # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
+    # `HYPER_DEFAULT_BUFFER` copies). This stops holding if hyper changes that default.
     'src/server\.rs:518:35: replace > with >= in serve_connection$',
     # `HttpConnector::poll_ready` returns `Ready(Ok(()))` for the default resolver
     # (hyper-util 0.1.21, `GaiResolver`), which is what the mutant returns.
     'UpstreamConnector>::poll_ready .* with Poll::from\(Ok\(\(\)\)\)$',
-    # The copy buffer size only sets how many bytes move per read; the bytes are the same.
-    'src/tunnel\.rs:\d+:\d+: replace \* with \+$',
+    # PUMP_BUFFER: the copy buffer size only sets how many bytes move per read; the bytes
+    # are the same.
+    'src/tunnel\.rs:25:31: replace \* with \+$',
 ]
