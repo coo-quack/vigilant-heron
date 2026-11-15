@@ -1,6 +1,6 @@
 //! Parsing of `rule <id> { ... }` blocks and the id registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use http::{HeaderName, Method};
@@ -29,10 +29,6 @@ pub(crate) const BUILTIN_PREFIX: &str = "vh-";
 /// Returns [`ConfigError::Invalid`] naming the directive's file and line for a
 /// bad id, a missing or repeated directive, an unknown directive, an invalid
 /// pattern or a rule without a condition.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per directive keeps each name and its check together"
-)]
 pub(crate) fn parse_rule(directive: &Directive, scope: Scope) -> Result<ParsedRule, ConfigError> {
     let id = rule_id(directive, scope)?;
     let children = block(directive).map_err(|_| {
@@ -42,162 +38,236 @@ pub(crate) fn parse_rule(directive: &Directive, scope: Scope) -> Result<ParsedRu
         )
     })?;
 
-    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut default_on = true;
-    let mut description: Option<String> = None;
-    let mut action: Option<RuleAction> = None;
-    let mut sites: Option<Vec<String>> = None;
-    let mut methods: Option<Vec<Method>> = None;
-    let mut path: Option<PathMatch> = None;
-    let mut clients: Option<Vec<IpNet>> = None;
-    let mut query = Vec::new();
-    let mut headers = Vec::new();
-    let mut body = Vec::new();
-    let mut any = Vec::new();
-
+    let mut draft = RuleDraft::new(id, scope);
     for child in children {
+        draft.apply(child)?;
+    }
+    draft.finish(directive)
+}
+
+/// A `rule` block while it is read: its id and scope, and the settings read so far, which
+/// become the fields of [`Rule`] and [`ParsedRule`] of the same names.
+struct RuleDraft<'a> {
+    /// The rule id, already checked by [`rule_id`].
+    id: String,
+    /// Where the block was written.
+    scope: Scope,
+    /// The names of the single-use directives seen so far.
+    seen: HashSet<&'a str>,
+    /// Whether the rule runs without `enable_rule`. Only `default off` in a built-in rule clears it.
+    default_on: bool,
+    description: Option<String>,
+    action: Option<RuleAction>,
+    sites: Option<Vec<String>>,
+    methods: Option<Vec<Method>>,
+    path: Option<PathMatch>,
+    clients: Option<Vec<IpNet>>,
+    query: Vec<Pattern>,
+    headers: Vec<(HeaderName, Pattern)>,
+    body: Vec<Pattern>,
+    any: Vec<Pattern>,
+}
+
+impl<'a> RuleDraft<'a> {
+    /// An empty draft for the rule `id`.
+    fn new(id: String, scope: Scope) -> Self {
+        Self {
+            id,
+            scope,
+            seen: HashSet::new(),
+            default_on: true,
+            description: None,
+            action: None,
+            sites: None,
+            methods: None,
+            path: None,
+            clients: None,
+            query: Vec::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            any: Vec::new(),
+        }
+    }
+
+    /// Applies one directive of the block. A repeated single-use directive fails
+    /// before its value is read.
+    fn apply(&mut self, child: &'a Directive) -> Result<(), ConfigError> {
         let name = child.name.as_str();
         let single = matches!(
             name,
             "description" | "action" | "default" | "site" | "method" | "path" | "client"
         );
-        if single && !seen.insert(name) {
+        if single && !self.seen.insert(name) {
             return Err(invalid(child, format!("duplicate directive \"{name}\"")));
         }
         match name {
-            "description" => {
-                let text = one_arg(child)?;
-                if text.trim().is_empty() {
-                    return Err(invalid(child, "\"description\" must not be empty"));
-                }
-                description = Some(text.to_owned());
-            }
-            "action" => {
-                action = Some(match child.args.as_slice() {
-                    [word] if word == "block" => RuleAction::Block,
-                    [word] if word == "skip" => RuleAction::Skip,
-                    _ => {
-                        return Err(invalid(child, "\"action\" must be \"block\" or \"skip\""));
-                    }
-                });
-            }
+            "description" => self.description = Some(description_text(child)?),
+            "action" => self.action = Some(rule_action(child)?),
             "default" => {
-                if scope != Scope::Builtin {
-                    return Err(invalid(
-                        child,
-                        "\"default\" is only valid in a built-in rule; a user rule is on as soon as it is written",
-                    ));
-                }
-                match child.args.as_slice() {
-                    [word] if word == "off" => default_on = false,
-                    _ => return Err(invalid(child, "\"default\" must be \"off\"")),
-                }
+                default_off(child, self.scope)?;
+                self.default_on = false;
             }
-            "site" => {
-                if scope != Scope::Top {
-                    return Err(invalid(
-                        child,
-                        "\"site\" is only valid in a top-level rule; a rule inside a site applies to that site",
-                    ));
-                }
-                if child.args.is_empty() {
-                    return Err(invalid(child, "\"site\" needs at least one host name"));
-                }
-                let mut names = Vec::new();
-                for host in &child.args {
-                    let normalized = normalize_host(host);
-                    if normalized.is_empty() {
-                        return Err(invalid(
-                            child,
-                            format!("\"site\" has an invalid host name: {host}"),
-                        ));
-                    }
-                    names.push(normalized);
-                }
-                sites = Some(names);
-            }
-            "method" => {
-                if child.args.is_empty() {
-                    return Err(invalid(child, "\"method\" needs at least one method"));
-                }
-                let mut list = Vec::new();
-                for text in &child.args {
-                    let method = Method::from_bytes(text.as_bytes()).map_err(|_| {
-                        invalid(child, format!("\"method\" is not a valid method: {text}"))
-                    })?;
-                    list.push(method);
-                }
-                methods = Some(list);
-            }
-            "path" => path = Some(path_match(child)?),
-            "client" => {
-                if child.args.is_empty() {
-                    return Err(invalid(
-                        child,
-                        "\"client\" needs at least one address or network",
-                    ));
-                }
-                let mut nets = Vec::new();
-                for text in &child.args {
-                    let net = IpNet::parse(text).ok_or_else(|| {
-                        invalid(
-                            child,
-                            format!("\"client\" is not an address or network: {text}"),
-                        )
-                    })?;
-                    nets.push(net);
-                }
-                clients = Some(nets);
-            }
-            "query" => query.push(pattern_directive(child)?),
-            "body" => body.push(pattern_directive(child)?),
-            "any" => any.push(pattern_directive(child)?),
-            "header" => headers.push(header_directive(child)?),
+            "site" => self.sites = Some(site_hosts(child, self.scope)?),
+            "method" => self.methods = Some(method_list(child)?),
+            "path" => self.path = Some(path_match(child)?),
+            "client" => self.clients = Some(client_nets(child)?),
+            "query" => self.query.push(pattern_directive(child)?),
+            "body" => self.body.push(pattern_directive(child)?),
+            "any" => self.any.push(pattern_directive(child)?),
+            "header" => self.headers.push(header_directive(child)?),
             other => {
                 return Err(invalid(
                     child,
-                    format!("unknown directive \"{other}\" in rule \"{id}\""),
+                    format!("unknown directive \"{other}\" in rule \"{}\"", self.id),
                 ));
             }
         }
+        Ok(())
     }
 
-    let description = description
-        .ok_or_else(|| invalid(directive, format!("rule \"{id}\" needs a \"description\"")))?;
-    let action =
-        action.ok_or_else(|| invalid(directive, format!("rule \"{id}\" needs an \"action\"")))?;
-    let has_condition = methods.is_some()
-        || path.is_some()
-        || clients.is_some()
-        || !query.is_empty()
-        || !headers.is_empty()
-        || !body.is_empty()
-        || !any.is_empty();
-    if !has_condition {
+    /// Checks what the block as a whole needs (a description, an action and a
+    /// condition) and builds the rule. `directive` is the `rule` directive, which
+    /// the errors and the result point at.
+    fn finish(self, directive: &Directive) -> Result<ParsedRule, ConfigError> {
+        let id = self.id;
+        let description = self
+            .description
+            .ok_or_else(|| invalid(directive, format!("rule \"{id}\" needs a \"description\"")))?;
+        let action = self
+            .action
+            .ok_or_else(|| invalid(directive, format!("rule \"{id}\" needs an \"action\"")))?;
+        let has_condition = self.methods.is_some()
+            || self.path.is_some()
+            || self.clients.is_some()
+            || !self.query.is_empty()
+            || !self.headers.is_empty()
+            || !self.body.is_empty()
+            || !self.any.is_empty();
+        if !has_condition {
+            return Err(invalid(
+                directive,
+                format!("rule \"{id}\" needs at least one condition"),
+            ));
+        }
+
+        Ok(ParsedRule {
+            rule: Arc::new(Rule {
+                id: Arc::from(id.as_str()),
+                description,
+                action,
+                methods: self.methods,
+                path: self.path,
+                clients: self.clients,
+                query: self.query,
+                headers: self.headers,
+                body: self.body,
+                any: self.any,
+                default_on: self.default_on,
+            }),
+            sites: self.sites,
+            file: Arc::clone(&directive.file),
+            line: directive.line,
+        })
+    }
+}
+
+/// `description <text>`: one argument that is not blank.
+fn description_text(directive: &Directive) -> Result<String, ConfigError> {
+    let text = one_arg(directive)?;
+    if text.trim().is_empty() {
+        return Err(invalid(directive, "\"description\" must not be empty"));
+    }
+    Ok(text.to_owned())
+}
+
+/// `action block` or `action skip`.
+fn rule_action(directive: &Directive) -> Result<RuleAction, ConfigError> {
+    match directive.args.as_slice() {
+        [word] if word == "block" => Ok(RuleAction::Block),
+        [word] if word == "skip" => Ok(RuleAction::Skip),
+        _ => Err(invalid(
+            directive,
+            "\"action\" must be \"block\" or \"skip\"",
+        )),
+    }
+}
+
+/// `default off`, valid in a built-in rule only.
+fn default_off(directive: &Directive, scope: Scope) -> Result<(), ConfigError> {
+    if scope != Scope::Builtin {
         return Err(invalid(
             directive,
-            format!("rule \"{id}\" needs at least one condition"),
+            "\"default\" is only valid in a built-in rule; a user rule is on as soon as it is written",
         ));
     }
+    match directive.args.as_slice() {
+        [word] if word == "off" => Ok(()),
+        _ => Err(invalid(directive, "\"default\" must be \"off\"")),
+    }
+}
 
-    Ok(ParsedRule {
-        rule: Arc::new(Rule {
-            id: Arc::from(id.as_str()),
-            description,
-            action,
-            methods,
-            path,
-            clients,
-            query,
-            headers,
-            body,
-            any,
-            default_on,
-        }),
-        sites,
-        file: Arc::clone(&directive.file),
-        line: directive.line,
-    })
+/// `site <host>...`, valid in a top-level rule only. Returns the normalized host names.
+fn site_hosts(directive: &Directive, scope: Scope) -> Result<Vec<String>, ConfigError> {
+    if scope != Scope::Top {
+        return Err(invalid(
+            directive,
+            "\"site\" is only valid in a top-level rule; a rule inside a site applies to that site",
+        ));
+    }
+    if directive.args.is_empty() {
+        return Err(invalid(directive, "\"site\" needs at least one host name"));
+    }
+    let mut names = Vec::new();
+    for host in &directive.args {
+        let normalized = normalize_host(host);
+        if normalized.is_empty() {
+            return Err(invalid(
+                directive,
+                format!("\"site\" has an invalid host name: {host}"),
+            ));
+        }
+        names.push(normalized);
+    }
+    Ok(names)
+}
+
+/// `method <name>...`.
+fn method_list(directive: &Directive) -> Result<Vec<Method>, ConfigError> {
+    if directive.args.is_empty() {
+        return Err(invalid(directive, "\"method\" needs at least one method"));
+    }
+    let mut list = Vec::new();
+    for text in &directive.args {
+        let method = Method::from_bytes(text.as_bytes()).map_err(|_| {
+            invalid(
+                directive,
+                format!("\"method\" is not a valid method: {text}"),
+            )
+        })?;
+        list.push(method);
+    }
+    Ok(list)
+}
+
+/// `client <address or network>...`.
+fn client_nets(directive: &Directive) -> Result<Vec<IpNet>, ConfigError> {
+    if directive.args.is_empty() {
+        return Err(invalid(
+            directive,
+            "\"client\" needs at least one address or network",
+        ));
+    }
+    let mut nets = Vec::new();
+    for text in &directive.args {
+        let net = IpNet::parse(text).ok_or_else(|| {
+            invalid(
+                directive,
+                format!("\"client\" is not an address or network: {text}"),
+            )
+        })?;
+        nets.push(net);
+    }
+    Ok(nets)
 }
 
 /// Checks the id after `rule` against the rules it may have.
