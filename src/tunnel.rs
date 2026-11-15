@@ -45,10 +45,10 @@ impl Activity {
 /// Shutdown bookkeeping that every tunnel holds, from the connection it came from.
 #[derive(Debug, Clone)]
 pub(crate) struct Lifetime {
-    /// Cloned into every tunnel, which keeps it until it closes. The server waits
-    /// until no clone is left. Nothing is ever sent on it.
+    /// Held by every connection, and cloned into every tunnel, which keeps it until it
+    /// closes. The server's drain waits until no clone is left.
     pub(crate) open: mpsc::Sender<()>,
-    /// Becomes true when `worker_shutdown_timeout` expires, and every tunnel then closes.
+    /// Becomes true when `worker_shutdown_timeout` expires.
     pub(crate) force: watch::Receiver<bool>,
 }
 

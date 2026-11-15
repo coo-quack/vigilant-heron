@@ -382,7 +382,9 @@ fn is_log_breaking_char(c: char) -> bool {
 /// Appends `value` escaped for `escape`.
 ///
 /// `Escape::Default` writes every byte outside printable ASCII as `\xNN`. `Escape::Json`
-/// keeps printable non-ASCII text (such as Japanese) and writes the breaking characters as `\uXXXX`.
+/// keeps printable non-ASCII text (such as Japanese), puts a backslash before `"` and `\`, writes
+/// newline, carriage return and tab as `\n`, `\r` and `\t`, and writes the other breaking
+/// characters as `\uXXXX`.
 pub(crate) fn escape_into(out: &mut String, value: &str, escape: Escape) {
     match escape {
         Escape::Default => {

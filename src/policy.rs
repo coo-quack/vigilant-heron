@@ -38,11 +38,11 @@ impl Action {
 /// Why the action was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reason {
-    /// A deny rule matched; the backend was not called.
+    /// A block rule or a `deny_path` entry matched; the backend was not called.
     Rule,
     /// The verdict reached a threshold.
     Model,
-    /// A static asset or a skip rule skipped the backend.
+    /// A static asset skipped the backend.
     Skip,
     /// A skip rule matched and the backend was not called.
     SkipRule,
@@ -90,7 +90,7 @@ impl Reason {
 /// Input to the decision table.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Assessment {
-    /// A deny rule matched; the backend was not called.
+    /// A block rule or a `deny_path` entry matched; the backend was not called.
     Rule,
     /// A static asset skipped the backend.
     Skip,

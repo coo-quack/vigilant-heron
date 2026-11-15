@@ -103,7 +103,7 @@ pub const STARTUP_ONLY_DIRECTIVES: &[&str] = &[
     "lingering_timeout",
 ];
 
-/// Every directive name the top level accepts. The parser rejects any other name,
+/// Every directive name the top level accepts. The configuration builder rejects any other name,
 /// and `docs/configuration.md` must document each one (checked by `tests/docs.rs`).
 pub const TOP_LEVEL_DIRECTIVES: &[&str] = &[
     "listen",
@@ -527,7 +527,7 @@ pub enum FailureAction {
 /// placeholder, and the router would start without a real token.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckedConfig {
-    /// The configuration. A token that is not set holds a placeholder, which is never sent.
+    /// The configuration.
     pub config: Config,
     /// The token variable that is not set, when the configuration names one. The router
     /// will not start without it.
@@ -555,9 +555,6 @@ impl Config {
     /// error here: its name is returned in [`CheckedConfig::unset_token`], and the
     /// check passes on the rest of the file. A variable that is set but blank is still
     /// an error. [`Config::load`] is unchanged, so starting the router still needs it.
-    ///
-    /// This is for checks only. Never serve from the returned configuration: the token
-    /// may be a placeholder, and [`Config::load`] is the one to start the router with.
     ///
     /// # Errors
     ///
@@ -874,7 +871,9 @@ const SITE_TIMEOUT_NAMES: [&str; 5] = [
     "proxy_send_timeout",
 ];
 
-/// Connection timers that apply before a site is chosen, so only the top level may set them.
+/// Connection settings (timers, keep-alive and header limits, lingering) that apply before a site
+/// is chosen, so only the top level may set them. A `site` block that sets one is rejected.
+/// The removed `max_body` is listed with them.
 const CONNECTION_NAMES: [&str; 9] = [
     "client_header_timeout",
     "keepalive_timeout",

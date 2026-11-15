@@ -90,9 +90,9 @@ pub(crate) fn is_known_category(value: &str) -> bool {
 /// The Clef model that answers the questions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClefModel {
-    /// `clef-flash`, with a 24,576-token context.
+    /// The `clef-flash` model.
     Flash,
-    /// `clef`, with a 64K context.
+    /// The `clef` model.
     Full,
 }
 
@@ -208,10 +208,6 @@ fn yes_no_question(instructions: &str, when_true: &str, when_false: &str) -> Val
     })
 }
 
-/// Reads the scores out of a Clef response.
-///
-/// Accepts the Workers AI envelope (`{"result": {...}, "success": true}`) and a
-/// bare result object.
 /// Reads `usage.input_tokens`. Missing or malformed usage yields `None`, so it never
 /// fails the verdict.
 fn input_tokens(result: &Value) -> Option<u64> {
@@ -221,6 +217,10 @@ fn input_tokens(result: &Value) -> Option<u64> {
         .and_then(Value::as_u64)
 }
 
+/// Reads the scores out of a Clef response.
+///
+/// Accepts the Workers AI envelope (`{"result": {...}, "success": true}`) and a
+/// bare result object.
 pub(crate) fn parse_response(body: &[u8]) -> Result<Verdict, DecisionError> {
     let root: Value = serde_json::from_slice(body)?;
     if root.get("success").and_then(Value::as_bool) == Some(false) {
