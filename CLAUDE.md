@@ -46,8 +46,8 @@ src/
   block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
   limits/        # limit_req / limit_conn, runs first: directives (config), location selection (location), zones with the leaky bucket and connection counts (state), screening (screen)
-  rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
-  rules/tests.rs # Unit tests of the rule parser, built-in signatures, normalization and matching
+  rules/         # Rules: types (mod.rs), parse.rs (rule block parser, id registry), builtin.rs (builtin.conf), site.rs (site lists, switches), matching.rs (matching, normalization)
+  rules/tests/   # Unit tests by section: parser.rs, builtin.rs (examples table), matching.rs (with proptests), opt_in.rs; shared helpers in mod.rs
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
   request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
   request_id.rs  # Request ids: the request-id header value or a generated id, and the X-Request-ID response header
