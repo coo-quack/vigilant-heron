@@ -287,7 +287,7 @@ impl Body for ClientBody {
 /// be taken for the next request.
 pub(crate) struct Finish<B> {
     inner: B,
-    phase: Arc<crate::transport::PhaseCell>,
+    phase: Arc<crate::phase::PhaseCell>,
     body_done: Arc<AtomicBool>,
     /// `limit_conn` counts of the request, released when the response is dropped.
     permits: Vec<ConnPermit>,
@@ -297,7 +297,7 @@ impl<B> Finish<B> {
     /// Wraps the response body `inner` of the request that `body_done` tracks.
     pub(crate) fn new(
         inner: B,
-        phase: Arc<crate::transport::PhaseCell>,
+        phase: Arc<crate::phase::PhaseCell>,
         body_done: Arc<AtomicBool>,
     ) -> Self {
         Self {
@@ -317,13 +317,13 @@ impl<B> Finish<B> {
     /// Ends the response's use of the connection.
     fn mark_idle(&self) {
         // A tunnelled connection is neither idle nor closing: its bytes are not requests.
-        if self.phase.get() == crate::transport::Phase::Tunnelling {
+        if self.phase.get() == crate::phase::Phase::Tunnelling {
             return;
         }
         let phase = if self.body_done.load(Ordering::Acquire) {
-            crate::transport::Phase::AwaitingKeepAlive
+            crate::phase::Phase::AwaitingKeepAlive
         } else {
-            crate::transport::Phase::Closing
+            crate::phase::Phase::Closing
         };
         self.phase.set(phase);
     }

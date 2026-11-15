@@ -35,7 +35,7 @@ use crate::conf::Directive;
 use crate::config::{block, invalid, once, one_arg, parse_bool, parse_size};
 use crate::error::ConfigError;
 use crate::proxy::HeaderOp;
-use crate::transport::lock;
+use crate::sync::lock;
 
 /// Bytes of memory per `limit_req` state, as in nginx.
 const REQ_STATE_BYTES: usize = 128;

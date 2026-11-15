@@ -1,32 +1,20 @@
-//! Socket wrappers that enforce connection timers and header limits.
-//!
-//! [`ClientIo`] wraps a client socket. It bounds the wait for a request header
-//! (`client_header_timeout`), the idle time between requests (`keepalive_timeout`),
-//! the wait between writes (`send_timeout`), and checks the request line and
-//! header fields against `large_client_header_buffers` before hyper parses them.
-//! When a connection closes while client data may still arrive, [`ClientIo`]
-//! lingers first (`lingering_close`): it half-closes after the response and discards
-//! the client's bytes until the client closes or a bound passes.
-//! [`UpstreamIo`] wraps an upstream socket and bounds the wait between writes
-//! (`proxy_send_timeout`). Body timers live in [`crate::body`].
-//!
-//! hyper's own header timeout is not used: it also runs while a connection is
-//! idle, so it cannot tell the header timer from the keep-alive timer, and it
-//! answers oversized headers with 431 rather than nginx's 414 and 400.
+//! [`ClientIo`], the client socket wrapper, with the timers it applies and the
+//! rejections it records.
 
 use std::future::Future;
 use std::io::{self, IoSlice};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll, Waker};
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use hyper_util::client::legacy::connect::{Connected, Connection};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 
-use crate::config::{ConnectionConfig, HeaderBuffers, LingeringClose};
+use super::head::{HeadLimits, HeadScanner, HeadViolation};
+use crate::config::{ConnectionConfig, LingeringClose};
+use crate::phase::{Phase, PhaseCell};
+use crate::sync::lock;
 
 /// Written to a client that stopped while sending its request header.
 const RESPONSE_408: &[u8] =
@@ -38,96 +26,8 @@ const RESPONSE_414: &[u8] =
 const RESPONSE_400: &[u8] =
     b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
-/// hyper's default read buffer per connection (`DEFAULT_MAX_BUFFER_SIZE` in hyper 1.12).
-pub(crate) const HYPER_DEFAULT_BUFFER: usize = 8192 + 4096 * 100;
-
 /// Bytes read and discarded at a time by a lingering close. Its memory is bounded by this.
 const LINGER_BUFFER: usize = 4096;
-
-const PHASE_HEADER: u8 = 0;
-const PHASE_KEEP_ALIVE: u8 = 1;
-const PHASE_BUSY: u8 = 2;
-const PHASE_CLOSING: u8 = 3;
-const PHASE_TUNNEL: u8 = 4;
-
-/// What a client connection is waiting for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Phase {
-    /// Waiting for a request header. Bounded by `client_header_timeout`.
-    AwaitingHeader,
-    /// Idle between two requests. Bounded by `keepalive_timeout`.
-    AwaitingKeepAlive,
-    /// A request is being handled. Reads are not timed here.
-    Busy,
-    /// The response is complete but the request body is not. Reads report end of
-    /// stream, so the connection closes instead of reading the rest of the body.
-    Closing,
-    /// The connection has been upgraded and spliced into a tunnel. The bytes that
-    /// follow are not a request: they are neither timed nor scanned.
-    Tunnelling,
-}
-
-/// The phase of one client connection, shared by its transport and its request handler.
-#[derive(Debug)]
-pub(crate) struct PhaseCell {
-    phase: AtomicU8,
-    /// The task that reads the connection, woken on a phase change.
-    waker: Mutex<Option<Waker>>,
-}
-
-impl PhaseCell {
-    /// Starts a connection in the wait for its first request header.
-    pub(crate) fn new() -> Self {
-        Self {
-            phase: AtomicU8::new(PHASE_HEADER),
-            waker: Mutex::new(None),
-        }
-    }
-
-    /// Remembers the task that reads the connection, so `set` can wake it.
-    fn watch(&self, waker: &Waker) {
-        *lock(&self.waker) = Some(waker.clone());
-    }
-
-    /// Returns the current phase.
-    pub(crate) fn get(&self) -> Phase {
-        match self.phase.load(Ordering::Acquire) {
-            PHASE_KEEP_ALIVE => Phase::AwaitingKeepAlive,
-            PHASE_BUSY => Phase::Busy,
-            PHASE_CLOSING => Phase::Closing,
-            PHASE_TUNNEL => Phase::Tunnelling,
-            _ => Phase::AwaitingHeader,
-        }
-    }
-
-    /// Sets the phase.
-    pub(crate) fn set(&self, phase: Phase) {
-        let code = match phase {
-            Phase::AwaitingHeader => PHASE_HEADER,
-            Phase::AwaitingKeepAlive => PHASE_KEEP_ALIVE,
-            Phase::Busy => PHASE_BUSY,
-            Phase::Closing => PHASE_CLOSING,
-            Phase::Tunnelling => PHASE_TUNNEL,
-        };
-        self.phase.store(code, Ordering::Release);
-        // A parked reader may have no timer armed for the new phase, so it is woken.
-        if let Some(waker) = lock(&self.waker).take() {
-            waker.wake();
-        }
-    }
-
-    /// Moves an idle connection to the wait for a header. Returns false in any other phase.
-    fn begin_header(&self) -> bool {
-        self.phase
-            .compare_exchange(
-                PHASE_KEEP_ALIVE,
-                PHASE_HEADER,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    }
-}
 
 /// A response the transport sent itself, logged once the connection ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,113 +40,6 @@ pub(crate) struct Rejection {
 
 /// Holds the rejection of a connection until its access record is written.
 pub(crate) type RejectionSlot = Arc<Mutex<Option<Rejection>>>;
-
-/// Locks a mutex, ignoring poisoning: the guarded values stay valid after a panic elsewhere.
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-/// Limits on the request line and header section.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct HeadLimits {
-    /// Most bytes in one line, not counting its line ending.
-    pub(crate) line: usize,
-    /// Most bytes in the whole header section, counting line endings.
-    pub(crate) total: usize,
-}
-
-impl HeadLimits {
-    /// Derives the limits from `large_client_header_buffers`: one line per buffer,
-    /// and the whole section within `count` buffers.
-    pub(crate) fn from_buffers(buffers: HeaderBuffers) -> Self {
-        Self {
-            line: buffers.size,
-            total: buffers.count.saturating_mul(buffers.size),
-        }
-    }
-}
-
-/// Why a request header was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeadViolation {
-    /// The request line is longer than one buffer. Answered with 414.
-    RequestLineTooLong,
-    /// A header field, or the whole section, is too large. Answered with 400.
-    HeaderTooLarge,
-}
-
-/// Checks the bytes of one request header as they arrive, without parsing them.
-#[derive(Debug, Clone)]
-pub(crate) struct HeadScanner {
-    limits: HeadLimits,
-    total: usize,
-    line_len: usize,
-    completed_lines: usize,
-    done: bool,
-}
-
-impl HeadScanner {
-    /// Creates a scanner that expects the start of a request header.
-    pub(crate) fn new(limits: HeadLimits) -> Self {
-        Self {
-            limits,
-            total: 0,
-            line_len: 0,
-            completed_lines: 0,
-            done: false,
-        }
-    }
-
-    /// Prepares the scanner for the next request header.
-    pub(crate) fn reset(&mut self) {
-        self.total = 0;
-        self.line_len = 0;
-        self.completed_lines = 0;
-        self.done = false;
-    }
-
-    /// Feeds the next bytes of a request header. Returns `Ok(true)` once the
-    /// blank line that ends the header has been seen. Bytes after that are ignored.
-    ///
-    /// # Errors
-    ///
-    /// Returns the violation at the first byte that exceeds a limit.
-    pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<bool, HeadViolation> {
-        for &byte in bytes {
-            if self.done {
-                break;
-            }
-            match byte {
-                b'\n' => {
-                    if self.line_len > 0 {
-                        self.completed_lines += 1;
-                        self.line_len = 0;
-                    } else if self.completed_lines > 0 {
-                        // The blank line that ends the header.
-                        self.done = true;
-                    }
-                    // Empty lines before the request line are ignored, as RFC 9112 allows.
-                }
-                b'\r' => {}
-                _ => {
-                    self.line_len += 1;
-                    if self.line_len > self.limits.line {
-                        return Err(if self.completed_lines == 0 {
-                            HeadViolation::RequestLineTooLong
-                        } else {
-                            HeadViolation::HeaderTooLarge
-                        });
-                    }
-                }
-            }
-            self.total += 1;
-            if self.total > self.limits.total {
-                return Err(HeadViolation::HeaderTooLarge);
-            }
-        }
-        Ok(self.done)
-    }
-}
 
 /// The timers and limits of client connections, copied out of the configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -730,230 +523,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ClientIo<S> {
     }
 }
 
-/// An upstream socket that bounds the wait between writes (`proxy_send_timeout`).
-pub(crate) struct UpstreamIo<S> {
-    inner: S,
-    send: Duration,
-    write_timer: Option<Pin<Box<Sleep>>>,
-}
-
-impl<S> UpstreamIo<S> {
-    /// Wraps `inner`, a connected upstream socket.
-    pub(crate) fn new(inner: S, send: Duration) -> Self {
-        Self {
-            inner,
-            send,
-            write_timer: None,
-        }
-    }
-
-    /// Applies `proxy_send_timeout` to one write attempt.
-    fn timed_write(
-        &mut self,
-        cx: &mut Context<'_>,
-        attempt: Poll<io::Result<usize>>,
-    ) -> Poll<io::Result<usize>> {
-        match attempt {
-            Poll::Pending => {
-                if expired(&mut self.write_timer, self.send, cx) {
-                    Poll::Ready(Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "upstream send timeout",
-                    )))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Ready(result) => {
-                self.write_timer = None;
-                Poll::Ready(result)
-            }
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for UpstreamIo<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for UpstreamIo<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let attempt = Pin::new(&mut this.inner).poll_write(cx, buf);
-        this.timed_write(cx, attempt)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let attempt = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
-        this.timed_write(cx, attempt)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
-    }
-}
-
-impl<S> Connection for UpstreamIo<S> {
-    fn connected(&self) -> Connected {
-        Connected::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error;
 
-    use proptest::prelude::*;
     use rstest::rstest;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
+    use crate::test_support::Recorder;
+    use crate::transport::test_helpers::limits;
 
     type BoxError = Box<dyn Error + Send + Sync>;
 
-    fn limits(line: usize, total: usize) -> HeadLimits {
-        HeadLimits { line, total }
-    }
-
-    /// Feeds `head` in pieces of `chunk` bytes and returns the final outcome.
-    fn scan_in_chunks(
-        head: &[u8],
-        chunk: usize,
-        limits: HeadLimits,
-    ) -> Result<bool, HeadViolation> {
-        let mut scanner = HeadScanner::new(limits);
-        let mut done = Ok(false);
-        for piece in head.chunks(chunk.max(1)) {
-            done = scanner.feed(piece);
-            match done {
-                Ok(true) | Err(_) => break,
-                Ok(false) => {}
-            }
-        }
-        done
-    }
-
-    #[rstest]
-    #[case::request_line_at_the_limit(b"GET /aaaa HTTP/1.1\r\nHost: a\r\n\r\n", 18, 100, Ok(true))]
-    #[case::request_line_over_the_limit(
-        b"GET /aaaaaa HTTP/1.1\r\n\r\n",
-        10,
-        100,
-        Err(HeadViolation::RequestLineTooLong)
-    )]
-    #[case::header_field_over_the_limit(
-        b"GET / HTTP/1.1\r\nX: 01234567890123456\r\n\r\n",
-        16,
-        200,
-        Err(HeadViolation::HeaderTooLarge)
-    )]
-    #[case::section_over_the_total(
-        b"GET / HTTP/1.1\r\nA: 1\r\nB: 2\r\n\r\n",
-        100,
-        20,
-        Err(HeadViolation::HeaderTooLarge)
-    )]
-    #[case::leading_empty_lines_are_ignored(b"\r\n\r\nGET / HTTP/1.1\r\n\r\n", 100, 100, Ok(true))]
-    fn the_scanner_applies_each_limit_where_nginx_does(
-        #[case] head: &[u8],
-        #[case] line: usize,
-        #[case] total: usize,
-        #[case] expected: Result<bool, HeadViolation>,
-    ) {
-        assert_eq!(scan_in_chunks(head, 1, limits(line, total)), expected);
-        assert_eq!(scan_in_chunks(head, 4096, limits(line, total)), expected);
-    }
-
-    #[test]
-    fn bytes_after_the_blank_line_are_not_scanned() {
-        let mut scanner = HeadScanner::new(limits(100, 100));
-        let body = [b'x'; 200];
-        let mut bytes = b"GET / HTTP/1.1\r\n\r\n".to_vec();
-        bytes.extend_from_slice(&body);
-        let result = scanner.feed(&bytes);
-        assert_eq!(result, Ok(true));
-    }
-
-    #[test]
-    fn reset_lets_the_scanner_check_the_next_header() {
-        let mut scanner = HeadScanner::new(limits(100, 100));
-        assert_eq!(scanner.feed(b"GET / HTTP/1.1\r\n\r\n"), Ok(true));
-        scanner.reset();
-        assert_eq!(scanner.feed(b"GET / HTTP/1.1\r\n"), Ok(false));
-    }
-
-    fn head_text(lines: &[usize]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (index, len) in lines.iter().enumerate() {
-            let prefix = if index == 0 { b'G' } else { b'H' };
-            out.push(prefix);
-            out.extend(std::iter::repeat_n(b'a', len.saturating_sub(1)));
-            out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
-        out
-    }
-
-    proptest! {
-        /// A header is accepted exactly when every line fits the line limit and the
-        /// whole section, with its line endings, fits the total limit.
-        #[test]
-        fn acceptance_matches_the_limit_arithmetic(
-            lines in prop::collection::vec(1usize..40, 1..8),
-            line_limit in 1usize..40,
-            total_limit in 1usize..300,
-            chunk in 1usize..17,
-        ) {
-            let head = head_text(&lines);
-            let lines_fit = lines.iter().all(|len| *len <= line_limit);
-            let section = lines.iter().map(|len| len + 2).sum::<usize>() + 2;
-            let total_fits = section <= total_limit;
-            let result = scan_in_chunks(&head, chunk, limits(line_limit, total_limit));
-            if lines_fit && total_fits {
-                prop_assert_eq!(result, Ok(true));
-            } else {
-                prop_assert!(result.is_err(), "expected a violation, got {result:?}");
-            }
-        }
-
-        /// Where the head is split into reads does not change the outcome.
-        #[test]
-        fn chunking_does_not_change_the_outcome(
-            lines in prop::collection::vec(1usize..40, 1..8),
-            line_limit in 1usize..40,
-            total_limit in 1usize..300,
-            chunk in 1usize..17,
-        ) {
-            let head = head_text(&lines);
-            let whole = scan_in_chunks(&head, head.len().max(1), limits(line_limit, total_limit));
-            let pieces = scan_in_chunks(&head, chunk, limits(line_limit, total_limit));
-            prop_assert_eq!(whole, pieces);
-        }
-    }
     /// A connected pair of sockets: the client end, and the server end that the router wraps.
     async fn socket_pair() -> io::Result<(TcpStream, TcpStream)> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1121,55 +704,6 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case::at_the_line_limit(14, Ok(true))]
-    #[case::one_byte_over_the_line_limit(13, Err(HeadViolation::RequestLineTooLong))]
-    fn a_request_line_is_refused_only_past_its_limit(
-        #[case] line: usize,
-        #[case] expected: Result<bool, HeadViolation>,
-    ) {
-        // "GET / HTTP/1.1" is 14 bytes.
-        assert_eq!(
-            scan_in_chunks(b"GET / HTTP/1.1\r\n\r\n", 1, limits(line, 100)),
-            expected
-        );
-    }
-
-    #[rstest]
-    #[case::exactly_the_total_limit(18, Ok(true))]
-    #[case::one_byte_over_the_total_limit(17, Err(HeadViolation::HeaderTooLarge))]
-    fn a_header_section_is_refused_only_past_the_total_limit(
-        #[case] total: usize,
-        #[case] expected: Result<bool, HeadViolation>,
-    ) {
-        // "GET / HTTP/1.1\r\n\r\n" is 18 bytes, the blank line included.
-        assert_eq!(
-            scan_in_chunks(b"GET / HTTP/1.1\r\n\r\n", 1, limits(100, total)),
-            expected
-        );
-    }
-
-    #[test]
-    fn a_busy_connection_reports_the_busy_phase() {
-        let cell = PhaseCell::new();
-        cell.set(Phase::Busy);
-        assert_eq!(cell.get(), Phase::Busy);
-    }
-
-    #[test]
-    fn only_an_idle_connection_moves_back_to_the_header_wait() {
-        let cell = PhaseCell::new();
-        assert!(
-            !cell.begin_header(),
-            "a connection awaiting its first header is not idle"
-        );
-        cell.set(Phase::AwaitingKeepAlive);
-        assert!(cell.begin_header());
-        assert_eq!(cell.get(), Phase::AwaitingHeader);
-        cell.set(Phase::Busy);
-        assert!(!cell.begin_header(), "a busy connection is not idle");
-    }
-
     /// A writer that accepts no bytes on its first write, then records every byte it gets.
     #[derive(Default)]
     struct RefusingOnce {
@@ -1279,90 +813,6 @@ mod tests {
             .map(|error| error.kind());
         assert_eq!(vectored, Some(io::ErrorKind::BrokenPipe));
         Ok(())
-    }
-
-    /// A socket stand-in that records what reaches it. It accepts at most `per_write`
-    /// bytes per write, reports `vectored` from `is_write_vectored`, and can refuse flushes.
-    /// Reads report end of file, and an error once they have been called too often.
-    struct Recorder {
-        per_write: usize,
-        vectored: bool,
-        fail_flush: bool,
-        written: Vec<u8>,
-        reads: usize,
-        flushes: usize,
-        shutdowns: usize,
-    }
-
-    impl Recorder {
-        fn new() -> Self {
-            Self {
-                per_write: usize::MAX,
-                vectored: false,
-                fail_flush: false,
-                written: Vec::new(),
-                reads: 0,
-                flushes: 0,
-                shutdowns: 0,
-            }
-        }
-    }
-
-    impl AsyncRead for Recorder {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            this.reads += 1;
-            if this.reads > 100 {
-                return Poll::Ready(Err(io::Error::other("read again after end of file")));
-            }
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    impl AsyncWrite for Recorder {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            let this = self.get_mut();
-            let take = buf.len().min(this.per_write);
-            this.written
-                .extend_from_slice(buf.get(..take).unwrap_or_default());
-            Poll::Ready(Ok(take))
-        }
-
-        fn is_write_vectored(&self) -> bool {
-            self.vectored
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            this.flushes += 1;
-            if this.fail_flush {
-                Poll::Ready(Err(io::Error::other("flush refused")))
-            } else {
-                Poll::Ready(Ok(()))
-            }
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            let this = self.get_mut();
-            this.shutdowns += 1;
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[test]
-    fn blank_lines_before_the_request_line_do_not_end_the_header() {
-        let mut scanner = HeadScanner::new(limits(100, 100));
-        assert_eq!(scanner.feed(b"\r\n\r\n"), Ok(false));
-        assert_eq!(scanner.feed(b"GET / HTTP/1.1\r\n"), Ok(false));
-        assert_eq!(scanner.feed(b"\r\n"), Ok(true));
     }
 
     #[tokio::test]
@@ -1562,16 +1012,6 @@ mod tests {
         assert_eq!(io.is_write_vectored(), vectored);
     }
 
-    #[rstest]
-    #[case::vectored(true)]
-    #[case::not_vectored(false)]
-    fn an_upstream_socket_reports_whether_its_inner_socket_writes_vectored(#[case] vectored: bool) {
-        let mut recorder = Recorder::new();
-        recorder.vectored = vectored;
-        let io = UpstreamIo::new(recorder, Duration::from_secs(5));
-        assert_eq!(io.is_write_vectored(), vectored);
-    }
-
     #[tokio::test]
     async fn a_client_flush_reaches_the_client_socket() -> Result<(), BoxError> {
         let timers = linger_timers(
@@ -1610,15 +1050,6 @@ mod tests {
         io.flush().await?;
         io.shutdown().await?;
         io.flush().await?;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn an_upstream_flush_and_shutdown_reach_the_upstream_socket() -> Result<(), BoxError> {
-        let mut io = UpstreamIo::new(Recorder::new(), Duration::from_secs(5));
-        io.flush().await?;
-        io.shutdown().await?;
-        assert_eq!((io.inner.flushes, io.inner.shutdowns), (1, 1));
         Ok(())
     }
 }

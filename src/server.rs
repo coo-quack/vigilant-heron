@@ -45,6 +45,7 @@ use crate::error::ConfigError;
 use crate::error::{DecisionError, ProxyError, ServeError};
 use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
 use crate::logsink::{Writer, spawn_writer};
+use crate::phase::{Phase, PhaseCell};
 use crate::policy::{self, Action, Assessment, Decision};
 use crate::prefilter::{self, Screening};
 use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
@@ -53,10 +54,9 @@ use crate::request_id;
 use crate::router::{Router, is_valid_host, normalize_host};
 use crate::rules::RuleInput;
 use crate::sanitize::{self, EventInput};
+use crate::sync::lock;
 use crate::system_one::SystemOneBackend;
-use crate::transport::{
-    ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Phase, PhaseCell, Rejection, RejectionSlot, lock,
-};
+use crate::transport::{ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Rejection, RejectionSlot};
 use crate::tunnel;
 
 const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");

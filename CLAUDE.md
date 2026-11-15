@@ -59,9 +59,11 @@ src/
   decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
-  proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers, proxy_set_header
+  proxy.rs       # Forwarding to upstreams (per-site client, connect timer, upstream socket with the send timer), hop-by-hop headers, proxy_set_header
   tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits; shutdown waits for tunnels and force-closes them at worker_shutdown_timeout
-  transport.rs   # Client socket: header, keep-alive and send timers, header limits (414/400); upstream send timer
+  transport/     # Client socket: ClientIo with header, keep-alive and send timers and lingering close (client); header limits (414/400) and the header scanner (head)
+  phase.rs       # Phase of a client connection (awaiting header, keep-alive, busy, closing, tunnelling), shared by the client socket, the body and the request handler
+  sync.rs        # Mutex lock helper that ignores poisoning
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
   server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
   error.rs       # Error types

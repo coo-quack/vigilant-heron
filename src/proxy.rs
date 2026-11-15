@@ -5,7 +5,7 @@
 
 use std::error::Error as StdError;
 use std::future::Future;
-use std::io;
+use std::io::{self, IoSlice};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -17,16 +17,18 @@ use http::{Request, Response, Uri};
 use http_body_util::combinators::UnsyncBoxBody;
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::connect::{Connected, Connection, HttpConnector};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::time::Sleep;
 use tower_service::Service;
 
 use crate::body::{BoxError, ClientBody, FaultSlot, FrameTimeout};
 use crate::conf::Directive;
 use crate::config::{SiteTimeouts, invalid};
 use crate::error::{ConfigError, ProxyError};
-use crate::transport::UpstreamIo;
+use crate::transport::expired;
 
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 
@@ -74,6 +76,98 @@ impl Service<Uri> for UpstreamConnector {
                 send_timeout,
             )))
         })
+    }
+}
+
+/// An upstream socket that bounds the wait between writes (`proxy_send_timeout`).
+pub(crate) struct UpstreamIo<S> {
+    inner: S,
+    send: Duration,
+    write_timer: Option<Pin<Box<Sleep>>>,
+}
+
+impl<S> UpstreamIo<S> {
+    /// Wraps `inner`, a connected upstream socket.
+    pub(crate) fn new(inner: S, send: Duration) -> Self {
+        Self {
+            inner,
+            send,
+            write_timer: None,
+        }
+    }
+
+    /// Applies `proxy_send_timeout` to one write attempt.
+    fn timed_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        attempt: Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<usize>> {
+        match attempt {
+            Poll::Pending => {
+                if expired(&mut self.write_timer, self.send, cx) {
+                    Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "upstream send timeout",
+                    )))
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Ready(result) => {
+                self.write_timer = None;
+                Poll::Ready(result)
+            }
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for UpstreamIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for UpstreamIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let attempt = Pin::new(&mut this.inner).poll_write(cx, buf);
+        this.timed_write(cx, attempt)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let attempt = Pin::new(&mut this.inner).poll_write_vectored(cx, bufs);
+        this.timed_write(cx, attempt)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> Connection for UpstreamIo<S> {
+    fn connected(&self) -> Connected {
+        Connected::new()
     }
 }
 
@@ -663,5 +757,33 @@ mod header_tests {
         assert!(!headers.contains_key("x-trace"));
         assert!(!headers.contains_key(CONNECTION));
         assert!(headers.contains_key("x-keep"));
+    }
+}
+
+#[cfg(test)]
+mod upstream_io_tests {
+    use rstest::rstest;
+    use tokio::io::AsyncWriteExt as _;
+
+    use super::*;
+    use crate::test_support::Recorder;
+
+    #[rstest]
+    #[case::vectored(true)]
+    #[case::not_vectored(false)]
+    fn an_upstream_socket_reports_whether_its_inner_socket_writes_vectored(#[case] vectored: bool) {
+        let mut recorder = Recorder::new();
+        recorder.vectored = vectored;
+        let io = UpstreamIo::new(recorder, Duration::from_secs(5));
+        assert_eq!(io.is_write_vectored(), vectored);
+    }
+
+    #[tokio::test]
+    async fn an_upstream_flush_and_shutdown_reach_the_upstream_socket() -> Result<(), BoxError> {
+        let mut io = UpstreamIo::new(Recorder::new(), Duration::from_secs(5));
+        io.flush().await?;
+        io.shutdown().await?;
+        assert_eq!((io.inner.flushes, io.inner.shutdowns), (1, 1));
+        Ok(())
     }
 }
