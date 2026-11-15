@@ -25,91 +25,124 @@ fn parse_top_rule(body: &str) -> Result<ParsedRule, ConfigError> {
     parse_rule(directive, Scope::Top)
 }
 
-// Parser and validation.
+// Parser and validation. In these tables the rule is on line 1, so the first line of its body
+// is line 2. A rule that lacks something is reported at the line of the rule.
 
 #[rstest]
-#[case::missing_description("action block;\npath /x;", "needs a \"description\"")]
-#[case::missing_action("description \"d\";\npath /x;", "needs an \"action\"")]
-#[case::no_condition("description \"d\";\naction block;", "needs at least one condition")]
+#[case::missing_description("action block;\npath /x;", "needs a \"description\"", 1)]
+#[case::missing_action("description \"d\";\npath /x;", "needs an \"action\"", 1)]
+#[case::no_condition("description \"d\";\naction block;", "needs at least one condition", 1)]
 #[case::unknown_action(
     "description \"d\";\naction allow;\npath /x;",
-    "must be \"block\" or \"skip\""
+    "must be \"block\" or \"skip\"",
+    3
 )]
-#[case::empty_description("description \" \";\naction block;\npath /x;", "must not be empty")]
+#[case::empty_description("description \" \";\naction block;\npath /x;", "must not be empty", 2)]
 #[case::duplicate_description(
     "description \"a\";\ndescription \"b\";\naction block;\npath /x;",
-    "duplicate directive \"description\""
+    "duplicate directive \"description\"",
+    3
 )]
 #[case::unknown_directive(
     "description \"d\";\naction block;\nfoo bar;",
-    "unknown directive \"foo\" in rule"
+    "unknown directive \"foo\" in rule",
+    4
 )]
-#[case::path_without_slash("description \"d\";\naction block;\npath x;", "must start with \"/\"")]
-#[case::path_bad_modifier("description \"d\";\naction block;\npath ~~ /x;", "modifier must be")]
+#[case::path_without_slash(
+    "description \"d\";\naction block;\npath x;",
+    "must start with \"/\"",
+    4
+)]
+#[case::path_bad_modifier(
+    "description \"d\";\naction block;\npath ~~ /x;",
+    "modifier must be",
+    4
+)]
 #[case::path_exact_without_slash(
     "description \"d\";\naction block;\npath = x;",
-    "must start with \"/\""
+    "must start with \"/\"",
+    4
 )]
-#[case::path_too_many_arguments("description \"d\";\naction block;\npath a b c;", "takes a value")]
+#[case::path_too_many_arguments(
+    "description \"d\";\naction block;\npath a b c;",
+    "takes a value",
+    4
+)]
 #[case::duplicate_path(
     "description \"d\";\naction block;\npath /a;\npath /b;",
-    "duplicate directive \"path\""
+    "duplicate directive \"path\"",
+    5
 )]
 #[case::query_without_operator(
     "description \"d\";\naction block;\nquery x;",
-    "takes an operator and a regex"
+    "takes an operator and a regex",
+    4
 )]
 #[case::query_with_bad_operator(
     "description \"d\";\naction block;\nquery = \"x\";",
-    "takes ~ or ~*"
+    "takes ~ or ~*",
+    4
 )]
-#[case::bad_regex("description \"d\";\naction block;\nquery ~ \"(\";", "invalid regex")]
+#[case::bad_regex(
+    "description \"d\";\naction block;\nquery ~ \"(\";",
+    "invalid regex",
+    4
+)]
 #[case::regex_too_large_for_the_limit(
     "description \"d\";\naction block;\nany ~ \"(a{1000}){1000}\";",
-    "invalid regex"
+    "invalid regex",
+    4
 )]
 #[case::bad_header_name(
     "description \"d\";\naction block;\nheader \"bad name\" ~ \"x\";",
-    "not a header name"
+    "not a header name",
+    4
 )]
 #[case::header_missing_regex(
     "description \"d\";\naction block;\nheader user-agent ~*;",
-    "takes a name, an operator and a regex"
+    "takes a name, an operator and a regex",
+    4
 )]
 #[case::empty_method(
     "description \"d\";\naction block;\nmethod \"\";",
-    "not a valid method"
+    "not a valid method",
+    4
 )]
 #[case::method_needs_an_argument(
     "description \"d\";\naction block;\nmethod;",
-    "needs at least one method"
+    "needs at least one method",
+    4
 )]
 #[case::bad_client(
     "description \"d\";\naction block;\nclient 10.0.0.300;",
-    "not an address or network"
+    "not an address or network",
+    4
 )]
 #[case::client_needs_an_argument(
     "description \"d\";\naction block;\nclient;",
-    "needs at least one address"
+    "needs at least one address",
+    4
 )]
 #[case::site_with_no_host(
     "description \"d\";\naction block;\npath /x;\nsite;",
-    "site\" needs at least one host name"
+    "site\" needs at least one host name",
+    5
 )]
 #[case::site_with_an_invalid_host(
     "description \"d\";\naction block;\npath /x;\nsite :8080;",
-    "\"site\" has an invalid host name: :8080"
+    "\"site\" has an invalid host name: :8080",
+    5
 )]
 fn invalid_rule_directives_are_rejected_with_their_line(
     #[case] body: &str,
     #[case] expected: &str,
+    #[case] line: usize,
 ) {
     let error = parse_top_rule(body).err().map_or_default(|e| e.to_string());
-    assert!(error.starts_with("test.conf:"), "{error}");
+    assert!(error.starts_with(&format!("test.conf:{line}: ")), "{error}");
     assert!(error.contains(expected), "{error}");
 }
 
-// The rule is on line 1, so the first line of its body is line 2.
 #[rstest]
 #[case::action(
     "description \"d\";\naction block;\naction skip;\npath /x;",

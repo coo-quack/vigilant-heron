@@ -62,9 +62,9 @@ where
     draft.finish(directives, formats, lookup)
 }
 
-/// The top level of the file while it is read: the settings read so far, which become the fields of
-/// [`Config`] of the same names (and the [`Top`] that every site inherits) once `finish` has
-/// resolved them, the single-use names and the rule ids seen so far, and the directives whose
+/// The top level of the file while it is read: the settings read so far, which `finish` resolves
+/// into [`Config`] and into the [`Top`] that every site inherits, the single-use names seen so
+/// far, the rule ids taken so far (the built-in ids from the start), and the directives whose
 /// values `finish` reads after the whole file is known.
 /// An error in one directive points at that directive, and a missing required directive points at
 /// the first directive of the file.
@@ -344,8 +344,8 @@ impl<'a> TopDraft<'a> {
     ///
     /// The checks run in this order: `listen` and `decision` are present, the decision block,
     /// the log formats, the zones, the limits, the access logs, a `site` is present, each site
-    /// in file order (its block, then its hosts against the earlier sites, then
-    /// `default_server`), and the sites that the top-level rules name.
+    /// in file order (its host names and its block, then its hosts against the earlier sites,
+    /// then `default_server`), and the sites that the top-level rules name.
     fn finish<F>(
         mut self,
         directives: &[Directive],
