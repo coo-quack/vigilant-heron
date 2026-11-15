@@ -36,6 +36,7 @@ use tokio::task::JoinSet;
 
 use crate::access;
 use crate::accesslog::AccessRecord;
+use crate::backend::sanitize::{self, EventInput};
 use crate::block::BlockResponse;
 use crate::body::{ClientBody, Sniffed};
 use crate::config::{Config, Mode, SiteConfig};
@@ -49,7 +50,6 @@ use crate::proxy::HeaderContext;
 use crate::request_id;
 use crate::router::{is_valid_host, normalize_host};
 use crate::rules::RuleInput;
-use crate::sanitize::{self, EventInput};
 use crate::sync::lock;
 use crate::transport::{ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, RejectionSlot};
 use crate::tunnel;

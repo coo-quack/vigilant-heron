@@ -18,7 +18,7 @@ System One backends ask three questions about it:
 - which category of attack it is (`category`, logged only).
 
 The question wording lives in
-[`src/system_one.rs`](https://github.com/coo-quack/vigilant-heron/blob/develop/src/system_one.rs).
+[`src/backend/system_one.rs`](https://github.com/coo-quack/vigilant-heron/blob/develop/src/backend/system_one.rs).
 
 ## Jev (TypeSafe), the default
 

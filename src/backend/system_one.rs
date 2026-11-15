@@ -13,9 +13,9 @@ use std::sync::LazyLock;
 use http::Uri;
 use serde_json::{Map, Value, json};
 
-use crate::decision::{DecisionClient, Limits, Probability, Verdict, post_json};
+use crate::backend::decision::{DecisionClient, Limits, Probability, Verdict, post_json};
+use crate::backend::sanitize::DecisionEvent;
 use crate::error::DecisionError;
-use crate::sanitize::DecisionEvent;
 
 /// Question id of the attack score.
 const ATTACK_ID: &str = "attack";
@@ -325,7 +325,7 @@ mod tests {
     use crate::error::DecisionError;
 
     fn sample_event(path: &str, body: &[u8]) -> DecisionEvent {
-        use crate::sanitize::{EventInput, build_event};
+        use crate::backend::sanitize::{EventInput, build_event};
         let headers = http::HeaderMap::new();
         build_event(&EventInput {
             method: &http::Method::POST,

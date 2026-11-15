@@ -1,5 +1,5 @@
-//! The decision backends: the transport shared by all of them, the JSON HTTP
-//! protocol, the System One protocol in [`crate::system_one`], and the backend enum.
+//! The transport and limits shared by all decision backends, the verdict, and the
+//! JSON HTTP backend.
 
 mod slots;
 
@@ -19,9 +19,8 @@ use rustls::{ClientConfig, RootCertStore};
 use serde::Deserialize;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
+use crate::backend::sanitize::DecisionEvent;
 use crate::error::{DecisionError, ProbabilityError, ServeError};
-use crate::sanitize::DecisionEvent;
-use crate::system_one::SystemOneBackend;
 
 pub(crate) use slots::ClientSlots;
 
@@ -209,24 +208,6 @@ impl HttpDecisionBackend {
             category: raw.category,
             input_tokens: None,
         })
-    }
-}
-
-/// The configured decision backend.
-pub(crate) enum Backend {
-    /// The JSON protocol over HTTP.
-    Http(HttpDecisionBackend),
-    /// The System One protocol: Cloudflare Clef, `TypeSafe` Jev, Strands Decider, or a server that speaks it.
-    SystemOne(SystemOneBackend),
-}
-
-impl Backend {
-    /// Asks the configured backend for a verdict on `event`.
-    pub(crate) async fn decide(&self, event: &DecisionEvent) -> Result<Verdict, DecisionError> {
-        match self {
-            Self::Http(backend) => backend.decide(event).await,
-            Self::SystemOne(backend) => backend.decide(event).await,
-        }
     }
 }
 

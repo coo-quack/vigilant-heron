@@ -5,8 +5,8 @@
 
 use http::{HeaderValue, StatusCode};
 
+use crate::backend::decision::Verdict;
 use crate::config::{FailureAction, Mode, SiteAction, SiteConfig};
-use crate::decision::Verdict;
 use crate::prefilter::fails_closed;
 
 /// What the proxy does with a request.
@@ -213,7 +213,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::decision::verdict;
+    use crate::backend::decision::verdict;
     use crate::error::ConfigError;
     use crate::prefilter::path_views;
     use crate::test_support::site;

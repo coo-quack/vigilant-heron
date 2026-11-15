@@ -1,7 +1,7 @@
 //! Unit tests of the shadow report: the sections, the escaping and the reading of the logs.
 
 use super::*;
-use crate::decision::{Limits, decision_client, post_json};
+use crate::backend::decision::{Limits, decision_client, post_json};
 use crate::error::{DecisionError, ProbabilityError};
 use crate::log_lines::MAX_LINE_BYTES;
 use crate::test_support::{EndsOnce, FailingReader};

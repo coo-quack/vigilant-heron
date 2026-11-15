@@ -1,8 +1,8 @@
 //! Redaction of `multipart/form-data` bodies, part by part.
 
 use super::lexical::redact_lexical;
-use crate::sanitize::REDACTED;
-use crate::sanitize::keys::is_redacted_key;
+use crate::backend::sanitize::REDACTED;
+use crate::backend::sanitize::keys::is_redacted_key;
 
 /// Returns the boundary of a `multipart/form-data` content type, without its quotes.
 ///
@@ -297,8 +297,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::sanitize::body::redact_body;
-    use crate::sanitize::test_helpers::redact;
+    use crate::backend::sanitize::body::redact_body;
+    use crate::backend::sanitize::test_helpers::redact;
 
     /// Redacts the start of a body that was cut, as `build_event` does.
     fn redact_cut(

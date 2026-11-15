@@ -7,11 +7,11 @@ use http::Uri;
 
 use super::names::DECISION_DIRECTIVES;
 use super::{BackendConfig, DecisionConfig};
+use crate::backend::system_one::{ApiToken, ClefModel};
 use crate::conf::{
     Directive, block, invalid, once, one_arg, parse_bool, parse_number, parse_size, parse_time,
 };
 use crate::error::ConfigError;
-use crate::system_one::{ApiToken, ClefModel};
 
 /// Default number of concurrent decision-backend calls.
 const DEFAULT_MAX_CONCURRENCY: usize = 64;

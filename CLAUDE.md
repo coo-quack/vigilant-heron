@@ -55,9 +55,10 @@ src/
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   log_lines.rs   # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
   shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
-  sanitize/      # Backend event and its truncation; keys (sensitive names, header drop), query and body redaction (multipart, lexical)
-  decision/      # Shared HTTPS transport and limits, HTTP backend, backend enum with decide (mod.rs); slots.rs (ClientSlots, the per-client cap on calls in flight)
-  system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
+  backend/       # The decision backends: mod.rs (Backend enum with decide, the configured backend)
+  backend/sanitize/ # Backend event and its truncation; keys (sensitive names, header drop), query and body redaction (multipart, lexical)
+  backend/decision/ # Shared HTTPS transport and limits, HTTP backend (mod.rs); slots.rs (ClientSlots, the per-client cap on calls in flight)
+  backend/system_one.rs # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
   proxy/         # Forwarding to upstreams (per-site client, connect timer, upstream socket with the send timer), hop-by-hop headers; set_header.rs (proxy_set_header templates and variables)
   tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits; shutdown waits for tunnels and force-closes them at worker_shutdown_timeout
