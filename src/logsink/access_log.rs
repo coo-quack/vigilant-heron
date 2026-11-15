@@ -17,6 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::mpsc;
 
+use super::append_options;
 use crate::accesslog;
 use crate::config::Destination;
 
@@ -170,9 +171,7 @@ async fn write_stream<W: tokio::io::AsyncWrite + Unpin>(mut stream: W, line: &st
 }
 
 async fn open_file(path: &PathBuf) -> Option<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    tokio::fs::OpenOptions::from(append_options())
         .open(path)
         .await
         .ok()

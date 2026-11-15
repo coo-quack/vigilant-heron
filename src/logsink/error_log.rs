@@ -1,6 +1,6 @@
 //! The error log: the `tracing` subscriber's output, with its reload and SIGUSR1 reopen.
 
-use std::fs::{File, OpenOptions as StdOpenOptions};
+use std::fs::File;
 use std::io::{self, Write as _};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,6 +11,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::reload;
 
+use super::append_options;
 use crate::config::{Destination, ErrorLogConfig, LogLevel};
 use crate::error::ConfigError;
 use crate::sync::lock;
@@ -39,7 +40,7 @@ impl ErrorSink {
             Destination::Stdout => Ok(Self::Stdout),
             Destination::File(path) => Ok(Self::File {
                 path: path.clone(),
-                file: Some(open_std_file(path)?),
+                file: Some(append_options().open(path)?),
             }),
             _ => Ok(Self::Stderr),
         }
@@ -48,7 +49,7 @@ impl ErrorSink {
     /// Reopens the file, after logrotate moved it away.
     fn reopen(&mut self) {
         if let Self::File { path, file } = self {
-            *file = open_std_file(path).ok();
+            *file = append_options().open(path).ok();
         }
     }
 
@@ -159,10 +160,6 @@ fn level_filter(level: LogLevel) -> LevelFilter {
         LogLevel::Info => LevelFilter::INFO,
         LogLevel::Debug => LevelFilter::DEBUG,
     }
-}
-
-fn open_std_file(path: &PathBuf) -> io::Result<File> {
-    StdOpenOptions::new().create(true).append(true).open(path)
 }
 
 /// The writer shared by every event: each event is written through the lock.
