@@ -27,7 +27,7 @@ exclude_re = [
     # text, and the configuration loader rejects a site that repeats a prefix path.
     'replace > with >= in select_location$',
     # `text[gt]` is `>`, so searching for the next `<` from `gt` finds what `gt + 1` finds.
-    'src/sanitize/body/lexical\.rs:42:21: replace \+ with \* in redact_xml_elements$',
+    'src/backend/sanitize/body/lexical\.rs:42:21: replace \+ with \* in redact_xml_elements$',
     # With `<=`, a retry at the end of the text moves `t` past the end and fails on the next
     # literal as before. A trailing `*`, the only way to match there, never retries.
     'src/conf/mod\.rs:280:38: replace < with <= in wildcard_matches$',

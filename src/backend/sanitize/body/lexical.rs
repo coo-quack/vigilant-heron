@@ -1,8 +1,8 @@
 //! Redaction of text that is not valid form data or JSON: `key=value` tokens, XML elements
 //! and JSON-like text.
 
-use crate::sanitize::REDACTED;
-use crate::sanitize::keys::is_redacted_key;
+use crate::backend::sanitize::REDACTED;
+use crate::backend::sanitize::keys::is_redacted_key;
 
 /// Redacts sensitive fields in text that is not valid form data or JSON.
 ///
@@ -238,8 +238,8 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::sanitize::keys::is_sensitive_key;
-    use crate::sanitize::test_helpers::{finishes_within, redact};
+    use crate::backend::sanitize::keys::is_sensitive_key;
+    use crate::backend::sanitize::test_helpers::{finishes_within, redact};
 
     #[test]
     fn malformed_json_string_value_is_redacted() {

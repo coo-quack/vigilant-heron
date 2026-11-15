@@ -297,7 +297,7 @@ pub(crate) struct AccessRecord<'a> {
     /// Raw query string, without the "?", when the request had one.
     pub(crate) query: Option<&'a str>,
     /// The query for `$block_query`: set only for a blocked request, already redacted
-    /// by [`crate::sanitize::block_query`]. `None` for every other request.
+    /// by [`crate::backend::sanitize::block_query`]. `None` for every other request.
     pub(crate) block_query: Option<String>,
     /// Status of the response.
     pub(crate) status: u16,
@@ -349,7 +349,7 @@ fn field_value(field: Field, record: &AccessRecord<'_>) -> Option<String> {
         Field::Host => text(record.host),
         Field::Method => text(record.method),
         Field::Path => text(record.path),
-        Field::QueryShape => record.query.and_then(crate::sanitize::query_shape),
+        Field::QueryShape => record.query.and_then(crate::backend::sanitize::query_shape),
         Field::BlockQuery => record.block_query.as_deref().and_then(text),
         Field::Status => Some(record.status.to_string()),
         Field::Action => text(record.action),

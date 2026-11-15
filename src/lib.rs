@@ -13,11 +13,11 @@
 
 mod access;
 mod accesslog;
+mod backend;
 mod block;
 mod body;
 mod conf;
 mod config;
-mod decision;
 mod error;
 mod finish;
 mod limits;
@@ -32,18 +32,17 @@ mod request_check;
 mod request_id;
 mod router;
 mod rules;
-mod sanitize;
 mod server;
 mod shadow_report;
 mod skip_suggest;
 mod sync;
-mod system_one;
 #[cfg(test)]
 mod test_support;
 mod transport;
 mod tunnel;
 
 pub use accesslog::LogFormat;
+pub use backend::system_one::{ApiToken, ClefModel};
 pub use block::{BlockResponse, BlockStatus};
 pub use config::{
     AccessLogConfig, BackendConfig, CheckedConfig, Config, ConnectionConfig, DecisionConfig,
@@ -57,7 +56,6 @@ pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_
 pub use server::{serve, serve_reloadable};
 pub use shadow_report::{ShadowOptions, ShadowReport};
 pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
-pub use system_one::{ApiToken, ClefModel};
 
 /// The directive names the configuration builder accepts, read by the documentation drift
 /// check in `tests/docs.rs`.

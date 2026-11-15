@@ -91,8 +91,8 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
-    use crate::sanitize::keys::is_sensitive_key;
-    use crate::sanitize::test_helpers::redact;
+    use crate::backend::sanitize::keys::is_sensitive_key;
+    use crate::backend::sanitize::test_helpers::redact;
 
     fn form_pairs(encoded: &str) -> Vec<(String, String)> {
         form_urlencoded::parse(encoded.as_bytes())
