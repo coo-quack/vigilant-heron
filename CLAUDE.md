@@ -56,15 +56,16 @@ src/
   log_lines.rs   # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
   shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
   sanitize/      # Backend event and its truncation; keys (sensitive names, header drop), query and body redaction (multipart, lexical)
-  decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
+  decision/      # Shared HTTPS transport and limits, HTTP backend, backend enum with decide (mod.rs); slots.rs (ClientSlots, the per-client cap on calls in flight)
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
-  proxy.rs       # Forwarding to upstreams (per-site client, connect timer, upstream socket with the send timer), hop-by-hop headers, proxy_set_header
+  proxy/         # Forwarding to upstreams (per-site client, connect timer, upstream socket with the send timer), hop-by-hop headers; set_header.rs (proxy_set_header templates and variables)
   tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits; shutdown waits for tunnels and force-closes them at worker_shutdown_timeout
   transport/     # Client socket: ClientIo with header, keep-alive and send timers and lingering close (client); header limits (414/400) and the header scanner (head)
-  phase.rs       # Phase of a client connection (awaiting header, keep-alive, busy, closing, tunnelling), shared by the client socket, the body and the request handler
+  phase.rs       # Phase of a client connection (awaiting header, keep-alive, busy, closing, tunnelling), shared by the client socket, the response body wrapper and the request handler
   sync.rs        # Mutex lock helper that ignores poisoning
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
+  finish.rs      # Response body wrapper: sets the connection phase (keep-alive or close) when the response ends, holds limit_conn permits
   server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
   error.rs       # Error types
   test_support.rs # Builds sites and configurations for the unit tests

@@ -19,6 +19,7 @@ mod conf;
 mod config;
 mod decision;
 mod error;
+mod finish;
 mod limits;
 mod log_lines;
 mod logsink;
