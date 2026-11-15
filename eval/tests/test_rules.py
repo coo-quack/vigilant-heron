@@ -24,7 +24,7 @@ def item(row_id, label, kind, reason="model", action="allow", split="dev", rule_
 
 class Thresholds(unittest.TestCase):
     def test_pipeline_thresholds_are_the_router_defaults(self):
-        source = (ROOT / "src" / "config.rs").read_text(encoding="utf-8")
+        source = (ROOT / "src" / "config" / "site.rs").read_text(encoding="utf-8")
         block = float(re.search(r"const DEFAULT_BLOCK_THRESHOLD: f64 = ([0-9.]+);", source).group(1))
         instruction = float(re.search(r"const DEFAULT_INSTRUCTION_THRESHOLD: f64 = ([0-9.]+);", source).group(1))
         self.assertEqual(rules.MODEL_BLOCK_THRESHOLD, block)
