@@ -109,6 +109,11 @@ A full run takes hours, so run it for the code you are changing. Its output is
 written to `mutants.out/`, and the lines in `missed.txt` tell you which change
 the tests did not catch.
 
+A mutant that no test can tell from the original code is hidden with an
+`exclude_re` pattern in `.cargo/mutants.toml`, with a comment that says why. The
+pattern names one function and one replacement, as `cargo mutants --list`
+prints it, so it hides nothing else.
+
 ## Benchmarks
 
 `benches/hot_path.rs` measures the request hot path through the public API:

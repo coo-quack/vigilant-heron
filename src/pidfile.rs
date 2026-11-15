@@ -445,6 +445,32 @@ mod tests {
         Ok(())
     }
 
+    /// The clock is paused, so the waits are measured exactly and the test does not sleep.
+    #[tokio::test(start_paused = true)]
+    async fn a_lock_that_stays_held_is_given_up_after_waiting_between_attempts_only()
+    -> std::io::Result<()> {
+        let dir = scratch_dir("lock-give-up", 0o700)?;
+        let path = dir.join("router.pid");
+        let first = PidFile::lock(&path).await?;
+        let started = tokio::time::Instant::now();
+        let second = PidFile::lock(&path).await.err();
+        let waited = started.elapsed();
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            second.as_ref().map(std::io::Error::kind),
+            Some(ErrorKind::WouldBlock)
+        );
+        // One wait between each pair of attempts, and none after the last one.
+        // The timer rounds each wait up to the next millisecond, so allow a few.
+        let between_attempts = LOCK_RETRY_INTERVAL * (LOCK_ATTEMPTS - 1);
+        assert!(
+            waited >= between_attempts && waited < between_attempts + LOCK_RETRY_INTERVAL,
+            "waited {waited:?} for {LOCK_ATTEMPTS} attempts"
+        );
+        Ok(())
+    }
+
     #[test]
     fn no_lock_file_means_no_lock_is_held() -> std::io::Result<()> {
         let dir = scratch_dir("lock-none", 0o700)?;

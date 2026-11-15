@@ -235,6 +235,37 @@ async fn a_request_without_a_body_is_forwarded_without_a_content_length() -> Tes
 }
 
 #[tokio::test]
+async fn the_upstream_gets_the_whole_body_length_as_a_content_length_when_the_client_header_is_removed()
+-> TestResult {
+    let upstream = Upstream::start().await?;
+    let stub = StubDecider::start().await?;
+    // inspect_body is 512, so most of the body is forwarded without being read for the decision.
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        &upstream.url(),
+        "",
+        "proxy_set_header Content-Length \"\";",
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::POST,
+        "/upload",
+        "example.com",
+        &[],
+        Bytes::from(vec![b'a'; 1500]),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::OK);
+    let echo = reply.json();
+    assert_eq!(received(&echo, "content-length").as_deref(), Some("1500"));
+    assert_eq!(received(&echo, "transfer-encoding"), None);
+    proxy.stop().await
+}
+
+#[tokio::test]
 async fn a_proxy_set_header_request_id_is_the_generated_id_when_the_request_has_none() -> TestResult
 {
     let upstream = Upstream::start().await?;
