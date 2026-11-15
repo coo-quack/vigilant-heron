@@ -20,7 +20,6 @@ use crate::block::{BLOCK_NAMES, BlockOverrides, BlockResponse};
 use crate::conf::{self, Directive};
 use crate::error::ConfigError;
 use crate::limits::{self, LimitOverrides, LimitSet, LimitZone, LocationConfig};
-use crate::logsink::Destination;
 use crate::proxy::HeaderOp;
 use crate::realip::{IpNet, RealIp};
 use crate::router::HostPattern;
@@ -460,6 +459,36 @@ pub struct SiteConfig {
     pub(crate) limits: LimitSet,
     /// The site's location blocks, in configuration order.
     pub(crate) locations: Vec<LocationConfig>,
+}
+
+/// Where an access log or the error log is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+    /// A file, appended to and reopened on SIGUSR1.
+    File(PathBuf),
+    /// A syslog server over UDP, in RFC 3164 form.
+    Syslog {
+        /// `host:port` of the server.
+        server: String,
+        /// The tag that starts each message, `vigilant-heron` by default.
+        tag: String,
+    },
+}
+
+impl Destination {
+    /// A name for the destination in messages.
+    pub(crate) fn label(&self) -> String {
+        match self {
+            Self::Stdout => "stdout".to_owned(),
+            Self::Stderr => "stderr".to_owned(),
+            Self::File(path) => path.display().to_string(),
+            Self::Syslog { server, .. } => format!("syslog:{server}"),
+        }
+    }
 }
 
 /// One access-log destination with its format.

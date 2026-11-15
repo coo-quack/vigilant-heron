@@ -46,11 +46,11 @@ pub use accesslog::LogFormat;
 pub use block::{BlockResponse, BlockStatus};
 pub use config::{
     AccessLogConfig, BackendConfig, CheckedConfig, Config, ConnectionConfig, DecisionConfig,
-    ErrorLogConfig, FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode, ProcessSettings,
-    SiteAction, SiteConfig, SiteTimeouts, dump_configuration, process_settings,
+    Destination, ErrorLogConfig, FailureAction, HeaderBuffers, LingeringClose, LogLevel, Mode,
+    ProcessSettings, SiteAction, SiteConfig, SiteTimeouts, dump_configuration, process_settings,
 };
 pub use error::{ConfigError, ServeError};
-pub use logsink::{Destination, ErrorLogHandle, install_error_log};
+pub use logsink::{ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
 pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_request_with};
 pub use server::{serve, serve_reloadable};
