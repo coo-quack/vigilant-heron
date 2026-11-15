@@ -574,7 +574,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ClientIo<S> {
         }
         let phase = this.phase.get();
         if phase == Phase::Tunnelling {
-            // A tunnel's bytes pass through as they are.
+            // The connection is a tunnel: bytes are copied, never parsed or timed.
             this.stop_timing_reads();
             return Pin::new(&mut this.inner).poll_read(cx, buf);
         }
