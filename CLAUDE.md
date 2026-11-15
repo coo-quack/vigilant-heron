@@ -45,7 +45,7 @@ src/
   router.rs      # Host normalization and site lookup: exact, leading and trailing wildcards, ~regex, default_server
   block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
-  limits.rs      # limit_req / limit_conn zones, leaky bucket, connection counts, location selection; runs first
+  limits/        # limit_req / limit_conn, runs first: directives (config), location selection (location), zones with the leaky bucket and connection counts (state), screening (screen)
   rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
   rules/tests.rs # Unit tests of the rule parser, built-in signatures, normalization and matching
   prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
