@@ -533,3 +533,192 @@ async fn an_upgrade_answered_with_200_loses_its_hop_by_hop_headers() -> TestResu
     assert!(!head.to_ascii_lowercase().contains("keep-alive:"), "{head}");
     proxy.stop().await
 }
+
+/// What a misbehaving upstream saw: the head of each request, and every byte that came after a head.
+struct SwitchingUpstream {
+    addr: std::net::SocketAddr,
+    heads: Arc<Mutex<Vec<String>>>,
+    after_head: Arc<Mutex<Vec<u8>>>,
+}
+
+const UPSTREAM_MARKER: &[u8] = b"LEAKED-FROM-UPSTREAM";
+const CLIENT_MARKER: &[u8] = b"LEAKED-FROM-CLIENT";
+
+/// Starts an upstream that answers every request with `101 Switching Protocols` followed by
+/// [`UPSTREAM_MARKER`], whether or not the request asked to upgrade. It is written on raw
+/// sockets so that nothing depends on the upgrade rules of an HTTP library.
+async fn start_switching_upstream() -> Result<SwitchingUpstream, common::BoxError> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let after_head = Arc::new(Mutex::new(Vec::new()));
+    let (seen_heads, seen_bytes) = (Arc::clone(&heads), Arc::clone(&after_head));
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (seen_heads, seen_bytes) = (Arc::clone(&seen_heads), Arc::clone(&seen_bytes));
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    match stream.read(&mut byte).await {
+                        Ok(1) => head.push(byte[0]),
+                        _ => return,
+                    }
+                }
+                if let Ok(mut heads) = seen_heads.lock() {
+                    heads.push(String::from_utf8_lossy(&head).into_owned());
+                }
+                let mut answer = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec();
+                answer.extend_from_slice(UPSTREAM_MARKER);
+                if stream.write_all(&answer).await.is_err() {
+                    return;
+                }
+                let mut chunk = [0u8; 1024];
+                while let Ok(read) = stream.read(&mut chunk).await {
+                    if read == 0 {
+                        return;
+                    }
+                    if let Ok(mut bytes) = seen_bytes.lock() {
+                        bytes.extend_from_slice(chunk.get(..read).unwrap_or_default());
+                    }
+                }
+            });
+        }
+    });
+    Ok(SwitchingUpstream {
+        addr,
+        heads,
+        after_head,
+    })
+}
+
+/// Appends what `stream` delivers within `window` to `into`, and stops early at end of stream.
+async fn read_within(stream: &mut TcpStream, into: &mut Vec<u8>, window: Duration) {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut chunk = [0u8; 1024];
+    while let Ok(Ok(read)) = tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+        if read == 0 {
+            return;
+        }
+        into.extend_from_slice(chunk.get(..read).unwrap_or_default());
+    }
+}
+
+/// Sends `request`, waits for what the proxy answers, then writes [`CLIENT_MARKER`] as a client
+/// would write its first tunnel bytes. Returns every byte the client received in the meantime.
+async fn send_then_write_tunnel_bytes(
+    addr: std::net::SocketAddr,
+    request: &[u8],
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut stream = TcpStream::connect(addr).await?;
+    stream.write_all(request).await?;
+    let mut received = Vec::new();
+    read_within(&mut stream, &mut received, Duration::from_millis(200)).await;
+    // The proxy may already have closed the connection, so a failed write is not an error here.
+    let _ = stream.write_all(CLIENT_MARKER).await;
+    read_within(&mut stream, &mut received, Duration::from_millis(300)).await;
+    Ok(received)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Checks that no tunnel carried bytes in either direction, and that the request did reach the upstream.
+fn assert_no_tunnel(
+    upstream: &SwitchingUpstream,
+    client_received: &[u8],
+) -> Result<(), common::BoxError> {
+    let heads = upstream
+        .heads
+        .lock()
+        .map_err(|_| "upstream lock poisoned")?;
+    assert_eq!(
+        heads.len(),
+        1,
+        "the request must reach the upstream: {heads:?}"
+    );
+    let after_head = upstream
+        .after_head
+        .lock()
+        .map_err(|_| "upstream lock poisoned")?;
+    assert!(
+        !contains(&after_head, CLIENT_MARKER),
+        "the client's bytes reached the upstream: {:?}",
+        String::from_utf8_lossy(&after_head)
+    );
+    assert!(
+        !contains(client_received, UPSTREAM_MARKER),
+        "the upstream's bytes reached the client: {:?}",
+        String::from_utf8_lossy(client_received)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_upstream_101_to_an_upgrade_does_not_start_a_tunnel_without_proxy_websocket()
+-> TestResult {
+    let upstream = start_switching_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(&stub.decide_url(), upstream.addr, "", "")).await?;
+
+    let received = send_then_write_tunnel_bytes(
+        proxy.addr,
+        b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await?;
+
+    assert_no_tunnel(&upstream, &received)?;
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_upstream_101_to_a_request_without_upgrade_does_not_start_a_tunnel() -> TestResult {
+    let upstream = start_switching_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream.addr,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+
+    let received = send_then_write_tunnel_bytes(
+        proxy.addr,
+        b"GET /plain HTTP/1.1\r\nHost: example.com\r\n\r\n",
+    )
+    .await?;
+
+    assert_no_tunnel(&upstream, &received)?;
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_upstream_101_to_an_upgrade_header_without_connection_upgrade_does_not_start_a_tunnel()
+-> TestResult {
+    // `Connection` does not list `upgrade`, so the request does not ask to switch protocols.
+    let upstream = start_switching_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream.addr,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+
+    let received = send_then_write_tunnel_bytes(
+        proxy.addr,
+        b"GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n",
+    )
+    .await?;
+
+    assert_no_tunnel(&upstream, &received)?;
+    proxy.stop().await
+}
