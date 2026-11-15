@@ -1479,6 +1479,42 @@ mod tests {
         Ok(())
     }
 
+    /// The clock is paused, so the timers are measured exactly and the test does not sleep.
+    #[tokio::test(start_paused = true)]
+    async fn the_header_timer_of_a_kept_alive_connection_counts_from_the_first_byte()
+    -> Result<(), BoxError> {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let timers = ClientTimers {
+            header: Duration::from_millis(100),
+            keep_alive: Duration::from_secs(60),
+            ..linger_timers(
+                LingeringClose::Off,
+                Duration::from_secs(5),
+                Duration::from_millis(200),
+            )
+        };
+        let phase = Arc::new(PhaseCell::new());
+        phase.set(Phase::AwaitingKeepAlive);
+        let mut io = ClientIo::new(server, phase, timers, Arc::new(Mutex::new(None)));
+        client.write_all(b"G").await?;
+        let mut buf = [0u8; 16];
+        assert_eq!(io.read(&mut buf).await?, 1);
+        let first_byte = tokio::time::Instant::now();
+        // The connection is not read again for 60 ms, as when the runtime is busy.
+        tokio::time::advance(Duration::from_millis(60)).await;
+        let error = io.read(&mut buf).await.err();
+        let waited = first_byte.elapsed();
+        assert_eq!(
+            error.map(|error| error.kind()),
+            Some(io::ErrorKind::TimedOut)
+        );
+        assert!(
+            waited >= Duration::from_millis(100) && waited < Duration::from_millis(150),
+            "the header timer ended {waited:?} after the first byte, not after the header timeout of 100 ms"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bytes_read_while_a_request_is_busy_are_not_scanned_as_a_header() -> Result<(), BoxError>
     {
