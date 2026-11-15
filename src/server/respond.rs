@@ -12,10 +12,11 @@ use http::request::Parts;
 use http::{HeaderMap, Response, StatusCode};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
 use hyper::upgrade::OnUpgrade;
 
 use crate::block::{BlockResponse, BlockStatus};
-use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody};
+use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, FrameTimeout};
 use crate::error::ProxyError;
 use crate::limits::ConnPermit;
 use crate::phase::{Phase, PhaseCell};
@@ -128,42 +129,7 @@ pub(crate) async fn respond(
                 )
                 .await
             {
-                Ok(mut upstream) => {
-                    let status = upstream.status().as_u16();
-                    // A 101 answer to an Upgrade request starts a tunnel; its headers are kept.
-                    let switching = upgrade.is_some() && status == 101;
-                    let client_upgrade = if switching {
-                        lock(delivery.client_upgrade).take()
-                    } else {
-                        None
-                    };
-                    let upstream_upgrade = client_upgrade
-                        .as_ref()
-                        .map(|_| hyper::upgrade::on(&mut upstream));
-                    let tunnel = upstream_upgrade.is_some();
-                    let (mut upstream_parts, upstream_body) = upstream.into_parts();
-                    if !tunnel {
-                        crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
-                    }
-                    if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
-                        // From here on the client connection carries tunnel bytes, not requests,
-                        // and no response is written to it.
-                        delivery.phase.set(Phase::Tunnelling);
-                        tunnel::spawn(
-                            client,
-                            upstream,
-                            delivery.proxy.read_timeout(),
-                            std::mem::take(held),
-                            delivery.tunnels.clone(),
-                        );
-                    }
-                    Outcome {
-                        response: Response::from_parts(upstream_parts, upstream_body.boxed()),
-                        upstream_status: Some(status),
-                        upstream_error: None,
-                        rejected: None,
-                    }
-                }
+                Ok(upstream) => upstream_outcome(delivery, upstream, upgrade.is_some(), held),
                 Err(error) => {
                     let mut outcome = failure(&error, complete);
                     outcome.response = with_request_id(outcome.response, delivery.ctx.request_id);
@@ -187,6 +153,53 @@ pub(crate) async fn respond(
             }
             Outcome::answered(response)
         }
+    }
+}
+
+/// The outcome of a request that the upstream answered.
+///
+/// A 101 answer to an Upgrade request (`upgrading`) starts a tunnel between the client
+/// connection and the upstream. The tunnel takes the `limit_conn` permits in `held`, and
+/// that answer keeps its hop-by-hop headers. Any other answer loses them.
+fn upstream_outcome(
+    delivery: &Delivery<'_>,
+    mut upstream: Response<FrameTimeout<Incoming>>,
+    upgrading: bool,
+    held: &mut Vec<ConnPermit>,
+) -> Outcome {
+    let status = upstream.status().as_u16();
+    // A 101 answer to an Upgrade request starts a tunnel; its headers are kept.
+    let switching = upgrading && status == 101;
+    let client_upgrade = if switching {
+        lock(delivery.client_upgrade).take()
+    } else {
+        None
+    };
+    let upstream_upgrade = client_upgrade
+        .as_ref()
+        .map(|_| hyper::upgrade::on(&mut upstream));
+    let tunnel = upstream_upgrade.is_some();
+    let (mut upstream_parts, upstream_body) = upstream.into_parts();
+    if !tunnel {
+        crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
+    }
+    if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
+        // From here on the client connection carries tunnel bytes, not requests,
+        // and no response is written to it.
+        delivery.phase.set(Phase::Tunnelling);
+        tunnel::spawn(
+            client,
+            upstream,
+            delivery.proxy.read_timeout(),
+            std::mem::take(held),
+            delivery.tunnels.clone(),
+        );
+    }
+    Outcome {
+        response: Response::from_parts(upstream_parts, upstream_body.boxed()),
+        upstream_status: Some(status),
+        upstream_error: None,
+        rejected: None,
     }
 }
 
