@@ -29,7 +29,9 @@ mod test_helpers;
 pub(crate) use config::{
     LIMIT_NAMES, LimitOverrides, LimitSet, LimitZone, ZONE_NAMES, build_zones,
 };
-pub(crate) use location::{LocationConfig, parse_location, select_location, select_locations};
+pub(crate) use location::{
+    LocationConfig, PendingLocation, parse_location, select_location, select_locations,
+};
 pub(crate) use screen::{KeyVars, screen};
 pub(crate) use state::{ConnPermit, ConnStatus, ReqStatus, ZoneStore};
 
