@@ -22,6 +22,7 @@ mod error;
 mod limits;
 mod log_lines;
 mod logsink;
+mod phase;
 mod policy;
 mod prefilter;
 mod proxy;
@@ -34,6 +35,7 @@ mod sanitize;
 mod server;
 mod shadow_report;
 mod skip_suggest;
+mod sync;
 mod system_one;
 #[cfg(test)]
 mod test_support;

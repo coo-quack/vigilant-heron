@@ -27,7 +27,7 @@ use tracing_subscriber::reload;
 use crate::accesslog;
 use crate::config::{ErrorLogConfig, LogLevel};
 use crate::error::ConfigError;
-use crate::transport::lock;
+use crate::sync::lock;
 
 /// Lines the queue holds before new lines are dropped.
 pub(crate) const QUEUE_CAPACITY: usize = 4096;

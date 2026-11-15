@@ -1,6 +1,10 @@
 //! Helpers shared by the unit tests.
 
-use std::io::BufRead;
+use std::io::{self, BufRead};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::config::{Config, SiteConfig};
 use crate::error::ConfigError;
@@ -102,5 +106,81 @@ impl std::io::BufRead for EndsOnce<'_> {
 
     fn consume(&mut self, amount: usize) {
         self.data = self.data.get(amount..).unwrap_or_default();
+    }
+}
+
+/// A socket stand-in that records what reaches it. It accepts at most `per_write`
+/// bytes per write, reports `vectored` from `is_write_vectored`, and can refuse flushes.
+/// Reads report end of file, and an error once they have been called too often.
+pub(crate) struct Recorder {
+    pub(crate) per_write: usize,
+    pub(crate) vectored: bool,
+    pub(crate) fail_flush: bool,
+    pub(crate) written: Vec<u8>,
+    pub(crate) reads: usize,
+    pub(crate) flushes: usize,
+    pub(crate) shutdowns: usize,
+}
+
+impl Recorder {
+    pub(crate) fn new() -> Self {
+        Self {
+            per_write: usize::MAX,
+            vectored: false,
+            fail_flush: false,
+            written: Vec::new(),
+            reads: 0,
+            flushes: 0,
+            shutdowns: 0,
+        }
+    }
+}
+
+impl AsyncRead for Recorder {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.reads += 1;
+        if this.reads > 100 {
+            return Poll::Ready(Err(io::Error::other("read again after end of file")));
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for Recorder {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let take = buf.len().min(this.per_write);
+        this.written
+            .extend_from_slice(buf.get(..take).unwrap_or_default());
+        Poll::Ready(Ok(take))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.vectored
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.flushes += 1;
+        if this.fail_flush {
+            Poll::Ready(Err(io::Error::other("flush refused")))
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        this.shutdowns += 1;
+        Poll::Ready(Ok(()))
     }
 }

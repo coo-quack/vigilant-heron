@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use crate::limits::ConnPermit;
-use crate::transport::lock;
+use crate::sync::lock;
 
 /// Bytes copied at a time in each direction.
 const PUMP_BUFFER: usize = 16 * 1024;
