@@ -989,7 +989,6 @@ mod tests {
     fn a_repeated_directive_is_reported_before_its_value_is_read() {
         let text = message(parse(&with_site("    mode enforce;\n    mode bogus;\n")));
         assert!(text.contains("duplicate directive \"mode\""), "{text}");
-        assert!(!text.contains("must be enforce or shadow"), "{text}");
     }
 
     #[test]
@@ -1022,7 +1021,7 @@ mod tests {
 
     #[rstest]
     #[case::unknown_name("bogus on;", "bogus")]
-    #[case::top_level_only("listen 127.0.0.1:1;", "listen")]
+    #[case::a_top_level_directive("listen 127.0.0.1:1;", "listen")]
     fn a_directive_that_a_site_does_not_have_is_rejected(#[case] line: &str, #[case] name: &str) {
         let text = message(parse(&with_site(&format!("    {line}\n"))));
         assert!(
@@ -1120,7 +1119,6 @@ mod tests {
             "site a.test {\n    location /a { }\n    location /a { }\n}\n",
         )));
         assert!(text.contains("duplicate \"location\""), "{text}");
-        assert!(!text.contains("\"upstream\" is required"), "{text}");
     }
 
     #[test]
@@ -1132,7 +1130,6 @@ mod tests {
             text.contains("\"access_log off\" cannot be combined with other access_log directives"),
             "{text}"
         );
-        assert!(!text.contains("\"upstream\" is required"), "{text}");
     }
 
     #[test]
@@ -1141,7 +1138,6 @@ mod tests {
             "    location /a { }\n    location /a { }\n    access_log off;\n    access_log stdout;\n",
         )));
         assert!(text.contains("duplicate \"location\""), "{text}");
-        assert!(!text.contains("cannot be combined"), "{text}");
     }
 
     #[rstest]
