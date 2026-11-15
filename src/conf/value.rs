@@ -174,3 +174,126 @@ pub(crate) fn once(seen: &mut HashSet<String>, directive: &Directive) -> Result<
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
+    use super::*;
+
+    /// A directive on line 7 of `test.conf` with no block.
+    fn directive(name: &str, args: &[&str]) -> Directive {
+        Directive {
+            name: name.to_owned(),
+            args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+            children: None,
+            file: Arc::from("test.conf"),
+            line: 7,
+        }
+    }
+
+    fn message<T>(result: Result<T, ConfigError>) -> String {
+        match result {
+            Ok(_) => String::new(),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[rstest]
+    #[case::none(&[])]
+    #[case::two(&["enforce", "shadow"])]
+    fn a_directive_that_does_not_have_one_argument_is_rejected(#[case] args: &[&str]) {
+        let mode = directive("mode", args);
+        assert_eq!(
+            message(one_arg(&mode)),
+            "test.conf:7: \"mode\" takes exactly one argument"
+        );
+    }
+
+    #[test]
+    fn a_directive_without_a_block_is_rejected_where_one_is_needed() {
+        let site = directive("site", &["example.com"]);
+        assert_eq!(
+            message(block(&site)),
+            "test.conf:7: \"site\" must be followed by a block"
+        );
+    }
+
+    #[test]
+    fn an_error_with_no_directive_to_point_at_names_the_configuration() {
+        assert_eq!(
+            invalid_at_top(&[], "\"listen\" is required").to_string(),
+            "configuration:1: \"listen\" is required"
+        );
+    }
+
+    #[rstest]
+    #[case::a_word("ten")]
+    #[case::negative("-1")]
+    #[case::a_fraction("1.5")]
+    fn a_value_that_is_not_a_whole_number_is_rejected(#[case] text: &str) {
+        let count = directive("max_connections", &[text]);
+        assert_eq!(
+            message(parse_number::<usize>(&count, text)),
+            format!("test.conf:7: \"max_connections\" must be a whole number, got \"{text}\"")
+        );
+    }
+
+    #[rstest]
+    #[case::unit_only("ms")]
+    #[case::a_word("soon")]
+    fn a_time_without_a_number_is_rejected(#[case] text: &str) {
+        let timeout = directive("timeout", &[text]);
+        assert_eq!(
+            message(parse_time(&timeout, text)),
+            format!("test.conf:7: \"timeout\" is not a time: \"{text}\"")
+        );
+    }
+
+    #[rstest]
+    #[case::minutes("m")]
+    #[case::hours("h")]
+    fn a_time_too_long_to_count_in_seconds_is_the_longest_time(
+        #[case] unit: &str,
+    ) -> Result<(), ConfigError> {
+        let text = format!("{}{unit}", u64::MAX);
+        let timeout = directive("timeout", &[&text]);
+        assert_eq!(parse_time(&timeout, &text)?, Duration::from_secs(u64::MAX));
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::unit_only("k")]
+    #[case::a_word("big")]
+    fn a_size_without_a_number_is_rejected(#[case] text: &str) {
+        let size = directive("inspect_body", &[text]);
+        assert_eq!(
+            message(parse_size(&size, text)),
+            format!("test.conf:7: \"inspect_body\" is not a size: \"{text}\"")
+        );
+    }
+
+    #[test]
+    fn a_size_with_an_unknown_unit_is_rejected() {
+        let size = directive("inspect_body", &["5x"]);
+        assert_eq!(
+            message(parse_size(&size, "5x")),
+            "test.conf:7: \"inspect_body\" has an unknown size unit in \"5x\""
+        );
+    }
+
+    #[rstest]
+    #[case::kilobytes("k")]
+    #[case::megabytes("m")]
+    #[case::gigabytes("g")]
+    fn a_size_that_does_not_fit_is_rejected(#[case] unit: &str) {
+        let text = format!("{}{unit}", usize::MAX);
+        let size = directive("inspect_body", &[&text]);
+        assert_eq!(
+            message(parse_size(&size, &text)),
+            format!("test.conf:7: \"inspect_body\" is too large: \"{text}\"")
+        );
+    }
+}
