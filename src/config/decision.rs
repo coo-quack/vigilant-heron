@@ -49,10 +49,7 @@ fn is_valid_model_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "one arm per directive keeps each name and its check together"
-)]
+/// Parses one `decision { ... }` directive.
 pub(crate) fn parse_decision<F>(
     directive: &Directive,
     lookup: &F,
@@ -60,106 +57,118 @@ pub(crate) fn parse_decision<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    let mut seen = HashSet::new();
-    let mut backend_name = "jev";
-    let mut url_text = None;
-    let mut model = None;
-    let mut token_env = None;
-    let mut timeout = DEFAULT_TIMEOUT;
-    let mut queue_timeout = Duration::ZERO;
-    let mut max_concurrency = DEFAULT_MAX_CONCURRENCY;
-    let mut max_concurrency_per_client: Option<usize> = None;
-    let mut inspect_body = DEFAULT_INSPECT_BODY;
-    let mut redact_headers = Vec::new();
-    let mut redact_fields = Vec::new();
-    let mut redact_file_parts = true;
-    let mut backend_line = directive;
-    let mut token_line = directive;
-    let mut model_line = directive;
+    let children = block(directive)?;
+    let mut draft = DecisionDraft::new(directive);
+    for child in children {
+        draft.apply(child)?;
+    }
+    draft.finish(lookup)
+}
 
-    for child in block(directive)? {
-        if !DECISION_DIRECTIVES.contains(&child.name.as_str()) {
+/// A `decision` block while it is read: the settings read so far, which become the fields of
+/// [`DecisionConfig`] and [`BackendConfig`], and the places the errors point at. Without a
+/// directive of its own, `backend_line`, `token_line` and `model_line` stay at the `decision`
+/// directive, as does the line of a default `url`.
+struct DecisionDraft<'a> {
+    /// The `decision` directive, which the cross-checks point at.
+    directive: &'a Directive,
+    /// The names of the single-use directives seen so far.
+    seen: HashSet<String>,
+    backend_name: &'a str,
+    /// The text of `url` and the directive that wrote it.
+    url_text: Option<(String, &'a Directive)>,
+    model: Option<String>,
+    token_env: Option<String>,
+    timeout: Duration,
+    queue_timeout: Duration,
+    max_concurrency: usize,
+    max_concurrency_per_client: Option<usize>,
+    inspect_body: usize,
+    redact_headers: Vec<String>,
+    redact_fields: Vec<String>,
+    redact_file_parts: bool,
+    /// The `backend` directive, or the `decision` directive when there is none.
+    backend_line: &'a Directive,
+    /// The `api_token_env` directive, or the `decision` directive when there is none.
+    token_line: &'a Directive,
+    /// The `model` directive, or the `decision` directive when there is none.
+    model_line: &'a Directive,
+}
+
+impl<'a> DecisionDraft<'a> {
+    /// A draft of the `decision` block `directive` with the defaults.
+    fn new(directive: &'a Directive) -> Self {
+        Self {
+            directive,
+            seen: HashSet::new(),
+            backend_name: "jev",
+            url_text: None,
+            model: None,
+            token_env: None,
+            timeout: DEFAULT_TIMEOUT,
+            queue_timeout: Duration::ZERO,
+            max_concurrency: DEFAULT_MAX_CONCURRENCY,
+            max_concurrency_per_client: None,
+            inspect_body: DEFAULT_INSPECT_BODY,
+            redact_headers: Vec::new(),
+            redact_fields: Vec::new(),
+            redact_file_parts: true,
+            backend_line: directive,
+            token_line: directive,
+            model_line: directive,
+        }
+    }
+
+    /// Applies one directive of the block. Every directive may appear once, except
+    /// `redact_header` and `redact_field`, whose lines add up, and `max_body`, which is
+    /// always refused. A repeated directive fails before its value is read.
+    fn apply(&mut self, child: &'a Directive) -> Result<(), ConfigError> {
+        let name = child.name.as_str();
+        if !DECISION_DIRECTIVES.contains(&name) {
             return Err(invalid(
                 child,
-                format!("unknown directive \"{}\" in decision", child.name),
+                format!("unknown directive \"{name}\" in decision"),
             ));
         }
-        match child.name.as_str() {
+        if !matches!(name, "max_body" | "redact_header" | "redact_field") {
+            once(&mut self.seen, child)?;
+        }
+        match name {
             "backend" => {
-                once(&mut seen, child)?;
-                backend_line = child;
-                backend_name = match one_arg(child)? {
-                    name @ ("jev" | "clef" | "strands" | "http") => name,
-                    other => {
-                        return Err(invalid(
-                            child,
-                            format!("\"backend\" must be jev, clef, strands or http, got {other}"),
-                        ));
-                    }
-                };
+                self.backend_line = child;
+                self.backend_name = known_backend(child)?;
             }
-            "url" => {
-                once(&mut seen, child)?;
-                url_text = Some((one_arg(child)?.to_owned(), child));
-            }
+            "url" => self.url_text = Some((one_arg(child)?.to_owned(), child)),
             "model" => {
-                once(&mut seen, child)?;
-                model_line = child;
-                model = Some(one_arg(child)?.to_owned());
+                self.model_line = child;
+                self.model = Some(one_arg(child)?.to_owned());
             }
             "api_token_env" => {
-                once(&mut seen, child)?;
-                token_line = child;
-                token_env = Some(one_arg(child)?.to_owned());
+                self.token_line = child;
+                self.token_env = Some(one_arg(child)?.to_owned());
             }
-            "timeout" => {
-                once(&mut seen, child)?;
-                timeout = parse_time(child, one_arg(child)?)?;
-            }
-            "queue_timeout" => {
-                once(&mut seen, child)?;
-                queue_timeout = parse_time(child, one_arg(child)?)?;
-            }
-            "max_concurrency" => {
-                once(&mut seen, child)?;
-                max_concurrency = parse_number::<usize>(child, one_arg(child)?)?;
-            }
+            "timeout" => self.timeout = parse_time(child, one_arg(child)?)?,
+            "queue_timeout" => self.queue_timeout = parse_time(child, one_arg(child)?)?,
+            "max_concurrency" => self.max_concurrency = parse_number(child, one_arg(child)?)?,
             "max_concurrency_per_client" => {
-                once(&mut seen, child)?;
-                max_concurrency_per_client = Some(parse_number::<usize>(child, one_arg(child)?)?);
+                self.max_concurrency_per_client = Some(parse_number(child, one_arg(child)?)?);
             }
-            "inspect_body" => {
-                once(&mut seen, child)?;
-                inspect_body = parse_size(child, one_arg(child)?)?;
-            }
+            "inspect_body" => self.inspect_body = parse_size(child, one_arg(child)?)?,
             "max_body" => {
                 return Err(invalid(
                     child,
                     "\"max_body\" was replaced by \"client_max_body_size\", which is set at the top level",
                 ));
             }
-            "redact_header" => {
-                if child.args.is_empty() {
-                    return Err(invalid(
-                        child,
-                        "\"redact_header\" needs at least one header name",
-                    ));
-                }
-                redact_headers.extend(child.args.iter().map(|h| h.to_ascii_lowercase()));
-            }
-            "redact_field" => {
-                if child.args.is_empty() {
-                    return Err(invalid(
-                        child,
-                        "\"redact_field\" needs at least one field name",
-                    ));
-                }
-                redact_fields.extend(child.args.iter().map(|f| f.to_ascii_lowercase()));
-            }
-            "redact_file_parts" => {
-                once(&mut seen, child)?;
-                redact_file_parts = parse_bool(child, one_arg(child)?)?;
-            }
+            "redact_header" => self.redact_headers.extend(lowercased_args(
+                child,
+                "\"redact_header\" needs at least one header name",
+            )?),
+            "redact_field" => self.redact_fields.extend(lowercased_args(
+                child,
+                "\"redact_field\" needs at least one field name",
+            )?),
+            "redact_file_parts" => self.redact_file_parts = parse_bool(child, one_arg(child)?)?,
             other => {
                 return Err(invalid(
                     child,
@@ -167,140 +176,219 @@ where
                 ));
             }
         }
+        Ok(())
     }
 
+    /// Checks the settings against each other, then resolves the URL and the backend,
+    /// whose token is read with `lookup`, and builds the result.
+    fn finish<F>(self, lookup: &F) -> Result<DecisionConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        check_timeouts(self.directive, self.timeout, self.queue_timeout)?;
+        let max_concurrency_per_client = per_client_limit(
+            self.directive,
+            self.max_concurrency,
+            self.max_concurrency_per_client,
+        )?;
+        let url = self.endpoint_url()?;
+        let backend = self.select_backend(lookup)?;
+        Ok(DecisionConfig {
+            url,
+            backend,
+            timeout: self.timeout,
+            queue_timeout: self.queue_timeout,
+            max_concurrency: self.max_concurrency,
+            max_concurrency_per_client,
+            inspect_body_bytes: self.inspect_body,
+            redact_headers: self.redact_headers,
+            redact_fields: self.redact_fields,
+            redact_file_parts: self.redact_file_parts,
+        })
+    }
+
+    /// The `url` as a URI. Only backend jev has a default, so the others need one.
+    fn endpoint_url(&self) -> Result<Uri, ConfigError> {
+        let (text, line) = match &self.url_text {
+            Some((text, line)) => (text.as_str(), *line),
+            None if self.backend_name == "jev" => (JEV_URL, self.directive),
+            None => {
+                return Err(invalid(
+                    self.backend_line,
+                    format!("\"url\" is required with backend {}", self.backend_name),
+                ));
+            }
+        };
+        parse_absolute_uri(text, &["http", "https"]).ok_or_else(|| {
+            invalid(
+                line,
+                format!("\"url\" must be an absolute http:// or https:// URI, got {text}"),
+            )
+        })
+    }
+
+    /// The backend the settings name, with the model and token it needs.
+    fn select_backend<F>(&self, lookup: &F) -> Result<BackendConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        match self.backend_name {
+            "http" => self.http_backend(),
+            "clef" => self.clef_backend(lookup),
+            "strands" => self.strands_backend(lookup),
+            _ => self.jev_backend(lookup),
+        }
+    }
+
+    /// Backend http speaks its own protocol, which has neither a model nor a token.
+    fn http_backend(&self) -> Result<BackendConfig, ConfigError> {
+        if self.model.is_some() {
+            return Err(invalid(
+                self.model_line,
+                "\"model\" is not valid with backend http",
+            ));
+        }
+        if self.token_env.is_some() {
+            return Err(invalid(
+                self.token_line,
+                "\"api_token_env\" is not valid with backend http",
+            ));
+        }
+        Ok(BackendConfig::Http)
+    }
+
+    /// Backend clef: one of its two models and a token are both required.
+    fn clef_backend<F>(&self, lookup: &F) -> Result<BackendConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let model_text = self
+            .model
+            .as_deref()
+            .ok_or_else(|| invalid(self.backend_line, "\"model\" is required with backend clef"))?;
+        let model = ClefModel::from_name(model_text).ok_or_else(|| {
+            invalid(
+                self.model_line,
+                format!("\"model\" must be clef-flash or clef for backend clef, got {model_text}"),
+            )
+        })?;
+        let env_name = self.token_env.as_deref().ok_or_else(|| {
+            invalid(
+                self.backend_line,
+                "\"api_token_env\" is required with backend clef",
+            )
+        })?;
+        Ok(BackendConfig::Clef {
+            model,
+            token: read_token(self.token_line, env_name, lookup)?,
+        })
+    }
+
+    /// Backend strands: the model has a default, and the token is optional.
+    fn strands_backend<F>(&self, lookup: &F) -> Result<BackendConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let model = self.model_id(STRANDS_MODEL)?;
+        let token = self
+            .token_env
+            .as_deref()
+            .map(|env_name| read_token(self.token_line, env_name, lookup))
+            .transpose()?;
+        Ok(BackendConfig::Strands { model, token })
+    }
+
+    /// Backend jev: the model and the token variable both have defaults.
+    fn jev_backend<F>(&self, lookup: &F) -> Result<BackendConfig, ConfigError>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let model = self.model_id(JEV_MODEL)?;
+        let env_name = self.token_env.as_deref().unwrap_or(JEV_TOKEN_ENV);
+        Ok(BackendConfig::Jev {
+            model,
+            token: read_token(self.token_line, env_name, lookup)?,
+        })
+    }
+
+    /// The `model` text, or `default` when there is none, if it is a safe identifier.
+    fn model_id(&self, default: &str) -> Result<String, ConfigError> {
+        let model = self.model.as_deref().unwrap_or(default);
+        if !is_valid_model_id(model) {
+            return Err(invalid(
+                self.model_line,
+                format!("\"model\" must be 1 to 100 characters from [A-Za-z0-9._-], got {model}"),
+            ));
+        }
+        Ok(model.to_owned())
+    }
+}
+
+/// `backend jev`, `clef`, `strands` or `http`. Returns the name.
+fn known_backend(directive: &Directive) -> Result<&str, ConfigError> {
+    match one_arg(directive)? {
+        name @ ("jev" | "clef" | "strands" | "http") => Ok(name),
+        other => Err(invalid(
+            directive,
+            format!("\"backend\" must be jev, clef, strands or http, got {other}"),
+        )),
+    }
+}
+
+/// The arguments of `redact_header` or `redact_field`, lowercased. With none, the error is
+/// `when_empty`.
+fn lowercased_args(directive: &Directive, when_empty: &str) -> Result<Vec<String>, ConfigError> {
+    if directive.args.is_empty() {
+        return Err(invalid(directive, when_empty));
+    }
+    Ok(directive
+        .args
+        .iter()
+        .map(|name| name.to_ascii_lowercase())
+        .collect())
+}
+
+/// Checks `timeout` and `queue_timeout`; the errors point at the `decision` directive.
+fn check_timeouts(
+    directive: &Directive,
+    timeout: Duration,
+    queue_timeout: Duration,
+) -> Result<(), ConfigError> {
     if timeout.is_zero() {
         return Err(invalid(directive, "\"timeout\" must be greater than 0"));
     }
     if queue_timeout > timeout {
         return Err(invalid(
             directive,
-            "\"queue_timeout\" must not exceed \"timeout\"".to_owned(),
+            "\"queue_timeout\" must not exceed \"timeout\"",
         ));
     }
+    Ok(())
+}
+
+/// The per-client limit, after `max_concurrency` and `max_concurrency_per_client` are checked.
+/// When it is not set, it is the default, capped at `max_concurrency`. The errors point at the
+/// `decision` directive.
+fn per_client_limit(
+    directive: &Directive,
+    max_concurrency: usize,
+    per_client: Option<usize>,
+) -> Result<usize, ConfigError> {
     if max_concurrency == 0 {
         return Err(invalid(directive, "\"max_concurrency\" must be at least 1"));
     }
-    let max_concurrency_per_client = match max_concurrency_per_client {
-        Some(0) => {
-            return Err(invalid(
-                directive,
-                "\"max_concurrency_per_client\" must be at least 1",
-            ));
-        }
-        Some(per_client) if per_client > max_concurrency => {
-            return Err(invalid(
-                directive,
-                "\"max_concurrency_per_client\" must not exceed \"max_concurrency\"",
-            ));
-        }
-        Some(per_client) => per_client,
-        None => DEFAULT_MAX_CONCURRENCY_PER_CLIENT.min(max_concurrency),
-    };
-
-    let (url_text, url_line) = match url_text {
-        Some((text, line)) => (text, line),
-        None if backend_name == "jev" => (JEV_URL.to_owned(), directive),
-        None => {
-            return Err(invalid(
-                backend_line,
-                format!("\"url\" is required with backend {backend_name}"),
-            ));
-        }
-    };
-    let url = parse_absolute_uri(&url_text, &["http", "https"]).ok_or_else(|| {
-        invalid(
-            url_line,
-            format!("\"url\" must be an absolute http:// or https:// URI, got {url_text}"),
-        )
-    })?;
-
-    let backend = match backend_name {
-        "http" => {
-            if model.is_some() {
-                return Err(invalid(
-                    model_line,
-                    "\"model\" is not valid with backend http",
-                ));
-            }
-            if token_env.is_some() {
-                return Err(invalid(
-                    token_line,
-                    "\"api_token_env\" is not valid with backend http",
-                ));
-            }
-            BackendConfig::Http
-        }
-        "clef" => {
-            let model_text = model
-                .ok_or_else(|| invalid(backend_line, "\"model\" is required with backend clef"))?;
-            let model = ClefModel::from_name(&model_text).ok_or_else(|| {
-                invalid(
-                    model_line,
-                    format!(
-                        "\"model\" must be clef-flash or clef for backend clef, got {model_text}"
-                    ),
-                )
-            })?;
-            let env_name = token_env.ok_or_else(|| {
-                invalid(
-                    backend_line,
-                    "\"api_token_env\" is required with backend clef",
-                )
-            })?;
-            BackendConfig::Clef {
-                model,
-                token: read_token(token_line, &env_name, lookup)?,
-            }
-        }
-        "strands" => {
-            let model_text = model.unwrap_or_else(|| STRANDS_MODEL.to_owned());
-            if !is_valid_model_id(&model_text) {
-                return Err(invalid(
-                    model_line,
-                    format!(
-                        "\"model\" must be 1 to 100 characters from [A-Za-z0-9._-], got {model_text}"
-                    ),
-                ));
-            }
-            let token = token_env
-                .map(|env_name| read_token(token_line, &env_name, lookup))
-                .transpose()?;
-            BackendConfig::Strands {
-                model: model_text,
-                token,
-            }
-        }
-        _ => {
-            let model_text = model.unwrap_or_else(|| JEV_MODEL.to_owned());
-            if !is_valid_model_id(&model_text) {
-                return Err(invalid(
-                    model_line,
-                    format!(
-                        "\"model\" must be 1 to 100 characters from [A-Za-z0-9._-], got {model_text}"
-                    ),
-                ));
-            }
-            let env_name = token_env.unwrap_or_else(|| JEV_TOKEN_ENV.to_owned());
-            BackendConfig::Jev {
-                model: model_text,
-                token: read_token(token_line, &env_name, lookup)?,
-            }
-        }
-    };
-
-    Ok(DecisionConfig {
-        url,
-        backend,
-        timeout,
-        queue_timeout,
-        max_concurrency,
-        max_concurrency_per_client,
-        inspect_body_bytes: inspect_body,
-        redact_headers,
-        redact_fields,
-        redact_file_parts,
-    })
+    match per_client {
+        Some(0) => Err(invalid(
+            directive,
+            "\"max_concurrency_per_client\" must be at least 1",
+        )),
+        Some(per_client) if per_client > max_concurrency => Err(invalid(
+            directive,
+            "\"max_concurrency_per_client\" must not exceed \"max_concurrency\"",
+        )),
+        Some(per_client) => Ok(per_client),
+        None => Ok(DEFAULT_MAX_CONCURRENCY_PER_CLIENT.min(max_concurrency)),
+    }
 }
 
 /// Reads the token from the variable `name`. A missing or blank value is an error at `directive`.
@@ -609,6 +697,114 @@ mod tests {
     fn redact_file_parts_rejects_other_values() {
         let text = with_decision("    backend http;\n    redact_file_parts yes;\n");
         assert!(message(parse(&text)).contains("\"redact_file_parts\" must be \"on\" or \"off\""));
+    }
+
+    #[test]
+    fn redact_header_needs_a_name() {
+        let text = with_decision("    backend http;\n    redact_header;\n");
+        assert!(message(parse(&text)).contains("\"redact_header\" needs at least one header name"));
+    }
+
+    #[test]
+    fn redact_header_lines_add_up() -> Result<(), ConfigError> {
+        let config = parse(&with_decision(
+            "    backend http;\n    redact_header X-A;\n    redact_header X-B;\n",
+        ))?;
+        assert_eq!(config.decision.redact_headers, ["x-a", "x-b"]);
+        Ok(())
+    }
+
+    #[test]
+    fn a_missing_url_is_reported_at_the_backend_line() {
+        let text = message(parse(
+            "listen 127.0.0.1:8080;\ndecision {\n    backend strands;\n}\n\
+             site example.com {\n    upstream http://upstream:80;\n}\n",
+        ));
+        assert!(text.starts_with("test.conf:3:"), "{text}");
+        assert!(
+            text.contains("\"url\" is required with backend strands"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_model_with_backend_http_is_reported_at_the_model_line() {
+        let text = message(parse(&with_decision(
+            "    backend http;\n    model jev-latest;\n",
+        )));
+        assert!(text.starts_with("test.conf:5:"), "{text}");
+        assert!(
+            text.contains("\"model\" is not valid with backend http"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_directive_in_decision_is_named() {
+        let text = message(parse(&with_decision(
+            "    backend http;\n    upstream http://upstream:80;\n",
+        )));
+        assert!(
+            text.contains("unknown directive \"upstream\" in decision"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_queue_timeout_equal_to_the_timeout_is_allowed() -> Result<(), ConfigError> {
+        let config = parse(&with_decision(
+            "    backend http;\n    timeout 100ms;\n    queue_timeout 100ms;\n",
+        ))?;
+        assert_eq!(config.decision.queue_timeout, Duration::from_millis(100));
+        Ok(())
+    }
+
+    #[test]
+    fn a_decision_url_that_is_not_an_absolute_http_uri_is_rejected_at_its_line() {
+        let text = message(parse(
+            "listen 127.0.0.1:8080;\ndecision {\n    backend http;\n    url stub-decider/decide;\n}\n\
+             site example.com {\n    upstream http://upstream:80;\n}\n",
+        ));
+        assert!(text.starts_with("test.conf:4:"), "{text}");
+        assert!(
+            text.contains(
+                "\"url\" must be an absolute http:// or https:// URI, got stub-decider/decide"
+            ),
+            "{text}"
+        );
+    }
+
+    #[rstest]
+    #[case::backend("    backend http;\n    backend http;\n", "backend")]
+    #[case::url("    backend http;\n    url http://stub-decider:9000/other;\n", "url")]
+    #[case::model("    model a;\n    model b;\n", "model")]
+    #[case::api_token_env("    api_token_env A;\n    api_token_env B;\n", "api_token_env")]
+    #[case::timeout("    backend http;\n    timeout 1s;\n    timeout 2s;\n", "timeout")]
+    #[case::queue_timeout(
+        "    backend http;\n    queue_timeout 1ms;\n    queue_timeout 2ms;\n",
+        "queue_timeout"
+    )]
+    #[case::max_concurrency(
+        "    backend http;\n    max_concurrency 2;\n    max_concurrency 3;\n",
+        "max_concurrency"
+    )]
+    #[case::max_concurrency_per_client(
+        "    backend http;\n    max_concurrency_per_client 1;\n    max_concurrency_per_client 2;\n",
+        "max_concurrency_per_client"
+    )]
+    #[case::inspect_body(
+        "    backend http;\n    inspect_body 1k;\n    inspect_body 2k;\n",
+        "inspect_body"
+    )]
+    fn a_single_use_decision_directive_is_rejected_the_second_time(
+        #[case] lines: &str,
+        #[case] name: &str,
+    ) {
+        let text = message(parse(&with_decision(lines)));
+        assert!(
+            text.contains(&format!("duplicate directive \"{name}\"")),
+            "{text}"
+        );
     }
 
     #[test]
