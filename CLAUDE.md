@@ -66,7 +66,7 @@ src/
   sync.rs        # Mutex lock helper that ignores poisoning
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
   finish.rs      # Response body wrapper: sets the connection phase (keep-alive or close) when the response ends, holds limit_conn permits
-  server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
+  server/        # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline (mod.rs); state.rs (AppState), reload.rs, respond.rs (responses), record.rs (access records)
   error.rs       # Error types
   test_support.rs # Builds sites and configurations for the unit tests
 benches/

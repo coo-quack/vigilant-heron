@@ -7,8 +7,11 @@
 //! Only the first `inspect_body` bytes of a body reach the backend; the rest is
 //! streamed to the upstream after the decision.
 
-use std::collections::HashMap;
-use std::convert::Infallible;
+mod record;
+mod reload;
+mod respond;
+mod state;
+
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::pin;
@@ -17,15 +20,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
-use http::header::{
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderName, HeaderValue, LOCATION, UPGRADE,
-    X_CONTENT_TYPE_OPTIONS,
-};
+use http::header::{CONNECTION, CONTENT_LENGTH, HOST, HeaderValue};
 use http::request::Parts;
 use http::{HeaderMap, Request, Response, StatusCode};
 use http_body::Body;
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -35,263 +34,33 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::JoinSet;
 
-use crate::access::{self, AccessEntry};
-use crate::accesslog::{AccessRecord, LogFormat};
-use crate::block::{BlockResponse, BlockStatus};
-use crate::body::{BodyFault, BodyTooLarge, BoxError, ClientBody, Sniffed};
-use crate::config::{AccessLogConfig, BackendConfig, Config, ConnectionConfig, Mode, SiteConfig};
-use crate::decision::{Backend, ClientSlots, HttpDecisionBackend, Limits, decision_client};
-use crate::error::ConfigError;
-use crate::error::{DecisionError, ProxyError, ServeError};
+use crate::access;
+use crate::accesslog::AccessRecord;
+use crate::block::BlockResponse;
+use crate::body::{ClientBody, Sniffed};
+use crate::config::{Config, Mode, SiteConfig};
+use crate::error::{ConfigError, DecisionError, ServeError};
 use crate::finish::Finish;
-use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus, ZoneStore};
-use crate::logsink::{Writer, spawn_writer};
+use crate::limits::{self, ConnPermit, ConnStatus, KeyVars, LimitSet, ReqStatus};
 use crate::phase::{Phase, PhaseCell};
-use crate::policy::{self, Action, Assessment, Decision};
+use crate::policy::{self, Action, Assessment};
 use crate::prefilter::{self, Screening};
-use crate::proxy::{HeaderContext, HeaderOp, Proxy, upgrade_request, upstream_headers};
-use crate::realip::RealIp;
+use crate::proxy::HeaderContext;
 use crate::request_id;
-use crate::router::{Router, is_valid_host, normalize_host};
+use crate::router::{is_valid_host, normalize_host};
 use crate::rules::RuleInput;
 use crate::sanitize::{self, EventInput};
 use crate::sync::lock;
-use crate::system_one::SystemOneBackend;
-use crate::transport::{ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, Rejection, RejectionSlot};
+use crate::transport::{ClientIo, ClientTimers, HYPER_DEFAULT_BUFFER, RejectionSlot};
 use crate::tunnel;
 
-const DEBUG_HEADER: HeaderName = HeaderName::from_static("x-vigilant-heron");
-
-/// Marks a response whose connection must close without the response being written (`block_status 444`).
-#[derive(Debug, Clone, Copy)]
-struct CloseWithoutResponse;
-
-type ResponseBody = BoxBody<Bytes, BoxError>;
-
-/// A destination's writer with the format its lines use.
-struct Sink {
-    writer: Writer,
-    format: LogFormat,
-}
-
-/// Shared state for every connection.
-pub(crate) struct AppState {
-    router: Router,
-    /// The top-level access list, used for requests that match no site.
-    access: Vec<AccessEntry>,
-    sites: Vec<SiteConfig>,
-    /// Upstream client of each site, in site order.
-    proxies: Vec<Proxy>,
-    /// Bytes of the request body read for the decision.
-    inspect_body_bytes: usize,
-    /// Header names dropped before the event is sent to the backend.
-    backend_redact: Vec<String>,
-    /// Body field names redacted before the event is sent to the backend (`redact_field`).
-    backend_redact_fields: Vec<String>,
-    /// Whether multipart file content is replaced before the event is sent (`redact_file_parts`).
-    backend_redact_file_parts: bool,
-    /// The decision slots shared by all calls, and the `max_concurrency` they were built with.
-    slots: Arc<Semaphore>,
-    slots_limit: usize,
-    /// Decision calls in flight per client address (`max_concurrency_per_client`).
-    client_slots: Arc<ClientSlots>,
-    backend: Backend,
-    default_status: StatusCode,
-    realip: RealIp,
-    request_id_header: Option<HeaderName>,
-    /// Access logs of each site, in site order.
-    site_sinks: Vec<Vec<Sink>>,
-    /// Access logs of requests that match no site, and of connections closed by the transport.
-    global_sinks: Vec<Sink>,
-    /// Runtime state of the `limit_req_zone` and `limit_conn_zone` zones, in definition order.
-    zones: Vec<Arc<ZoneStore>>,
-    /// The limits of requests that match no site.
-    top_limits: LimitSet,
-}
-
-impl AppState {
-    /// Builds the state of `config`. A reload (`previous` is the state it replaces)
-    /// keeps the decision slots while `max_concurrency` is unchanged, and the
-    /// per-client table while `max_concurrency_per_client` is unchanged, so calls
-    /// admitted before the reload still count against the limits. Zones named like a
-    /// zone of `previous`, with the same size, keep their counts.
-    fn from_config(config: Config, previous: Option<&Self>) -> Result<Self, ServeError> {
-        let client = decision_client()?;
-        let url = config.decision.url.clone();
-        let (slots, client_slots) = decision_slots(&config, previous);
-        let previous_zones = previous.map_or(&[][..], |old| old.zones.as_slice());
-        let limits = Limits {
-            timeout: config.decision.timeout,
-            queue_timeout: config.decision.queue_timeout,
-            slots: Arc::clone(&slots),
-        };
-        let backend =
-            match &config.decision.backend {
-                BackendConfig::Http => Backend::Http(HttpDecisionBackend::new(client, url, limits)),
-                BackendConfig::Clef { model, token } => Backend::SystemOne(SystemOneBackend::new(
-                    client,
-                    url,
-                    model.as_str().to_owned(),
-                    Some(token.clone()),
-                    limits,
-                )),
-                BackendConfig::Jev { model, token } => Backend::SystemOne(SystemOneBackend::new(
-                    client,
-                    url,
-                    model.clone(),
-                    Some(token.clone()),
-                    limits,
-                )),
-                BackendConfig::Strands { model, token } => Backend::SystemOne(
-                    SystemOneBackend::new(client, url, model.clone(), token.clone(), limits),
-                ),
-            };
-        // The request-id header identifies the request to the log only.
-        let mut backend_redact = config.decision.redact_headers.clone();
-        if let Some(name) = &config.request_id_header {
-            backend_redact.push(name.as_str().to_owned());
-        }
-        let mut writers: HashMap<String, Writer> = HashMap::new();
-        let mut sinks_for = |logs: &[AccessLogConfig]| -> Vec<Sink> {
-            logs.iter()
-                .map(|log| {
-                    let writer = writers
-                        .entry(log.destination.label())
-                        .or_insert_with(|| spawn_writer(log.destination.clone()))
-                        .clone();
-                    Sink {
-                        writer,
-                        format: log.format.clone(),
-                    }
-                })
-                .collect()
-        };
-        let global_sinks = sinks_for(&config.access_logs);
-        let site_sinks = config
-            .sites
-            .iter()
-            .map(|site| {
-                let logs = site.access_logs.as_deref().unwrap_or(&config.access_logs);
-                sinks_for(logs)
-            })
-            .collect();
-        let proxies = config
-            .sites
-            .iter()
-            .map(|site| Proxy::new(&site.timeouts))
-            .collect();
-        Ok(Self {
-            router: Router::new(&config.sites),
-            access: config.access,
-            sites: config.sites,
-            proxies,
-            inspect_body_bytes: config.decision.inspect_body_bytes,
-            backend_redact,
-            backend_redact_fields: config.decision.redact_fields.clone(),
-            backend_redact_file_parts: config.decision.redact_file_parts,
-            slots,
-            slots_limit: config.decision.max_concurrency,
-            client_slots,
-            backend,
-            default_status: config.default_status,
-            realip: config.realip,
-            request_id_header: config.request_id_header,
-            site_sinks,
-            global_sinks,
-            zones: config
-                .zones
-                .into_iter()
-                .map(|zone| {
-                    let shared = previous_zones.iter().find(|old| {
-                        old.name() == zone.name.as_str() && old.capacity() == zone.capacity
-                    });
-                    Arc::new(match shared {
-                        Some(old) => ZoneStore::sharing(zone, old),
-                        None => ZoneStore::new(zone),
-                    })
-                })
-                .collect(),
-            top_limits: config.limits,
-        })
-    }
-}
-
-/// The decision slots of a state built from `config`. A reload reuses the previous
-/// slots of each limit whose value is unchanged, so calls in flight still count.
-fn decision_slots(
-    config: &Config,
-    previous: Option<&AppState>,
-) -> (Arc<Semaphore>, Arc<ClientSlots>) {
-    let slots = match previous {
-        Some(old) if old.slots_limit == config.decision.max_concurrency => Arc::clone(&old.slots),
-        _ => Arc::new(Semaphore::new(config.decision.max_concurrency)),
-    };
-    let client_slots = match previous {
-        Some(old) if old.client_slots.limit() == config.decision.max_concurrency_per_client => {
-            Arc::clone(&old.client_slots)
-        }
-        _ => ClientSlots::new(config.decision.max_concurrency_per_client),
-    };
-    (slots, client_slots)
-}
-
-/// Connection settings that stay the same for the whole run: a reload does not change them.
-#[derive(Debug, Clone, Copy)]
-struct ConnectionSettings {
-    /// Connection timers and header limits.
-    timers: ClientTimers,
-    /// Requests per connection before it is closed.
-    keepalive_requests: usize,
-}
-
-/// The settings that a reload cannot change. A reload that changes one logs a warning.
-struct Startup {
-    pid_file: std::path::PathBuf,
-    listen: String,
-    worker_threads: Option<usize>,
-    max_connections: usize,
-    worker_shutdown_timeout: Option<Duration>,
-    connection: ConnectionConfig,
-}
-
-impl Startup {
-    fn of(config: &Config) -> Self {
-        Self {
-            pid_file: config.pid_file.clone(),
-            listen: config.listen.clone(),
-            worker_threads: config.worker_threads,
-            max_connections: config.max_connections,
-            worker_shutdown_timeout: config.worker_shutdown_timeout,
-            connection: config.connection.clone(),
-        }
-    }
-
-    /// Warns about each setting of `config` that differs from the startup value.
-    fn report_changes(&self, config: &Config) {
-        if config.pid_file != self.pid_file {
-            tracing::warn!(path = %config.pid_file.display(), "pid changed; a restart is needed for it to take effect");
-        }
-        if config.listen != self.listen {
-            tracing::warn!(listen = %config.listen, "listen changed; a restart is needed for it to take effect");
-        }
-        if config.worker_threads != self.worker_threads {
-            tracing::warn!("worker_threads changed; a restart is needed for it to take effect");
-        }
-        if config.max_connections != self.max_connections {
-            tracing::warn!("max_connections changed; a restart is needed for it to take effect");
-        }
-        if config.worker_shutdown_timeout != self.worker_shutdown_timeout {
-            tracing::warn!(
-                "worker_shutdown_timeout changed; a restart is needed for it to take effect"
-            );
-        }
-        if config.connection != self.connection {
-            tracing::warn!(
-                "connection timers and header limits changed; a restart is needed for them to take effect"
-            );
-        }
-    }
-}
+use record::{latency, raw_host, reject, verdict_fields, write_access, write_rejection};
+use reload::{Startup, next_reload, reload};
+use respond::{
+    CloseWithoutResponse, Delivery, ResponseBody, add_debug_header, body_failure, empty_answer,
+    respond,
+};
+use state::{AppState, ConnectionSettings};
 
 /// Where a reload gets its configuration: a function that reads and validates it.
 type Loader = Box<dyn Fn() -> Result<Config, ConfigError> + Send>;
@@ -443,44 +212,6 @@ async fn drain(connections: &mut JoinSet<()>, open: &mut mpsc::Receiver<()>) {
     while connections.join_next().await.is_some() {}
     // Nothing is ever sent, so this returns once every sender is dropped.
     let _ = open.recv().await;
-}
-
-/// Waits for the next reload request. Without a reload source it never completes,
-/// and a closed source ends the wait for good.
-async fn next_reload(requests: &mut Option<mpsc::Receiver<()>>) -> Option<()> {
-    match requests {
-        Some(requests) => requests.recv().await,
-        None => std::future::pending().await,
-    }
-}
-
-/// Builds the state of a new configuration and publishes it to new requests. A
-/// failure is logged and leaves the current state in place.
-fn reload(
-    load: &dyn Fn() -> Result<Config, ConfigError>,
-    applied: &dyn Fn(&Config),
-    startup: &Startup,
-    current: &watch::Sender<Arc<AppState>>,
-) {
-    let config = match load() {
-        Ok(config) => config,
-        Err(error) => {
-            tracing::error!(%error, "configuration reload failed; keeping the previous configuration");
-            return;
-        }
-    };
-    startup.report_changes(&config);
-    let previous = current.borrow().clone();
-    match AppState::from_config(config.clone(), Some(previous.as_ref())) {
-        Ok(state) => {
-            current.send_replace(Arc::new(state));
-            applied(&config);
-            tracing::info!("configuration reloaded");
-        }
-        Err(error) => {
-            tracing::error!(%error, "configuration reload failed; keeping the previous configuration");
-        }
-    }
 }
 
 /// State of one connection that its requests share.
@@ -913,242 +644,6 @@ async fn pipeline(
     response
 }
 
-/// What a request was answered with, for the access log.
-struct Outcome {
-    response: Response<ResponseBody>,
-    /// Status the upstream answered with, when it answered.
-    upstream_status: Option<u16>,
-    /// Why the upstream gave no response.
-    upstream_error: Option<&'static str>,
-    /// Set when the request body caused the answer, which then replaces the decision's reason.
-    rejected: Option<&'static str>,
-}
-
-impl Outcome {
-    fn answered(response: Response<ResponseBody>) -> Self {
-        Self {
-            response,
-            upstream_status: None,
-            upstream_error: None,
-            rejected: None,
-        }
-    }
-}
-
-fn latency(started: Instant) -> u64 {
-    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Queues one line per destination. A destination whose queue is full drops the line.
-fn write_access(sinks: &[Sink], record: &AccessRecord<'_>, headers: &HeaderMap) {
-    for sink in sinks {
-        sink.writer.send(sink.format.render(record, headers));
-    }
-}
-
-/// Adds `Connection: close` to a response that ends the connection.
-fn close(response: &mut Response<ResponseBody>) {
-    response
-        .headers_mut()
-        .insert(CONNECTION, HeaderValue::from_static("close"));
-}
-
-/// Where an allowed request is forwarded, and what a block answers with.
-struct Delivery<'a> {
-    /// The upstream client of the site.
-    proxy: &'a Proxy,
-    /// The shutdown bookkeeping of the connection, held by a tunnel that the request starts.
-    tunnels: &'a tunnel::Lifetime,
-    /// The site's upstream URI.
-    upstream: &'a http::Uri,
-    /// The `proxy_set_header` operations of the level in effect.
-    headers: &'a [HeaderOp],
-    /// The block response of the level in effect.
-    block: &'a BlockResponse,
-    /// The values `proxy_set_header` values may use.
-    ctx: HeaderContext<'a>,
-    /// Whether an Upgrade request is tunnelled (`proxy_websocket on`).
-    websocket: bool,
-    /// The client connection's upgrade, which the tunnel takes when the upstream switches protocols.
-    client_upgrade: &'a Mutex<Option<OnUpgrade>>,
-    /// The phase of the client connection, which a started tunnel moves to tunnelling.
-    phase: &'a PhaseCell,
-}
-
-/// Forwards an allowed request, or answers a block or redirect.
-///
-/// When the request body was not read in full, the response closes the
-/// connection, because the rest of the body would otherwise be read as the next
-/// request.
-async fn respond(
-    delivery: &Delivery<'_>,
-    parts: &Parts,
-    body: ClientBody,
-    peer: SocketAddr,
-    decision: &Decision,
-    held: &mut Vec<ConnPermit>,
-) -> Outcome {
-    let complete = body.is_complete();
-    let block = delivery.block;
-    match &decision.action {
-        Action::Allow => {
-            let path_and_query = parts
-                .uri
-                .path_and_query()
-                .map_or("/", |value| value.as_str());
-            // An Upgrade request keeps its Upgrade and Connection headers only when the site tunnels them.
-            let upgrade = if delivery.websocket {
-                upgrade_request(&parts.headers)
-            } else {
-                None
-            };
-            let mut headers =
-                upstream_headers(&parts.headers, peer.ip(), delivery.headers, &delivery.ctx);
-            if let Some(protocol) = &upgrade {
-                headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
-                headers.insert(UPGRADE, protocol.clone());
-            }
-            match delivery
-                .proxy
-                .forward(
-                    parts.method.clone(),
-                    headers,
-                    path_and_query,
-                    body,
-                    delivery.upstream,
-                )
-                .await
-            {
-                Ok(mut upstream) => {
-                    let status = upstream.status().as_u16();
-                    // A 101 answer to an Upgrade request starts a tunnel; its headers are kept.
-                    let switching = upgrade.is_some() && status == 101;
-                    let client_upgrade = if switching {
-                        lock(delivery.client_upgrade).take()
-                    } else {
-                        None
-                    };
-                    let upstream_upgrade = client_upgrade
-                        .as_ref()
-                        .map(|_| hyper::upgrade::on(&mut upstream));
-                    let tunnel = upstream_upgrade.is_some();
-                    let (mut upstream_parts, upstream_body) = upstream.into_parts();
-                    if !tunnel {
-                        crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
-                    }
-                    if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
-                        // From here on the client connection carries tunnel bytes, not requests,
-                        // and no response is written to it.
-                        delivery.phase.set(Phase::Tunnelling);
-                        tunnel::spawn(
-                            client,
-                            upstream,
-                            delivery.proxy.read_timeout(),
-                            std::mem::take(held),
-                            delivery.tunnels.clone(),
-                        );
-                    }
-                    Outcome {
-                        response: Response::from_parts(upstream_parts, upstream_body.boxed()),
-                        upstream_status: Some(status),
-                        upstream_error: None,
-                        rejected: None,
-                    }
-                }
-                Err(error) => {
-                    let mut outcome = failure(&error, complete);
-                    outcome.response = with_request_id(outcome.response, delivery.ctx.request_id);
-                    outcome
-                }
-            }
-        }
-        Action::Block => block_outcome(block, delivery.ctx.request_id, complete),
-        Action::Reject(status) => {
-            let mut response = empty_answer(*status, delivery.ctx.request_id);
-            if !complete {
-                close(&mut response);
-            }
-            Outcome::answered(response)
-        }
-        Action::Redirect(location) => {
-            let mut response = empty_answer(StatusCode::FOUND, delivery.ctx.request_id);
-            response.headers_mut().insert(LOCATION, location.clone());
-            if !complete {
-                close(&mut response);
-            }
-            Outcome::answered(response)
-        }
-    }
-}
-
-/// The answer to a block: the block response, or a 444 that closes the connection without one.
-fn block_outcome(block: &BlockResponse, request_id: &str, complete: bool) -> Outcome {
-    let mut response = match block.status {
-        BlockStatus::Respond(status) => block_response(status, block.page.as_ref(), request_id),
-        BlockStatus::Close => {
-            // The status is only logged: the connection closes without writing it.
-            let mut response = status_response(close_status(), "");
-            response.extensions_mut().insert(CloseWithoutResponse);
-            response
-        }
-    };
-    if !complete {
-        close(&mut response);
-    }
-    Outcome::answered(response)
-}
-
-/// Maps a failed forward to the status nginx would send. Upstream timeouts are 504,
-/// connection errors 502, and a client body that failed answers 413, 408 or 400.
-fn failure(error: &ProxyError, complete: bool) -> Outcome {
-    let (status, upstream_error, rejected) = match error {
-        ProxyError::Target(_) | ProxyError::Request(_) => {
-            (StatusCode::BAD_GATEWAY, Some("upstream_failed"), None)
-        }
-        ProxyError::Connect(_) => (StatusCode::BAD_GATEWAY, Some("connect_failed"), None),
-        ProxyError::ReadTimeout => (StatusCode::GATEWAY_TIMEOUT, Some("read_timeout"), None),
-        ProxyError::ConnectTimeout => (StatusCode::GATEWAY_TIMEOUT, Some("connect_timeout"), None),
-        ProxyError::SendTimeout(_) => (StatusCode::GATEWAY_TIMEOUT, Some("send_timeout"), None),
-        ProxyError::Body(BodyFault::TooLarge) => {
-            (StatusCode::PAYLOAD_TOO_LARGE, None, Some("body_too_large"))
-        }
-        ProxyError::Body(BodyFault::TimedOut) => {
-            (StatusCode::REQUEST_TIMEOUT, None, Some("body_timeout"))
-        }
-        ProxyError::Body(BodyFault::Failed) => {
-            (StatusCode::BAD_REQUEST, None, Some("unreadable_body"))
-        }
-    };
-    let mut response = status_response(status, "");
-    // A request body that did not arrive in full cannot be followed by another request.
-    if !complete || rejected.is_some() {
-        close(&mut response);
-    }
-    Outcome {
-        response,
-        upstream_status: None,
-        upstream_error,
-        rejected,
-    }
-}
-
-/// The status and reason for a request body that could not be read.
-fn body_failure(
-    error: &(dyn std::error::Error + Send + Sync + 'static),
-) -> (StatusCode, &'static str) {
-    if error.downcast_ref::<BodyTooLarge>().is_some() {
-        return (StatusCode::PAYLOAD_TOO_LARGE, "body_too_large");
-    }
-    let timed_out = error
-        .downcast_ref::<std::io::Error>()
-        .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut);
-    if timed_out {
-        (StatusCode::REQUEST_TIMEOUT, "body_timeout")
-    } else {
-        (StatusCode::BAD_REQUEST, "unreadable_body")
-    }
-}
-
 async fn assess(
     state: &AppState,
     parts: &Parts,
@@ -1236,21 +731,6 @@ fn request_id_for(state: &AppState, headers: &HeaderMap) -> String {
         .unwrap_or_else(request_id::generate)
 }
 
-/// An answer without a body, with the given status and the request id.
-fn empty_answer(status: StatusCode, request_id: &str) -> Response<ResponseBody> {
-    with_request_id(status_response(status, ""), request_id)
-}
-
-/// Adds the `X-Request-ID` header to a response the router generated itself.
-fn with_request_id(mut response: Response<ResponseBody>, id: &str) -> Response<ResponseBody> {
-    if let Ok(value) = HeaderValue::from_str(id) {
-        response
-            .headers_mut()
-            .insert(request_id::RESPONSE_HEADER, value);
-    }
-    response
-}
-
 /// The value of a valid `Content-Length` header.
 pub(crate) fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
@@ -1264,194 +744,6 @@ pub(crate) fn content_length(headers: &HeaderMap) -> Option<u64> {
 
 fn site_name(site: &SiteConfig) -> &str {
     site.hosts.first().map_or("", String::as_str)
-}
-
-/// The verdict fields of an access record. Each is empty when no backend answered.
-struct VerdictFields<'a> {
-    attack: Option<f64>,
-    ai_instruction: Option<f64>,
-    category: Option<&'a str>,
-    input_tokens: Option<u64>,
-    decision_error: Option<&'a str>,
-    retry_after: Option<&'a str>,
-}
-
-fn verdict_fields(assessment: &Assessment) -> VerdictFields<'_> {
-    let mut fields = VerdictFields {
-        attack: None,
-        ai_instruction: None,
-        category: None,
-        input_tokens: None,
-        decision_error: None,
-        retry_after: None,
-    };
-    match assessment {
-        Assessment::Model(verdict) => {
-            fields.attack = Some(verdict.attack.value());
-            fields.ai_instruction = Some(verdict.ai_instruction.value());
-            fields.category = verdict.category.as_deref();
-            fields.input_tokens = verdict.input_tokens;
-        }
-        Assessment::RateLimited { cause, retry_after } => {
-            fields.decision_error = Some(cause);
-            fields.retry_after = retry_after.as_deref();
-        }
-        Assessment::ClientBusy => fields.decision_error = Some("client_busy"),
-        Assessment::DecisionFailed { cause } => fields.decision_error = Some(cause),
-        Assessment::Rule | Assessment::Skip | Assessment::SkipRule | Assessment::AccessDenied => {}
-    }
-    fields
-}
-
-/// The record of a request answered before a decision. Only the status, the reason and
-/// the latency are set; a caller fills in the request fields with struct update syntax.
-fn rejection_record(status: u16, reason: &str, started: Instant) -> AccessRecord<'_> {
-    AccessRecord {
-        time: SystemTime::now(),
-        request_id: None,
-        client_ip: "",
-        remote_addr: "",
-        site: "",
-        host: "",
-        method: "",
-        path: "",
-        query: None,
-        block_query: None,
-        status,
-        action: "reject",
-        reason,
-        rule_id: "",
-        would_have: None,
-        attack: None,
-        ai_instruction: None,
-        category: None,
-        decision_error: None,
-        retry_after: None,
-        input_tokens: None,
-        upstream_status: None,
-        upstream_error: None,
-        latency_ms: latency(started),
-        limit_req_status: None,
-        limit_conn_status: None,
-    }
-}
-
-/// The `Host` header as sent, or an empty string when it is missing or not text.
-fn raw_host(parts: &Parts) -> &str {
-    parts
-        .headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-}
-
-/// Answers a request that never reached a decision, and logs it as a rejection.
-///
-/// `closing` adds `Connection: close`, for a request whose body was not read in full.
-fn reject(
-    parts: &Parts,
-    trace: &Trace<'_>,
-    site: &str,
-    status: StatusCode,
-    reason: &str,
-    sinks: &[Sink],
-    closing: bool,
-) -> Response<ResponseBody> {
-    let record = AccessRecord {
-        request_id: Some(trace.request_id),
-        client_ip: trace.client_ip,
-        remote_addr: trace.remote_addr,
-        site,
-        host: raw_host(parts),
-        method: parts.method.as_str(),
-        path: parts.uri.path(),
-        query: parts.uri.query(),
-        limit_req_status: *lock(&trace.limit_req),
-        limit_conn_status: *lock(&trace.limit_conn),
-        ..rejection_record(status.as_u16(), reason, trace.started)
-    };
-    write_access(sinks, &record, &parts.headers);
-    let mut response = empty_answer(status, trace.request_id);
-    if closing {
-        close(&mut response);
-    }
-    response
-}
-
-/// Logs a response the transport sent on its own, such as a 408 or a 414.
-fn write_rejection(sinks: &[Sink], rejection: Rejection, peer: SocketAddr, started: Instant) {
-    let remote = peer.ip().to_string();
-    let record = AccessRecord {
-        client_ip: &remote,
-        remote_addr: &remote,
-        ..rejection_record(rejection.status, rejection.reason, started)
-    };
-    write_access(sinks, &record, &HeaderMap::new());
-}
-
-fn add_debug_header(headers: &mut HeaderMap, decision: &Decision) {
-    let would_have = decision.would_have.as_ref().map_or("none", Action::name);
-    let value = format!(
-        "action={}; reason={}; would_have={would_have}",
-        decision.action.name(),
-        decision.reason.name()
-    );
-    if let Ok(value) = HeaderValue::from_str(&value) {
-        headers.insert(DEBUG_HEADER, value);
-    }
-}
-
-/// The status of a 444 block, which is logged and never sent.
-fn close_status() -> StatusCode {
-    StatusCode::from_u16(444).unwrap_or(StatusCode::FORBIDDEN)
-}
-
-/// A block response: the configured page as HTML when there is one, else a plain-text line
-/// with the request id, so that the client can report the request.
-fn block_response(
-    status: StatusCode,
-    page: Option<&Bytes>,
-    request_id: &str,
-) -> Response<ResponseBody> {
-    let response = match page {
-        Some(page) => typed_response(status, page.clone(), "text/html; charset=utf-8"),
-        None => typed_response(
-            status,
-            Bytes::from(format!("Request blocked. Request ID: {request_id}\n")),
-            "text/plain; charset=utf-8",
-        ),
-    };
-    with_request_id(response, request_id)
-}
-
-fn typed_response(
-    status: StatusCode,
-    body: Bytes,
-    content_type: &'static str,
-) -> Response<ResponseBody> {
-    let mut response = Response::new(
-        Full::new(body)
-            .map_err(|never: Infallible| match never {})
-            .boxed(),
-    );
-    *response.status_mut() = status;
-    response
-        .headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response
-        .headers_mut()
-        .insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
-    response
-}
-
-fn status_response(status: StatusCode, body: &'static str) -> Response<ResponseBody> {
-    let mut response = Response::new(
-        Full::new(Bytes::from_static(body.as_bytes()))
-            .map_err(|never: Infallible| match never {})
-            .boxed(),
-    );
-    *response.status_mut() = status;
-    response
 }
 
 #[cfg(test)]
