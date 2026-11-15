@@ -37,8 +37,8 @@ src/
   lifecycle.rs   # start/stop/restart: detached child (own process group), pid-file readiness, bounded waits, no SIGKILL
   pidfile.rs     # PID file: written after bind (atomic rename), removed on drop
   lib.rs         # Public API: Config, ConfigError, serve, install_error_log
-  conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)
-  config/        # Directive tree -> validated Config; every error names file:line. mod.rs (types, load, -T dump), names.rs, value.rs (value parsers), top.rs (build: the top-level directives and the checks across sites and rules), decision.rs, site.rs, logs.rs (log directives)
+  conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles); value.rs (helpers the directive parsers share: errors with file:line, arguments and blocks, single-use check, times, sizes, numbers, on/off)
+  config/        # Directive tree -> validated Config; every error names file:line. mod.rs (types, load, -T dump), names.rs, value.rs (parsers of single directives' values), top.rs (build: the top-level directives and the checks across sites and rules), decision.rs, site.rs, logs.rs (log directives)
   realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
   accesslog/     # log_format compiler, variables, escaping, built-in json and main formats; time.rs (UTC calendar and time formatting, syslog stamp)
   logsink/       # Log destinations: access_log.rs (access-log queues, drop counts, SIGUSR1 reopen, syslog), error_log.rs (error log with reloadable level and destination)

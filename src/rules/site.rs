@@ -3,8 +3,7 @@
 use std::sync::Arc;
 
 use super::{ParsedRule, Rule, RuleAction, RuleSwitches, SiteRules};
-use crate::conf::Directive;
-use crate::config::invalid;
+use crate::conf::{Directive, invalid};
 use crate::error::ConfigError;
 
 /// Builds the rule lists of one site.

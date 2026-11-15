@@ -4,8 +4,7 @@
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 
 use super::HOP_BY_HOP;
-use crate::conf::Directive;
-use crate::config::invalid;
+use crate::conf::{Directive, invalid};
 use crate::error::ConfigError;
 
 /// One `proxy_set_header` directive: a header name and the value template it is set to.
