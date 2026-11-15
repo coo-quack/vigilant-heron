@@ -64,7 +64,8 @@ where
 
 /// The top level of the file while it is read: the settings read so far, which become the fields of
 /// [`Config`] of the same names (and the [`Top`] that every site inherits) once `finish` has
-/// resolved them, and the directives whose values `finish` reads after the whole file is known.
+/// resolved them, the single-use names and the rule ids seen so far, and the directives whose
+/// values `finish` reads after the whole file is known.
 /// An error in one directive points at that directive, and a missing required directive points at
 /// the first directive of the file.
 struct TopDraft<'a> {
@@ -176,7 +177,8 @@ impl<'a> TopDraft<'a> {
     /// directive fails before its argument is read. `log_format` is read before this, the zone
     /// and limit directives are kept for `finish`, and the lists, `allow`, `deny`, the rules, the
     /// sites and `access_log` add up. `max_body` and `include` are always refused, and `claimed`
-    /// takes the id of each `rule`.
+    /// takes the id of each `rule`. The settings of the client connection have no arm here:
+    /// `apply_connection` applies them.
     fn apply(&mut self, directive: &'a Directive) -> Result<(), ConfigError> {
         if !TOP_LEVEL_DIRECTIVES.contains(&directive.name.as_str()) {
             return Err(invalid(
@@ -266,14 +268,15 @@ impl<'a> TopDraft<'a> {
             "include" => {
                 return Err(invalid(directive, "\"include\" was not expanded"));
             }
+            // What is left are the settings of the client connection.
             _ => self.apply_connection(directive)?,
         }
         Ok(())
     }
 
-    /// Applies a directive that sets a timer or limit of the client connection. Each is
-    /// single-use, so a repeat fails before its argument is read. `apply` sends every name it has
-    /// no arm for here, so any other name is an unknown directive.
+    /// Applies a directive that sets a timer, a limit or the lingering close of the client
+    /// connection. Each is single-use, so a repeat fails before its argument is read. `apply`
+    /// sends every name it has no arm for here, so any other name is an unknown directive.
     fn apply_connection(&mut self, directive: &Directive) -> Result<(), ConfigError> {
         match directive.name.as_str() {
             "client_header_timeout" => {
@@ -340,9 +343,9 @@ impl<'a> TopDraft<'a> {
     /// variables.
     ///
     /// The checks run in this order: `listen` and `decision` are present, the decision block,
-    /// the log formats, the zones, the limits, the block response, the access logs, a `site`
-    /// is present, each site (its hosts, then `default_server`), and the sites that the top-level
-    /// rules name.
+    /// the log formats, the zones, the limits, the access logs, a `site` is present, each site
+    /// in file order (its block, then its hosts against the earlier sites, then
+    /// `default_server`), and the sites that the top-level rules name.
     fn finish<F>(
         mut self,
         directives: &[Directive],

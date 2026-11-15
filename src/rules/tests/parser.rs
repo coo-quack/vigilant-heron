@@ -100,22 +100,6 @@ fn parse_top_rule(body: &str) -> Result<ParsedRule, ConfigError> {
     "description \"d\";\naction block;\npath /x;\nsite :8080;",
     "\"site\" has an invalid host name: :8080"
 )]
-#[case::duplicate_action(
-    "description \"d\";\naction block;\naction skip;\npath /x;",
-    "duplicate directive \"action\""
-)]
-#[case::duplicate_method(
-    "description \"d\";\naction block;\nmethod GET;\nmethod POST;",
-    "duplicate directive \"method\""
-)]
-#[case::duplicate_client(
-    "description \"d\";\naction block;\nclient 10.0.0.1;\nclient 10.0.0.2;",
-    "duplicate directive \"client\""
-)]
-#[case::duplicate_site(
-    "description \"d\";\naction block;\npath /x;\nsite a.test;\nsite b.test;",
-    "duplicate directive \"site\""
-)]
 fn invalid_rule_directives_are_rejected_with_their_line(
     #[case] body: &str,
     #[case] expected: &str,
@@ -123,6 +107,40 @@ fn invalid_rule_directives_are_rejected_with_their_line(
     let error = parse_top_rule(body).err().map_or_default(|e| e.to_string());
     assert!(error.starts_with("test.conf:"), "{error}");
     assert!(error.contains(expected), "{error}");
+}
+
+// The rule is on line 1, so the first line of its body is line 2.
+#[rstest]
+#[case::action(
+    "description \"d\";\naction block;\naction skip;\npath /x;",
+    "action",
+    4
+)]
+#[case::method(
+    "description \"d\";\naction block;\nmethod GET;\nmethod POST;",
+    "method",
+    5
+)]
+#[case::client(
+    "description \"d\";\naction block;\nclient 10.0.0.1;\nclient 10.0.0.2;",
+    "client",
+    5
+)]
+#[case::site(
+    "description \"d\";\naction block;\npath /x;\nsite a.test;\nsite b.test;",
+    "site",
+    6
+)]
+fn a_single_use_rule_directive_written_twice_is_rejected_at_the_second_one(
+    #[case] body: &str,
+    #[case] name: &str,
+    #[case] line: usize,
+) {
+    let error = parse_top_rule(body).err().map_or_default(|e| e.to_string());
+    assert_eq!(
+        error,
+        format!("test.conf:{line}: duplicate directive \"{name}\"")
+    );
 }
 
 #[test]
