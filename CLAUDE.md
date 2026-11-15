@@ -55,7 +55,7 @@ src/
   skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
   log_lines.rs   # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
   shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
-  sanitize.rs    # Backend event: header drop, body redaction, truncation
+  sanitize/      # Backend event and its truncation; keys (sensitive names, header drop), query and body redaction (multipart, lexical)
   decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
   system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
