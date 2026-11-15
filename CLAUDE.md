@@ -40,8 +40,8 @@ src/
   conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)
   config.rs      # Directive tree -> validated Config; every error names file:line
   realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
-  accesslog.rs   # log_format compiler, variables, escaping, built-in json and main formats
-  logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog; error log with reloadable level and destination
+  accesslog/     # log_format compiler, variables, escaping, built-in json and main formats; time.rs (UTC calendar and time formatting, syslog stamp)
+  logsink/       # Log destinations: access_log.rs (access-log queues, drop counts, SIGUSR1 reopen, syslog), error_log.rs (error log with reloadable level and destination)
   router.rs      # Host normalization and site lookup: exact, leading and trailing wildcards, ~regex, default_server
   block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
