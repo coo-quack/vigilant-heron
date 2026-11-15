@@ -96,6 +96,26 @@ fn parse_top_rule(body: &str) -> Result<ParsedRule, ConfigError> {
     "description \"d\";\naction block;\npath /x;\nsite;",
     "site\" needs at least one host name"
 )]
+#[case::site_with_an_invalid_host(
+    "description \"d\";\naction block;\npath /x;\nsite :8080;",
+    "\"site\" has an invalid host name: :8080"
+)]
+#[case::duplicate_action(
+    "description \"d\";\naction block;\naction skip;\npath /x;",
+    "duplicate directive \"action\""
+)]
+#[case::duplicate_method(
+    "description \"d\";\naction block;\nmethod GET;\nmethod POST;",
+    "duplicate directive \"method\""
+)]
+#[case::duplicate_client(
+    "description \"d\";\naction block;\nclient 10.0.0.1;\nclient 10.0.0.2;",
+    "duplicate directive \"client\""
+)]
+#[case::duplicate_site(
+    "description \"d\";\naction block;\npath /x;\nsite a.test;\nsite b.test;",
+    "duplicate directive \"site\""
+)]
 fn invalid_rule_directives_are_rejected_with_their_line(
     #[case] body: &str,
     #[case] expected: &str,
