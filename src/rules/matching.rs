@@ -12,7 +12,7 @@ use http::{HeaderMap, HeaderName, Method};
 use regex::RegexBuilder;
 
 use super::Rule;
-use crate::prefilter::percent_decode_lossy;
+use crate::prefilter::decode_twice;
 use crate::realip::IpNet;
 
 /// Longest regex source, in bytes.
@@ -88,13 +88,6 @@ impl PathMatch {
             Self::Regex(pattern) => pattern.is_match(path),
         }
     }
-}
-
-/// Decodes percent escapes at most twice, so double encoding is undone too, and drops NUL bytes.
-fn decode_twice(raw: &str) -> String {
-    let once = percent_decode_lossy(raw);
-    let twice = percent_decode_lossy(&once);
-    twice.replace('\0', "")
 }
 
 /// Normalizes a query string or form body: `+` becomes a space, then [`decode_twice`].
