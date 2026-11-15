@@ -1,9 +1,9 @@
 //! The log directives: `error_log`, `log_format` and `access_log`.
 
 use super::{AccessLogConfig, Destination, ErrorLogConfig, LogLevel};
-use crate::accesslog::{Escape, LogFormat};
 use crate::conf::{Directive, invalid};
 use crate::error::ConfigError;
+use crate::logging::accesslog::{Escape, LogFormat};
 
 pub(crate) fn parse_error_log(directive: &Directive) -> Result<ErrorLogConfig, ConfigError> {
     let (destination_text, level_text) = match directive.args.as_slice() {

@@ -102,7 +102,7 @@ cargo mutants --in-diff pr.diff
 To run it on one file:
 
 ```bash
-cargo mutants --file src/skip_suggest.rs
+cargo mutants --file src/tooling/skip_suggest.rs
 ```
 
 A full run takes hours, so run it for the code you are changing. Its output is

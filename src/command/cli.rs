@@ -14,8 +14,8 @@ use rustix::process::{Pid, Signal, kill_process};
 
 use vigilant_heron::{ShadowOptions, SuggestOptions};
 
-use crate::pidfile;
-use crate::request_url::UrlRequest;
+use crate::command::pidfile;
+use crate::command::request_url::UrlRequest;
 
 /// What `-s` asks the running router to do, as nginx's `-s` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

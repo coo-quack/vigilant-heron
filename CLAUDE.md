@@ -12,7 +12,7 @@ Shadow mode records what it would have done without blocking.
 
 - Rust (toolchain pinned in `rust-toolchain.toml`, edition 2024)
 - tokio, hyper 1, hyper-util (server and pooled client)
-- serde, toml, serde_json; thiserror in the library, anyhow only in the binary (`main.rs` and its modules `cli.rs` and `lifecycle.rs`)
+- serde, toml, serde_json; thiserror in the library, anyhow only in the binary (`main.rs` and its modules `command/cli.rs` and `command/lifecycle.rs`)
 - Tests: built-in harness, rstest, proptest; e2e with Docker Compose
 
 ## Commands
@@ -33,15 +33,18 @@ Shadow mode records what it would have done without blocking.
 ```
 src/
   main.rs        # Entry point: runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen, SIGTERM/SIGINT/SIGQUIT graceful stop, signal handlers registered before the pid file
-  cli.rs         # Options (-h -v -c -t -T -s, start/stop/restart words), usage text, -s signals through rustix via the pid file
-  lifecycle.rs   # start/stop/restart: detached child (own process group), pid-file readiness, bounded waits, no SIGKILL
-  pidfile.rs     # PID file: written after bind (atomic rename), removed on drop
+  command/       # The modules of the binary, declared by main.rs only (mod.rs)
+  command/cli.rs # Options (-h -v -c -t -T -s, start/stop/restart words), usage text, -s signals through rustix via the pid file
+  command/lifecycle.rs # start/stop/restart: detached child (own process group), pid-file readiness, bounded waits, no SIGKILL
+  command/pidfile.rs # PID file: written after bind (atomic rename), removed on drop
+  command/request_url.rs # test-request --url: builds the raw request from a URL, --host, --method and --header
   lib.rs         # Public API: Config, ConfigError, serve, install_error_log
   conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles); value.rs (helpers the directive parsers share: errors with file:line, arguments and blocks, single-use check, times, sizes, numbers, on/off)
   config/        # Directive tree -> validated Config; every error names file:line. mod.rs (types, load, -T dump), names.rs, value.rs (parsers of single directives' values), top.rs (build: the top-level directives and the checks across sites and rules), decision.rs, site.rs, logs.rs (log directives)
   realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
-  accesslog/     # log_format compiler, variables, escaping, built-in json and main formats; time.rs (UTC calendar and time formatting, syslog stamp)
-  logsink/       # Log destinations: access_log.rs (access-log queues, drop counts, SIGUSR1 reopen, syslog), error_log.rs (error log with reloadable level and destination)
+  logging/       # The log writers (mod.rs)
+  logging/accesslog/ # log_format compiler, variables, escaping, built-in json and main formats; time.rs (UTC calendar and time formatting, syslog stamp)
+  logging/logsink/ # Log destinations: access_log.rs (access-log queues, drop counts, SIGUSR1 reopen, syslog), error_log.rs (error log with reloadable level and destination)
   router.rs      # Host normalization and site lookup: exact, leading and trailing wildcards, ~regex, default_server
   block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
@@ -49,12 +52,12 @@ src/
   rules/         # Rules: types (mod.rs), parse.rs (rule block parser, id registry), builtin.rs (builtin.conf), site.rs (site lists, switches), matching.rs (matching, normalization)
   rules/tests/   # Unit tests by section: parser.rs, builtin.rs (examples table), matching.rs (with proptests), opt_in.rs; shared helpers in mod.rs
   prefilter/     # Screening order (mod.rs): deny_path, block rules, skip rules, static skip; paths.rs (path views, normalization, decode_twice), static_skip.rs (static asset skip)
-  request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  tooling/       # What the command-line tools run (mod.rs)
+  tooling/request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  tooling/skip_suggest.rs # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
+  tooling/log_lines.rs # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
+  tooling/shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
   request_id.rs  # Request ids: the request-id header value or a generated id, and the X-Request-ID response header
-  request_url.rs # test-request --url: builds the raw request from a URL, --host, --method and --header
-  skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
-  log_lines.rs   # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
-  shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
   backend/       # The decision backends: mod.rs (Backend enum with decide, the configured backend)
   backend/sanitize/ # Backend event and its truncation; keys (sensitive names, header drop), query and body redaction (multipart, lexical)
   backend/decision/ # Shared HTTPS transport and limits, HTTP backend (mod.rs); slots.rs (ClientSlots, the per-client cap on calls in flight)

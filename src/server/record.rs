@@ -8,7 +8,7 @@ use http::header::HOST;
 use http::request::Parts;
 use http::{HeaderMap, Response, StatusCode};
 
-use crate::accesslog::AccessRecord;
+use crate::logging::accesslog::AccessRecord;
 use crate::policy::Assessment;
 use crate::sync::lock;
 use crate::transport::Rejection;

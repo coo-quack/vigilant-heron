@@ -15,7 +15,9 @@ use std::io::{self, BufRead};
 
 use serde_json::Value;
 
-use crate::log_lines::{Line, for_each_line, is_block, number_field, object_line, text_field};
+use crate::tooling::log_lines::{
+    Line, for_each_line, is_block, number_field, object_line, text_field,
+};
 
 /// The filter and thresholds of one run. The defaults are the thresholds that the documentation states.
 #[derive(Debug, Clone, PartialEq)]

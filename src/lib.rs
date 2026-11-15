@@ -12,7 +12,6 @@
 //! listener that the caller binds.
 
 mod access;
-mod accesslog;
 mod backend;
 mod block;
 mod body;
@@ -21,27 +20,23 @@ mod config;
 mod error;
 mod finish;
 mod limits;
-mod log_lines;
-mod logsink;
+mod logging;
 mod phase;
 mod policy;
 mod prefilter;
 mod proxy;
 mod realip;
-mod request_check;
 mod request_id;
 mod router;
 mod rules;
 mod server;
-mod shadow_report;
-mod skip_suggest;
 mod sync;
 #[cfg(test)]
 mod test_support;
+mod tooling;
 mod transport;
 mod tunnel;
 
-pub use accesslog::LogFormat;
 pub use backend::system_one::{ApiToken, ClefModel};
 pub use block::{BlockResponse, BlockStatus};
 pub use config::{
@@ -50,12 +45,15 @@ pub use config::{
     ProcessSettings, SiteAction, SiteConfig, SiteTimeouts, dump_configuration, process_settings,
 };
 pub use error::{ConfigError, ServeError};
-pub use logsink::{ErrorLogHandle, install_error_log};
+pub use logging::accesslog::LogFormat;
+pub use logging::logsink::{ErrorLogHandle, install_error_log};
 pub use realip::{IpNet, RealIp};
-pub use request_check::{CheckError, Outcome, RequestCheck, check_request, check_request_with};
 pub use server::{serve, serve_reloadable};
-pub use shadow_report::{ShadowOptions, ShadowReport};
-pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
+pub use tooling::request_check::{
+    CheckError, Outcome, RequestCheck, check_request, check_request_with,
+};
+pub use tooling::shadow_report::{ShadowOptions, ShadowReport};
+pub use tooling::skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
 
 /// The directive names the configuration builder accepts, read by the documentation drift
 /// check in `tests/docs.rs`.

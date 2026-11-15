@@ -21,12 +21,12 @@ use std::time::Duration;
 use http::{HeaderName, HeaderValue, StatusCode, Uri};
 
 use crate::access::AccessEntry;
-use crate::accesslog::LogFormat;
 use crate::backend::system_one::{ApiToken, ClefModel};
 use crate::block::BlockResponse;
 use crate::conf::{self, Directive, one_arg, parse_positive_time};
 use crate::error::ConfigError;
 use crate::limits::{LimitSet, LimitZone, LocationConfig};
+use crate::logging::accesslog::LogFormat;
 use crate::proxy::HeaderOp;
 use crate::realip::RealIp;
 use crate::router::HostPattern;

@@ -3,8 +3,8 @@
 use super::*;
 use crate::backend::decision::{Limits, decision_client, post_json};
 use crate::error::{DecisionError, ProbabilityError};
-use crate::log_lines::MAX_LINE_BYTES;
 use crate::test_support::{EndsOnce, FailingReader};
+use crate::tooling::log_lines::MAX_LINE_BYTES;
 use rstest::rstest;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
