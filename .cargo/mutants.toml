@@ -36,7 +36,7 @@ exclude_re = [
     # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
     # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
     # `HYPER_DEFAULT_BUFFER` copies). This stops holding if hyper changes that default.
-    'src/server\.rs:518:35: replace > with >= in serve_connection$',
+    'src/server\.rs:519:35: replace > with >= in serve_connection$',
     # `HttpConnector::poll_ready` returns `Ready(Ok(()))` for the default resolver
     # (hyper-util 0.1.21, `GaiResolver`), which is what the mutant returns.
     'UpstreamConnector>::poll_ready .* with Poll::from\(Ok\(\(\)\)\)$',

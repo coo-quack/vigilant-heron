@@ -392,7 +392,6 @@ pub fn install_error_log(config: &ErrorLogConfig) -> Result<ErrorLogHandle, Conf
             .with_ansi(false)
             .with_writer(SharedSink(Arc::clone(&sink))),
     );
-    // Only the first installation takes effect.
     let _ = tracing::subscriber::set_global_default(subscriber);
     let handle = ErrorLogHandle {
         sink,

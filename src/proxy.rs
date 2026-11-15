@@ -275,7 +275,7 @@ impl HeaderOp {
         })
     }
 
-    /// The value for one request. An empty value removes the header.
+    /// The value for one request.
     fn render(&self, ctx: &HeaderContext<'_>) -> String {
         let mut value = String::new();
         for part in &self.template {

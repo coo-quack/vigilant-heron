@@ -11,7 +11,7 @@ use serde_json::Value;
 pub(crate) const REDACTED: &str = "[REDACTED]";
 
 /// Credential headers dropped by name. Other headers are dropped when their name is
-/// sensitive under [`is_sensitive_key`], so `x-csrf-token` and `x-session-id` are dropped too.
+/// sensitive under [`is_sensitive_header`], so `x-csrf-token` and `x-session-id` are dropped too.
 const DROPPED_HEADERS: [&str; 5] = [
     "cookie",
     "authorization",
@@ -62,9 +62,9 @@ const SENSITIVE_WORDS: [&str; 12] = [
 ];
 
 /// Whole words that mark a header name as sensitive, as in `x-cas-ticket` and
-/// `x-authentication`. They are checked only for header names: `ticket` is a common
-/// body field (support tickets, `ticket_ref`), so body and query fields keep it visible.
-/// Whole-word matching keeps `authenticated` and `authenticator-id` visible.
+/// `x-authentication`. `ticket` is a common body field (support tickets, `ticket_ref`),
+/// so body and query fields keep it visible. Whole-word matching keeps `authenticated`
+/// and `authenticator-id` visible.
 const SENSITIVE_HEADER_WORDS: [&str; 2] = ["ticket", "authentication"];
 
 /// Header names that end in `key` but are not credentials. `Sec-WebSocket-Key` is the
@@ -337,7 +337,7 @@ pub(crate) fn is_sensitive_key(key: &str) -> bool {
 /// Returns true when a header name is sensitive: by [`is_sensitive_key`], by one of
 /// [`SENSITIVE_HEADER_WORDS`] as a word, or by a last word in [`SENSITIVE_HEADER_KEY_WORDS`]
 /// (except the [`KEY_HEADER_EXEMPTIONS`]). A header such as `x-limit-key` is dropped by the
-/// last rule. Body and query fields are not checked against these two header rules.
+/// last rule.
 pub(crate) fn is_sensitive_header(name: &str) -> bool {
     if is_sensitive_key(name) {
         return true;
@@ -864,11 +864,10 @@ fn redact_json_like(text: &str, redact_fields: &[String]) -> String {
         let value_stop = value_end(&chars, value_start);
         if sensitive {
             let value_is_string = chars.get(value_start) == Some(&'"');
-            out.push_str(if value_is_string {
-                "\"[REDACTED]\""
-            } else {
-                "[REDACTED]"
-            });
+            let quote = if value_is_string { "\"" } else { "" };
+            out.push_str(quote);
+            out.push_str(REDACTED);
+            out.push_str(quote);
         } else {
             copy_range(&chars, value_start, value_stop, &mut out);
         }

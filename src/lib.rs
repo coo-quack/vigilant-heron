@@ -1,10 +1,11 @@
 //! A reverse proxy that screens web requests before they reach the site.
 //!
 //! Each request is matched to a site by its `Host` header. Requests that match
-//! a deny rule are blocked without asking the decision backend. Static assets
-//! are forwarded without asking it either. Every other request is sent, with
-//! credentials removed, to the decision backend, which returns two scores. The
-//! policy turns the scores into a block, a redirect or a forward to the upstream.
+//! a block rule or a `deny_path` entry are blocked without asking the decision
+//! backend. Static assets are forwarded without asking it either. Every other
+//! request is sent, with credentials removed, to the decision backend, which
+//! returns two scores. The policy turns the scores into a block, a redirect or
+//! a forward to the upstream.
 //!
 //! Shadow mode forwards every request and only records what would have happened.
 //! The configuration uses nginx-style directives. [`serve`] runs the proxy on a
@@ -55,7 +56,8 @@ pub use shadow_report::{ShadowOptions, ShadowReport};
 pub use skip_suggest::{Candidate, SuggestOptions, SuggestReport, suggest_skip_rules};
 pub use system_one::{ApiToken, ClefModel};
 
-/// The directive names the parser accepts, read by the documentation drift check in `tests/docs.rs`.
+/// The directive names the configuration builder accepts, read by the documentation drift
+/// check in `tests/docs.rs`.
 #[doc(hidden)]
 pub mod directives {
     pub use crate::config::{

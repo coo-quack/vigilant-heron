@@ -136,8 +136,8 @@ impl PidFile {
         ))
     }
 
-    /// A value for a router that could not take the lock. It writes the pid file as before,
-    /// but holds no lock, so the commands that read the file treat the router as not running.
+    /// A value for a router that could not take the lock. It writes the pid file but holds
+    /// no lock, so the commands that read the file treat the router as not running.
     pub(crate) fn unlocked(path: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
@@ -224,10 +224,10 @@ fn parse_pid(text: &str) -> Option<i32> {
     digits.parse::<i32>().ok().filter(|pid| *pid > 0)
 }
 
-/// Reads the process id that the pid file at `path` holds. `-s`, `start`, `stop` and
-/// `restart` signal the process this names, so the file is checked first: the file is
-/// opened without following a symlink, its owner and its directory's mode are read, and
-/// [`is_trusted`] decides whether to use it.
+/// Reads the process id that the pid file at `path` holds. `-s`, `stop` and `restart`
+/// signal the process this names, and `start` checks that it is running, so the file is
+/// checked first: the file is opened without following a symlink, its owner and its
+/// directory's mode are read, and [`is_trusted`] decides whether to use it.
 ///
 /// # Errors
 ///

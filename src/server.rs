@@ -1,10 +1,11 @@
 //! The accept loop and the per-request pipeline.
 //!
-//! The order is fixed: site lookup, body limit, body sniff, deterministic rules,
-//! backend call, policy, forwarding. Rules are decided before the backend is
-//! called, so no failure setting can turn a rule block into an allow. Only the
-//! first `inspect_body` bytes of a body reach the backend; the rest is streamed
-//! to the upstream after the decision.
+//! The order is fixed: site lookup, limits, Host check, access list, body limit,
+//! body sniff, deterministic rules, backend call, policy, forwarding. Limits and
+//! the access list run before the body is read. Rules are decided before the
+//! backend is called, so no failure setting can turn a rule block into an allow.
+//! Only the first `inspect_body` bytes of a body reach the backend; the rest is
+//! streamed to the upstream after the decision.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -321,8 +322,9 @@ pub async fn serve(
 /// error level, and the previous configuration keeps serving. A reload that
 /// succeeds applies to the requests that start after it; requests in flight finish
 /// with the configuration they started with. Zones keep their counts when a zone
-/// with the same name and size exists. The listen address, `worker_threads`,
-/// `max_connections` and the connection timers apply only at startup.
+/// with the same name and size exists. `pid`, the listen address, `worker_threads`,
+/// `max_connections`, `worker_shutdown_timeout` and the connection settings apply
+/// only at startup.
 ///
 /// `applied` is called with the new configuration after it is in service, and
 /// before the reload is logged. It is not called for a reload that fails, so the
@@ -364,7 +366,6 @@ async fn run(
     let initial = Arc::new(AppState::from_config(config, None)?);
     let (current_tx, current_rx) = watch::channel(initial);
     let (stop_tx, stop_rx) = watch::channel(false);
-    // Each connection and each tunnel holds a clone of `open_tx`; the drain ends when none is left.
     let (open_tx, mut open_rx) = mpsc::channel::<()>(1);
     let (force_tx, force_rx) = watch::channel(false);
     let slots = Arc::new(Semaphore::new(max_connections));
@@ -714,7 +715,7 @@ async fn pipeline(
             !done.load(Ordering::Acquire),
         );
     }
-    // The access list comes next, before the body is read and before the host is judged.
+    // The access list comes next, before the body is read and before an unknown host is refused.
     let entries = matched.map_or(state.access.as_slice(), |site| site.access.as_slice());
     let access_denied = !access::permits(entries, trace.client_addr);
     if access_denied && matched.is_none() {
@@ -835,11 +836,12 @@ async fn pipeline(
     } else {
         block.unwrap_or(&access_block)
     };
-    // The request headers that proxy_set_header values may use, and the operations of the level in effect.
+    // The proxy_set_header operations of the level in effect.
     let header_ops = location
         .map(|location| location.proxy_headers.as_slice())
         .or_else(|| matched.map(|site| site.proxy_headers.as_slice()))
         .unwrap_or_default();
+    // The request values that proxy_set_header values may use.
     let ctx = HeaderContext {
         client_ip: trace.client_ip,
         remote_addr: trace.remote_addr,
@@ -974,9 +976,9 @@ struct Delivery<'a> {
 
 /// Forwards an allowed request, or answers a block or redirect.
 ///
-/// `complete` says whether the request body was read in full. When it was not,
-/// the response closes the connection, because the rest of the body would
-/// otherwise be read as the next request.
+/// When the request body was not read in full, the response closes the
+/// connection, because the rest of the body would otherwise be read as the next
+/// request.
 async fn respond(
     delivery: &Delivery<'_>,
     parts: &Parts,
@@ -1034,8 +1036,8 @@ async fn respond(
                         crate::proxy::strip_hop_by_hop(&mut upstream_parts.headers);
                     }
                     if let (Some(client), Some(upstream)) = (client_upgrade, upstream_upgrade) {
-                        // From here on the client connection carries tunnel bytes, not requests:
-                        // its reads are neither timed nor scanned, and no response is written to it.
+                        // From here on the client connection carries tunnel bytes, not requests,
+                        // and no response is written to it.
                         delivery.phase.set(Phase::Tunnelling);
                         tunnel::spawn(
                             client,

@@ -24,7 +24,7 @@ pub(crate) enum SignalCommand {
     Reload,
     /// `reopen`: reopen the log files (SIGUSR1).
     Reopen,
-    /// `stop`: shut down, graceful in this version (SIGTERM).
+    /// `stop`: shut down gracefully, as `quit` does (SIGTERM).
     Stop,
     /// `quit`: shut down gracefully (SIGQUIT).
     Quit,

@@ -388,7 +388,7 @@ async fn run(
 /// signal that arrives before the handlers exist would end the process without the
 /// cleanup that removes the pid file.
 ///
-/// SIGINT, SIGTERM and SIGQUIT all shut down gracefully in this version.
+/// SIGINT, SIGTERM and SIGQUIT all shut down gracefully.
 fn shutdown_signal() -> impl Future<Output = ()> {
     let interrupt = signal(SignalKind::interrupt());
     let terminate = signal(SignalKind::terminate());

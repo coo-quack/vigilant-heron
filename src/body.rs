@@ -314,8 +314,7 @@ impl<B> Finish<B> {
         self
     }
 
-    /// Ends the response's use of the connection: idle for keep-alive when the request
-    /// body was read in full, otherwise closing.
+    /// Ends the response's use of the connection.
     fn mark_idle(&self) {
         // A tunnelled connection is neither idle nor closing: its bytes are not requests.
         if self.phase.get() == crate::transport::Phase::Tunnelling {
