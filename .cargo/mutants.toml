@@ -42,9 +42,11 @@ exclude_re = [
     'src/conf/mod\.rs:293:28: replace \+ with \* in wildcard_matches$',
     # With `false`, hyper's HTTP/1 server (hyper 1.12.0, `proto/h1/dispatch.rs`) takes the
     # length from `size_hint`, which `Finish` forwards, so an ended body is announced as
-    # `Known(0)` instead of as no body, and both write `content-length: 0`
-    # (`proto/h1/role.rs`, `None | Some(BodyLength::Known(0))`). hyper then polls the body
-    # once, gets `None`, and `Finish` marks the connection as dropping it would.
+    # `Known(0)` instead of as no body. The encoder handles the two in one arm
+    # (`proto/h1/role.rs`, `None | Some(BodyLength::Known(0))`), responses to HEAD included.
+    # hyper then polls the body once and gets `None`, and `Finish` sets the same connection
+    # phase that dropping the body sets. This stops holding if hyper changes how it reads
+    # a response body's length.
     'src/finish\.rs:79:9: replace <impl Body for Finish<B>>::is_end_stream -> bool with false$',
     # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
     # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
