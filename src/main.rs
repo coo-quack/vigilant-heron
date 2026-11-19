@@ -1,9 +1,6 @@
 //! Command-line entry point for the vigilant-heron proxy.
 
-mod cli;
-mod lifecycle;
-mod pidfile;
-mod request_url;
+mod command;
 
 use std::fmt::Display;
 use std::future::Future;
@@ -13,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context, anyhow};
-use cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
-use pidfile::PidFile;
-use request_url::UrlRequest;
+use command::cli::{Command, Options, USAGE, config_path, parse_args, send_signal};
+use command::lifecycle;
+use command::pidfile::PidFile;
+use command::request_url::UrlRequest;
 use tokio::signal::unix::{SignalKind, signal};
 use vigilant_heron::{
     CheckedConfig, Config, ErrorLogHandle, ShadowOptions, ShadowReport, SuggestOptions,
@@ -388,7 +386,7 @@ async fn run(
 /// signal that arrives before the handlers exist would end the process without the
 /// cleanup that removes the pid file.
 ///
-/// SIGINT, SIGTERM and SIGQUIT all shut down gracefully in this version.
+/// SIGINT, SIGTERM and SIGQUIT all shut down gracefully.
 fn shutdown_signal() -> impl Future<Output = ()> {
     let interrupt = signal(SignalKind::interrupt());
     let terminate = signal(SignalKind::terminate());

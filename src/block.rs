@@ -12,8 +12,7 @@ use std::path::{Path, PathBuf};
 use bytes::Bytes;
 use http::StatusCode;
 
-use crate::conf::Directive;
-use crate::config::{invalid, once, one_arg};
+use crate::conf::{Directive, invalid, once, one_arg};
 use crate::error::ConfigError;
 
 /// Largest `block_page` file, in bytes.

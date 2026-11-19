@@ -2,7 +2,7 @@
 
 # The build stage runs on the build host and cross-compiles for the target
 # architecture, so an arm64 image is not built under emulation.
-FROM --platform=$BUILDPLATFORM rust:1.100.0-slim-trixie@sha256:e9d95b74296f7126a83ae3d041aeaba1ff4c478f13abc5cc034fcf7c131c3d4a AS build
+FROM --platform=$BUILDPLATFORM rust:1.100.0-slim-trixie@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS build
 ARG BUILDARCH
 ARG TARGETARCH
 WORKDIR /src

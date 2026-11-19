@@ -58,10 +58,10 @@ every mode. A graceful shutdown waits for lingering closes that are in progress.
 ## Where each limit is enforced
 
 - The header limits and the connection timers apply to the bytes before hyper
-  parses them, in the socket wrapper (`src/transport.rs`).
+  parses them, in the socket wrapper (`src/transport/`).
 - The body timer and `client_max_body_size` apply while the body is read
   (`src/body.rs`).
-- The upstream timers apply in the upstream client (`src/proxy.rs`).
+- The upstream timers apply in the upstream client (`src/proxy/`).
 
 Request bodies are streamed. The router reads the first `inspect_body` bytes for
 the decision and forwards the rest as the upstream reads it. A body over

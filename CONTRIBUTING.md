@@ -108,12 +108,17 @@ cargo mutants --in-diff pr.diff
 To run it on one file:
 
 ```bash
-cargo mutants --file src/skip_suggest.rs
+cargo mutants --file src/tooling/skip_suggest.rs
 ```
 
 A full run takes hours, so run it for the code you are changing. Its output is
 written to `mutants.out/`, and the lines in `missed.txt` tell you which change
 the tests did not catch.
+
+A mutant that no test can tell from the original code is hidden with an
+`exclude_re` pattern in `.cargo/mutants.toml`, with a comment that says why. The
+pattern names one mutant, or the mutants of one replacement in one function, as
+`cargo mutants --list` prints them, so it hides nothing else.
 
 ## Benchmarks
 

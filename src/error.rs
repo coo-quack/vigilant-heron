@@ -4,8 +4,9 @@ use http::StatusCode;
 
 /// Errors found while loading or validating a configuration.
 ///
-/// Every error that comes from the file names the file and the line, so the
-/// message reads `file:line: problem`.
+/// Every error that comes from the text of a file (`Syntax`, `Include` and
+/// `Invalid`) names the file and the line, so the message reads `file:line: problem`.
+/// `Read` and `ErrorLog` name the path or destination instead, and have no line.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// A configuration file could not be read.
