@@ -41,7 +41,7 @@ allow_attributes_without_reason = "deny"
 
 [package]
 name = "vigilant-heron"
-version = "0.5.0"
+version = "0.5.1"
 description = "Router that checks web requests with typed decision models and blocks, redirects or passes them"
 edition.workspace = true
 rust-version.workspace = true
@@ -54,7 +54,7 @@ workspace = true
 
 [dependencies]
 anyhow = "=1.0.104"
-bytes = "=1.12.1"
+bytes = "=1.12.2"
 form_urlencoded = "=1.2.2"
 http = "=1.5.0"
 http-body = "=1.1.0"
@@ -63,7 +63,7 @@ hyper = { version = "=1.12.0", features = ["http1", "server", "client"] }
 hyper-rustls = { version = "=0.27.10", default-features = false, features = ["ring", "tls12", "http1", "logging", "native-tokio"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1"] }
 percent-encoding = "=2.3.2"
-regex = "=1.13.1"
+regex = "=1.13.2"
 rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.5"
 rustix = { version = "=1.1.6", default-features = false, features = ["std", "process", "fs"] }
@@ -85,3 +85,10 @@ criterion = { version = "=0.8.2", default-features = false, features = ["cargo_b
 [[bench]]
 name = "hot_path"
 harness = false
+
+# The Cargo profile cargo-mutants builds with (`profile` in .cargo/mutants.toml).
+# Every mutant relinks all the test binaries, and without debug info that link is
+# faster. A failing test's backtrace has no line numbers in this profile.
+[profile.mutants]
+inherits = "test"
+debug = "none"

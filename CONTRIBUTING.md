@@ -20,6 +20,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings  # lint job
 RUSTDOCFLAGS=-D warnings cargo doc --workspace --no-deps --locked  # lint job
 cargo test --workspace --locked                            # Tests
 cargo llvm-cov --workspace --locked --fail-under-lines 90  # test job: tests and line coverage
+python3 -I -m unittest discover -s eval/tests              # test job: tests of the eval scripts and datasets
 bash scripts/e2e.sh                                        # e2e job
 cargo deny --locked check                                  # audit job
 cargo machete                                              # deadcode job
@@ -63,6 +64,8 @@ tools, and `rustup component add llvm-tools` adds what `cargo llvm-cov` needs.
 - `tests/e2e.rs` runs against the Compose stack in `e2e/` (nginx in front, the
   router image, the stub decider, an upstream). Its tests are `#[ignore]`d in
   the normal run; `scripts/e2e.sh` starts the stack and runs them.
+- `eval/tests/` checks the evaluation scripts and the labelled datasets with
+  the Python standard library. It needs no router build and no network.
 - Expected values are never changed to match what the code happens to do.
 
 ## Mutation testing
@@ -75,10 +78,16 @@ passes, that change is a **missed mutant**, which means a test is missing or
 too weak.
 
 `.github/workflows/mutants.yml` runs it every Sunday night (Monday 03:17 JST)
-in 32 shards. When the run finds missed mutants, timed-out mutants, or fails,
+in 20 shards. When the run finds missed mutants, timed-out mutants, or fails,
 it opens or updates the issue "Weekly mutation testing: findings". When a later
 run is clean, it closes that issue. The full output is in the `mutants-*`
 artifacts of the run. The settings are in `.cargo/mutants.toml`.
+
+cargo-mutants runs the tests with cargo-nextest, in the `mutants` profile of
+`.config/nextest.toml`. A test that runs for 60 s is stopped and counts as
+failed, so a mutant that makes one test loop forever is caught, not timed out.
+Install both tools to run it yourself: `cargo install --locked cargo-mutants cargo-nextest`.
+nextest does not run doctests, and the workspace has none.
 
 Every PR also runs the `mutants-diff` check. It mutates only the lines the PR
 changes (`cargo mutants --in-diff`), split over parallel shards: 8 shards for a PR
@@ -99,12 +108,17 @@ cargo mutants --in-diff pr.diff
 To run it on one file:
 
 ```bash
-cargo mutants --file src/skip_suggest.rs
+cargo mutants --file src/tooling/skip_suggest.rs
 ```
 
 A full run takes hours, so run it for the code you are changing. Its output is
 written to `mutants.out/`, and the lines in `missed.txt` tell you which change
 the tests did not catch.
+
+A mutant that no test can tell from the original code is hidden with an
+`exclude_re` pattern in `.cargo/mutants.toml`, with a comment that says why. The
+pattern names one mutant, or the mutants of one replacement in one function, as
+`cargo mutants --list` prints them, so it hides nothing else.
 
 ## Benchmarks
 

@@ -13,36 +13,13 @@ env:
   CARGO_TERM_COLOR: always
   # rust-toolchain.toml pins the toolchain; rustup on the runner installs it
   # on the first cargo call, so no third-party toolchain action is needed.
-  CARGO_DENY_VERSION: 0.20.2
   CARGO_MACHETE_VERSION: 0.9.2
   CARGO_LLVM_COV_VERSION: 0.9.1
-  # Keep in step with mutants.yml.
+  # Keep these two in step with mutants.yml.
   CARGO_MUTANTS_VERSION: 27.1.0
+  CARGO_NEXTEST_VERSION: 0.9.152
 
 jobs:
-  # Advisories, licenses, banned crates and registry sources (deny.toml).
-  audit:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/bin/cargo-deny
-          key: cargo-deny-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}
-      - run: command -v cargo-deny || cargo install --locked cargo-deny --version "$CARGO_DENY_VERSION"
-      - run: cargo deny --locked check
-      # The documentation site's dependencies (docs/, package.json). pnpm comes
-      # from corepack, which reads the packageManager field.
-      - run: corepack enable pnpm
-      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '26.13.0'
-          cache: 'pnpm'
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm audit --audit-level=high
-
   lint:
     runs-on: ubuntu-latest
     permissions:
@@ -91,6 +68,8 @@ jobs:
       # fewer than 90% of the lines run, so new code comes with its tests.
       - run: rustup component add llvm-tools
       - run: cargo llvm-cov --workspace --locked --fail-under-lines 90
+      # The eval scripts and datasets, with the Python standard library only.
+      - run: python3 -I -m unittest discover -s eval/tests
 
   # Timings on shared runners are too noisy to gate on, so this job only proves
   # that the benchmarks build and run once. bench.yml records the timings weekly.
@@ -144,7 +123,7 @@ jobs:
 
   # Copy/paste duplication in src/ (jscpd, configured by .jscpd.json). The
   # threshold there keeps duplicated Rust code from growing; `pnpm run dup`
-  # lists the clones. pnpm comes from corepack, as in the audit job.
+  # lists the clones. pnpm comes from corepack, as in audit.yml.
   duplication:
     runs-on: ubuntu-latest
     permissions:
@@ -154,7 +133,7 @@ jobs:
       - run: corepack enable pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.13.0'
+          node-version: '26.13.1'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm run dup
@@ -209,10 +188,14 @@ jobs:
         shard: ${{ fromJSON(github.base_ref == 'main' && '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]' || '[0,1,2,3,4,5,6,7]') }}
     env:
       SHARD_TOTAL: ${{ github.base_ref == 'main' && 32 || 8 }}
-      # cargo runs the test binaries through prlimit (6 GiB of address space, 4 GiB
-      # per file), so a mutant that loops while allocating or writing is killed, and
-      # counts as caught, instead of taking the runner down. The compiler is not limited.
-      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=6442450944 --fsize=4294967296 --
+      # cargo runs the test binaries through prlimit: each test process, and each process
+      # it starts, gets at most 3 GiB of address space and writes files of at most 1 GiB,
+      # so a mutant that loops while allocating or writing is killed, and counts as caught,
+      # instead of taking the runner down. The compiler is not limited.
+      # nextest runs each test in a process of its own; with two mutants at a time (--jobs 2)
+      # and two tests each (--test-threads=2), the test processes hold at most 12 GiB of
+      # the 15 GiB a standard runner has.
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=3221225472 --fsize=1073741824 --
     permissions:
       contents: read
     steps:
@@ -232,6 +215,11 @@ jobs:
           path: ~/.cargo/bin/cargo-mutants
           key: cargo-mutants-${{ runner.os }}-${{ env.CARGO_MUTANTS_VERSION }}
       - run: command -v cargo-mutants || cargo install --locked cargo-mutants --version "$CARGO_MUTANTS_VERSION"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ env.CARGO_NEXTEST_VERSION }}
+      - run: command -v cargo-nextest || cargo install --locked cargo-nextest --version "$CARGO_NEXTEST_VERSION"
       - name: Diff against the base branch
         env:
           BASE_REF: ${{ github.base_ref }}
@@ -239,8 +227,11 @@ jobs:
       # Every shard computes the same mutant list from the same diff, then runs its own slice.
       # --baseline=skip: the required `test` job already runs the unmutated suite, so a shard
       # does not repeat it. With no baseline there is no measured test time to scale, so the
-      # test timeout is fixed at 300 s, as in mutants.yml.
-      # --jobs 2 runs two mutants at a time on the runner's 4 vCPUs, as the single job did.
+      # test timeout is fixed at 300 s, as in mutants.yml. nextest stops a single test
+      # that runs for 60 s (the "mutants" profile in .config/nextest.toml).
+      # --jobs 2 runs two mutants at a time on the runner's 4 vCPUs, as the single job did,
+      # and --test-threads=2 gives each two tests at a time, so four run at once (see the
+      # prlimit caps above).
       # Without --in-place, cargo-mutants builds each mutant in a copy of the tree, so the
       # checked-out source is never changed.
       # A non-zero exit code is recorded, not raised here, so the upload step still runs.
@@ -251,7 +242,7 @@ jobs:
         run: |
           set +e
           cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --shard "$SHARD/$SHARD_TOTAL" \
-            --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked \
+            --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked --cargo-test-arg=--test-threads=2 \
             --output "$RUNNER_TEMP/mutants" 2>&1 | tee "$RUNNER_TEMP/mutants.log"
           status=${PIPESTATUS[0]}
           if [ "$status" != 0 ]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi

@@ -3,10 +3,51 @@
 # src/test_support.rs builds test fixtures; mutating it only tests the test helper.
 exclude_globs = ["src/test_support.rs"]
 
-# The tests use real short timers, so a mutant that slows the code gets extra time before it counts as a timeout.
-timeout_multiplier = 3.0
+# Run the tests with cargo-nextest, in the "mutants" profile of .config/nextest.toml,
+# so a test that never returns is stopped and failed after 60 s. nextest does not run
+# doctests; the workspace has none.
+test_tool = "nextest"
+additional_cargo_test_args = ["--profile=mutants"]
+
+# Build in the "mutants" Cargo profile of Cargo.toml, which leaves out debug info.
+# It shares a name with the nextest profile above and is otherwise unrelated.
+profile = "mutants"
 
 # The workspace denies lints such as unused imports, so a mutant that leaves an
 # import or a parameter unused would fail to build and count as unviable instead
 # of being tested. Lints are turned off for mutant builds only.
 cap_lints = true
+
+# Mutants that no test can tell from the original code. Each pattern names one mutant,
+# or the mutants of one replacement in one function, as `cargo mutants --list` prints
+# them, so it hides nothing else. A name carries its line and column, so a pattern that
+# pins them stops matching when the line moves. The mutant is then reported as missed
+# again, and the pattern is updated.
+exclude_re = [
+    # The OFlags are separate bits (RDONLY is 0), so `a | b` and `a ^ b` are the same value.
+    'replace \| with \^ in open_lock_file$',
+    'replace \| with \^ in lock_held$',
+    'replace \| with \^ in read_pid$',
+    # `high << 64` and the widened 64-bit `low` occupy different bits, so `|` and `^` agree.
+    'replace \| with \^ in Table::digest$',
+    # Two prefix locations that both match a path and have the same length have the same
+    # text, and the configuration loader rejects a site that repeats a prefix path.
+    'replace > with >= in select_location$',
+    # `text[gt]` is `>`, so searching for the next `<` from `gt` finds what `gt + 1` finds.
+    'src/backend/sanitize/body/lexical\.rs:42:21: replace \+ with \* in redact_xml_elements$',
+    # With `<=`, a retry at the end of the text moves `t` past the end and fails on the next
+    # literal as before. A trailing `*`, the only way to match there, never retries.
+    'src/conf/mod\.rs:291:38: replace < with <= in wildcard_matches$',
+    # `p = sp * 1` points at the `*` again, and its arm sets the same `star`, `p` and `t`.
+    'src/conf/mod\.rs:293:28: replace \+ with \* in wildcard_matches$',
+    # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
+    # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
+    # `HYPER_DEFAULT_BUFFER` copies). This stops holding if hyper changes that default.
+    'src/server/mod\.rs:251:35: replace > with >= in serve_connection$',
+    # `HttpConnector::poll_ready` returns `Ready(Ok(()))` for the default resolver
+    # (hyper-util 0.1.21, `GaiResolver`), which is what the mutant returns.
+    'UpstreamConnector>::poll_ready .* with Poll::from\(Ok\(\(\)\)\)$',
+    # PUMP_BUFFER: the copy buffer size only sets how many bytes move per read; the bytes
+    # are the same.
+    'src/tunnel\.rs:25:31: replace \* with \+$',
+]

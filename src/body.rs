@@ -20,7 +20,6 @@ use http_body_util::{BodyExt, combinators::UnsyncBoxBody};
 use hyper::body::Incoming;
 use tokio::time::Sleep;
 
-use crate::limits::ConnPermit;
 use crate::transport::expired;
 
 /// An error that a body can return.
@@ -277,87 +276,6 @@ impl Body for ClientBody {
             hint.set_upper(upper.saturating_add(replayed));
         }
         hint
-    }
-}
-
-/// Ends a connection's use once its response has been sent.
-///
-/// The connection goes idle for keep-alive only when the request body was read in
-/// full. Otherwise it is closed, since the unread rest of the body would otherwise
-/// be taken for the next request.
-pub(crate) struct Finish<B> {
-    inner: B,
-    phase: Arc<crate::transport::PhaseCell>,
-    body_done: Arc<AtomicBool>,
-    /// `limit_conn` counts of the request, released when the response is dropped.
-    permits: Vec<ConnPermit>,
-}
-
-impl<B> Finish<B> {
-    /// Wraps the response body `inner` of the request that `body_done` tracks.
-    pub(crate) fn new(
-        inner: B,
-        phase: Arc<crate::transport::PhaseCell>,
-        body_done: Arc<AtomicBool>,
-    ) -> Self {
-        Self {
-            inner,
-            phase,
-            body_done,
-            permits: Vec::new(),
-        }
-    }
-
-    /// Keeps the `limit_conn` counts of the request until this body is dropped.
-    pub(crate) fn holding(mut self, permits: Vec<ConnPermit>) -> Self {
-        self.permits = permits;
-        self
-    }
-
-    /// Ends the response's use of the connection: idle for keep-alive when the request
-    /// body was read in full, otherwise closing.
-    fn mark_idle(&self) {
-        // A tunnelled connection is neither idle nor closing: its bytes are not requests.
-        if self.phase.get() == crate::transport::Phase::Tunnelling {
-            return;
-        }
-        let phase = if self.body_done.load(Ordering::Acquire) {
-            crate::transport::Phase::AwaitingKeepAlive
-        } else {
-            crate::transport::Phase::Closing
-        };
-        self.phase.set(phase);
-    }
-}
-
-impl<B: Body + Unpin> Body for Finish<B> {
-    type Data = B::Data;
-    type Error = B::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        let item = Pin::new(&mut this.inner).poll_frame(cx);
-        if matches!(item, Poll::Ready(None)) {
-            this.mark_idle();
-        }
-        item
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-impl<B> Drop for Finish<B> {
-    fn drop(&mut self) {
-        self.mark_idle();
     }
 }
 

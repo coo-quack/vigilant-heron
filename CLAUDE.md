@@ -12,7 +12,7 @@ Shadow mode records what it would have done without blocking.
 
 - Rust (toolchain pinned in `rust-toolchain.toml`, edition 2024)
 - tokio, hyper 1, hyper-util (server and pooled client)
-- serde, toml, serde_json; thiserror in the library, anyhow only in the binary (`main.rs` and its modules `cli.rs` and `lifecycle.rs`)
+- serde, toml, serde_json; thiserror in the library, anyhow only in the binary (`main.rs` and its modules `command/cli.rs` and `command/lifecycle.rs`)
 - Tests: built-in harness, rstest, proptest; e2e with Docker Compose
 
 ## Commands
@@ -21,6 +21,7 @@ Shadow mode records what it would have done without blocking.
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` — lint
 - `cargo test --workspace --locked` — unit and integration tests
 - `cargo llvm-cov --workspace --locked --fail-under-lines 90` — the tests with line coverage; CI fails below 90%
+- `python3 -I -m unittest discover -s eval/tests` — tests of the eval scripts and datasets (stdlib only; part of the `test` job)
 - `bash scripts/e2e.sh` — e2e suite against the Compose stack in `e2e/`
 - `cargo deny --locked check` — advisories, licenses, sources
 - `cargo machete` — unused dependencies
@@ -32,37 +33,44 @@ Shadow mode records what it would have done without blocking.
 ```
 src/
   main.rs        # Entry point: runtime built from worker_threads, SIGHUP reload, SIGUSR1 reopen, SIGTERM/SIGINT/SIGQUIT graceful stop, signal handlers registered before the pid file
-  cli.rs         # Options (-h -v -c -t -T -s, start/stop/restart words), usage text, -s signals through rustix via the pid file
-  lifecycle.rs   # start/stop/restart: detached child (own process group), pid-file readiness, bounded waits, no SIGKILL
-  pidfile.rs     # PID file: written after bind (atomic rename), removed on drop
+  command/       # The modules of the binary, declared by main.rs only (mod.rs)
+  command/cli.rs # Options (-h -v -c -t -T -s, start/stop/restart words), usage text, -s signals through rustix via the pid file
+  command/lifecycle.rs # start/stop/restart: detached child (own process group), pid-file readiness, bounded waits, no SIGKILL
+  command/pidfile.rs # PID file: written after bind (atomic rename), removed on drop
+  command/request_url.rs # test-request --url: builds the raw request from a URL, --host, --method and --header
   lib.rs         # Public API: Config, ConfigError, serve, install_error_log
-  conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles)
-  config.rs      # Directive tree -> validated Config; every error names file:line
+  conf/          # Configuration language: lexer, parser, includes (globs, depth, cycles); value.rs (helpers the directive parsers share: errors with file:line, arguments and blocks, single-use check, times, sizes, numbers, on/off)
+  config/        # Directive tree -> validated Config; every error names file:line. mod.rs (types, load, -T dump), names.rs, value.rs (parsers of single directives' values), top.rs (build: the top-level directives and the checks across sites and rules), decision.rs, site.rs, logs.rs (log directives)
   realip.rs      # Client address from real_ip_from / real_ip_header / real_ip_recursive
-  accesslog.rs   # log_format compiler, variables, escaping, built-in json and main formats
-  logsink.rs     # Access-log destinations: bounded queues, drop counts, SIGUSR1 reopen, syslog; error log with reloadable level and destination
+  logging/       # The log writers (mod.rs)
+  logging/accesslog/ # log_format compiler, variables, escaping, built-in json and main formats; time.rs (UTC calendar and time formatting, syslog stamp)
+  logging/logsink/ # Log destinations: access_log.rs (access-log queues, drop counts, SIGUSR1 reopen, syslog), error_log.rs (error log with reloadable level and destination)
   router.rs      # Host normalization and site lookup: exact, leading and trailing wildcards, ~regex, default_server
   block.rs       # block_status (4xx/5xx or 444) and block_page (HTML, 64 KiB, read at load), per level
   access.rs      # Access list: allow/deny by client address, checked in order (nginx semantics)
-  limits.rs      # limit_req / limit_conn zones, leaky bucket, connection counts, location selection; runs first
-  rules/         # Rules: rule block parser, built-in rules (builtin.conf), matching and normalization
-  rules/tests.rs # Unit tests of the rule parser, built-in signatures, normalization and matching
-  prefilter.rs   # Screening order: deny_path, block rules, skip rules, static skip
-  request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  limits/        # limit_req / limit_conn, runs first: directives (config), location selection (location), zones with the leaky bucket and connection counts (state), screening (screen)
+  rules/         # Rules: types (mod.rs), parse.rs (rule block parser, id registry), builtin.rs (builtin.conf), site.rs (site lists, switches), matching.rs (matching, normalization)
+  rules/tests/   # Unit tests by section: parser.rs, builtin.rs (examples table), matching.rs (with proptests), opt_in.rs; shared helpers in mod.rs
+  prefilter/     # Screening order (mod.rs): deny_path, block rules, skip rules, static skip; paths.rs (path views, normalization, decode_twice), static_skip.rs (static asset skip)
+  tooling/       # What the command-line tools run (mod.rs)
+  tooling/request_check.rs # test-request: parses a raw request file and reports the server's checks for it, without the backend
+  tooling/skip_suggest.rs # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
+  tooling/log_lines.rs # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
+  tooling/shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
   request_id.rs  # Request ids: the request-id header value or a generated id, and the X-Request-ID response header
-  request_url.rs # test-request --url: builds the raw request from a URL, --host, --method and --header
-  skip_suggest.rs  # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
-  log_lines.rs   # json access-log reading shared by suggest-skip-rules and shadow-report: line loop with a length cap, field helpers
-  shadow_report.rs # shadow-report: plain-text summary of json access logs (overview, per day, blocked lines, bursts, backend per hour, tokens)
-  sanitize.rs    # Backend event: header drop, body redaction, truncation
-  decision.rs    # Shared HTTPS transport and limits, HTTP backend, backend enum with decide
-  system_one.rs  # System One backends (Clef, Jev): questions, request, response parsing, API token type
+  backend/       # The decision backends: mod.rs (Backend enum with decide, the configured backend)
+  backend/sanitize/ # Backend event and its truncation; keys (sensitive names, header drop), query and body redaction (multipart, lexical)
+  backend/decision/ # Shared HTTPS transport and limits, HTTP backend (mod.rs); slots.rs (ClientSlots, the per-client cap on calls in flight)
+  backend/system_one.rs # System One backends (Clef, Jev): questions, request, response parsing, API token type
   policy.rs      # Pure decision table (rules, thresholds, failure settings, shadow)
-  proxy.rs       # Forwarding to upstreams (per-site client, connect and send timers), hop-by-hop headers, proxy_set_header
+  proxy/         # Forwarding to upstreams (per-site client, connect timer, upstream socket with the send timer), hop-by-hop headers; set_header.rs (proxy_set_header templates and variables)
   tunnel.rs      # proxy_websocket: splices the client and upstream after a 101, idle timeout, holds limit_conn permits; shutdown waits for tunnels and force-closes them at worker_shutdown_timeout
-  transport.rs   # Client socket: header, keep-alive and send timers, header limits (414/400); upstream send timer
+  transport/     # Client socket: ClientIo with header, keep-alive and send timers and lingering close (client); header limits (414/400) and the header scanner (head)
+  phase.rs       # Phase of a client connection (awaiting header, keep-alive, busy, closing, tunnelling), shared by the client socket, the response body wrapper and the request handler
+  sync.rs        # Mutex lock helper that ignores poisoning
   body.rs        # Request body: sniff of inspect_body, replay, client_max_body_size, frame timers, keep-alive marker
-  server.rs      # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline, access records
+  finish.rs      # Response body wrapper: sets the connection phase (keep-alive or close) when the response ends, holds limit_conn permits
+  server/        # Accept loop, reload (watch channel of the state), shutdown drain, per-request pipeline (mod.rs); state.rs (AppState), reload.rs, respond.rs (responses), record.rs (access records)
   error.rs       # Error types
   test_support.rs # Builds sites and configurations for the unit tests
 benches/
@@ -86,7 +94,7 @@ tests/
   common/        # Shared helpers: in-process upstream, stub and gated decision backends, client, fake System One endpoint
   cli.rs         # The binary: -h, -v, -t and -T, -s signals (reload, reopen, stop, quit), start, stop and restart, the startup log
   headers.rs     # proxy_set_header: variables, removal, inheritance, location replacement
-  websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
+  websocket.rs   # proxy_websocket tunnels against an in-process echo upstream; no tunnel when a raw-socket upstream answers 101 to a request that may not upgrade
   reload.rs      # serve_reloadable: valid, broken, zone state kept or reset, in-flight requests finish
   request_check.rs # test-request agrees with the running router on outcome, reason and rule id
   skip_suggest.rs # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds
@@ -112,8 +120,9 @@ eval/
   run.py         # Labelled-dataset evaluation (stdlib only, python3 -I)
   load.py        # Load test against the stub decider (offline only)
   rules.py       # Built-in rules on dev and holdout, and the combined pipeline (stdlib only)
-  dataset/       # Labelled dev and holdout sets (JSON lines)
+  dataset/       # Labelled sets (JSON lines): dev and holdout, field (rows from a shadow trial), adversarial (prompt injection that tries to evade the judge)
   config.template.conf # Router configuration template; run.py fills the @PLACEHOLDERS@
+  tests/         # unittest suite for run.py, rules.py, load.py and the datasets (row shape, counts the README states)
   README.md      # The Clef-flash evaluation: what it measures and how to run it
   reports/       # Written reports of each measurement
 examples/
@@ -127,13 +136,14 @@ Top-level and documentation files:
 ```
 docs/            # Reference and guides for the VitePress site (docs.yml); changelog.md is a symlink to CHANGELOG.md
 skills/          # Agent skills (npx skills add coo-quack/vigilant-heron): vigilant-heron-rollout drives docs/rollout.md on a real server
-.github/         # CODEOWNERS and the CI workflows (ci.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
+.github/         # CODEOWNERS and the CI workflows (ci.yml, audit.yml, docs.yml, backport.yml, release.yml, mutants.yml, bench.yml)
 Dockerfile       # Container image build
 package.json     # VitePress for docs/ (docs:dev, docs:build, docs:preview)
 Cargo.toml       # Workspace, lints and dependencies; Cargo.lock is pinned with --locked
 deny.toml        # cargo-deny policy: advisories, licenses, sources
 .jscpd.json      # jscpd settings for the duplication check (pnpm run dup)
-.cargo/mutants.toml # cargo-mutants settings (exclusions, timeout multiplier)
+.cargo/mutants.toml # cargo-mutants settings (exclusions, test tool)
+.config/nextest.toml # cargo-nextest settings: the mutants profile stops a test that runs for 60 s
 clippy.toml      # Clippy settings (allow the lints in tests)
 rust-toolchain.toml # Toolchain pin
 README.md, CHANGELOG.md, CONTRIBUTING.md, SECURITY.md # Project documents

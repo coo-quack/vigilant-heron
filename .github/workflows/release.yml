@@ -50,7 +50,7 @@ jobs:
             echo "should_release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # Tests and the advisory check (the same tools and steps as the ci.yml audit
+  # Tests and the advisory check (the same tools and steps as the audit.yml audit
   # job) run without write access, and the checkout keeps no credential.
   verify:
     needs: check
@@ -60,7 +60,7 @@ jobs:
     permissions:
       contents: read
     env:
-      # Keep in step with ci.yml.
+      # Keep in step with audit.yml.
       CARGO_DENY_VERSION: 0.20.2
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -81,7 +81,7 @@ jobs:
       - run: corepack enable pnpm
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '26.13.0'
+          node-version: '26.13.1'
           cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm audit --audit-level=high
@@ -105,7 +105,7 @@ jobs:
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

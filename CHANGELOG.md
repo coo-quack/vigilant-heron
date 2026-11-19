@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.5.1 (2026-11-20)
+
+No change in this release is meant to change what the router does.
+
+- Changed: the release binaries and the image are built with Rust 1.100.0 (#144,
+  #145), and use regex 1.13.2 (#174) and bytes 1.12.2 (#173).
+- Added: the evaluation has an adversarial set of prompt-injection rows that try to
+  evade the judge, with a report of Jev's results on it (#134), and unittest suites
+  for the eval scripts and the datasets (#135).
+- Internal: the large modules in `src/` are split into folders and smaller files, and
+  the configuration parsers into one step per directive (#152 to #169). The comments
+  in `src/` match the code (#151).
+- Tests: the missed mutants in the body, pid file and transport code are killed
+  (#150); every invalid rule directive is checked for its line (#170); an upstream
+  that answers 101 to a request that may not upgrade gets no tunnel (#175).
+- CI: mutation tests run under cargo-nextest, so a hung test fails instead of
+  timing out the mutant (#148); the dependency audit also runs weekly (#146).
+
 ## v0.5.0 (2026-11-03)
 
 - Added: `skills/vigilant-heron-rollout/SKILL.md`, an agent skill that drives the guide
