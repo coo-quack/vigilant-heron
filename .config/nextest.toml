@@ -10,7 +10,7 @@
 # for the whole run.
 [profile.mutants]
 slow-timeout = { period = "60s", terminate-after = 1 }
-# Each test is a process of its own, and the workflows limit each one's memory with
-# prlimit. The number of processes at a time is fixed so that those limits add up to
-# what a runner has, whatever its CPU count.
+# Each test is a process of its own, and the workflows cap each one's address space
+# with prlimit. Four at a time keeps those caps within a runner's memory, whatever its
+# CPU count. mutants-diff in ci.yml runs two mutants at once and passes --test-threads=2.
 test-threads = 4

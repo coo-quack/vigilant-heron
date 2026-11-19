@@ -188,12 +188,13 @@ jobs:
         shard: ${{ fromJSON(github.base_ref == 'main' && '[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31]' || '[0,1,2,3,4,5,6,7]') }}
     env:
       SHARD_TOTAL: ${{ github.base_ref == 'main' && 32 || 8 }}
-      # cargo runs the test binaries through prlimit (3 GiB of address space, 1 GiB
-      # per file), so a mutant that loops while allocating or writing is killed, and
-      # counts as caught, instead of taking the runner down. The compiler is not limited.
-      # nextest runs each test in its own process, four at a time (.config/nextest.toml),
-      # so the limits add up to 12 GiB of memory and 4 GiB of disk, within the 16 GB of
-      # a standard runner.
+      # cargo runs the test binaries through prlimit: each test process, and each process
+      # it starts, gets at most 3 GiB of address space and writes files of at most 1 GiB,
+      # so a mutant that loops while allocating or writing is killed, and counts as caught,
+      # instead of taking the runner down. The compiler is not limited.
+      # nextest runs each test in a process of its own; with two mutants at a time (--jobs 2)
+      # and two tests each (--test-threads=2), the test processes hold at most 12 GiB of
+      # the 15 GiB a standard runner has.
       CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=3221225472 --fsize=1073741824 --
     permissions:
       contents: read
@@ -228,7 +229,9 @@ jobs:
       # does not repeat it. With no baseline there is no measured test time to scale, so the
       # test timeout is fixed at 300 s, as in mutants.yml. nextest stops a single test
       # that runs for 60 s (the "mutants" profile in .config/nextest.toml).
-      # --jobs 2 runs two mutants at a time on the runner's 4 vCPUs, as the single job did.
+      # --jobs 2 runs two mutants at a time on the runner's 4 vCPUs, as the single job did,
+      # and --test-threads=2 gives each two tests at a time, so four run at once (see the
+      # prlimit caps above).
       # Without --in-place, cargo-mutants builds each mutant in a copy of the tree, so the
       # checked-out source is never changed.
       # A non-zero exit code is recorded, not raised here, so the upload step still runs.
@@ -239,7 +242,7 @@ jobs:
         run: |
           set +e
           cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --shard "$SHARD/$SHARD_TOTAL" \
-            --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked \
+            --baseline=skip --timeout 300 --jobs 2 --cargo-arg=--locked --cargo-test-arg=--test-threads=2 \
             --output "$RUNNER_TEMP/mutants" 2>&1 | tee "$RUNNER_TEMP/mutants.log"
           status=${PIPESTATUS[0]}
           if [ "$status" != 0 ]; then echo "status=$status" >> "$GITHUB_OUTPUT"; fi

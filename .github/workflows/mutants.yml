@@ -14,12 +14,12 @@ env:
   # Pinned so the cache key changes when the version does.
   CARGO_MUTANTS_VERSION: 27.1.0
   CARGO_NEXTEST_VERSION: 0.9.152
-  # cargo runs the test binaries through prlimit (3 GiB of address space, 1 GiB
-  # per file), so a mutant that loops while allocating or writing is killed, and
-  # counts as caught, instead of taking the runner down. The compiler is not limited.
-  # nextest runs each test in its own process, four at a time (.config/nextest.toml),
-  # so the limits add up to 12 GiB of memory and 4 GiB of disk, within the 16 GB of
-  # a standard runner.
+  # cargo runs the test binaries through prlimit: each test process, and each process
+  # it starts, gets at most 3 GiB of address space and writes files of at most 1 GiB,
+  # so a mutant that loops while allocating or writing is killed, and counts as caught,
+  # instead of taking the runner down. The compiler is not limited.
+  # nextest runs each test in a process of its own, four at a time (.config/nextest.toml),
+  # so the test processes hold at most 12 GiB of the 15 GiB a standard runner has.
   CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: prlimit --as=3221225472 --fsize=1073741824 --
 
 jobs:
