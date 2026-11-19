@@ -12,7 +12,7 @@ description = "Deterministic stand-in for the decision backend, used only by the
 workspace = true
 
 [dependencies]
-bytes = "=1.12.1"
+bytes = "=1.12.2"
 http-body-util = "=0.1.5"
 hyper = { version = "=1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
