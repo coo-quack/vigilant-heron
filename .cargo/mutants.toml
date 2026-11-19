@@ -37,9 +37,15 @@ exclude_re = [
     'src/backend/sanitize/body/lexical\.rs:42:21: replace \+ with \* in redact_xml_elements$',
     # With `<=`, a retry at the end of the text moves `t` past the end and fails on the next
     # literal as before. A trailing `*`, the only way to match there, never retries.
-    'src/conf/mod\.rs:280:38: replace < with <= in wildcard_matches$',
+    'src/conf/mod\.rs:291:38: replace < with <= in wildcard_matches$',
     # `p = sp * 1` points at the `*` again, and its arm sets the same `star`, `p` and `t`.
-    'src/conf/mod\.rs:282:28: replace \+ with \* in wildcard_matches$',
+    'src/conf/mod\.rs:293:28: replace \+ with \* in wildcard_matches$',
+    # With `false`, hyper's HTTP/1 server (hyper 1.12.0, `proto/h1/dispatch.rs`) takes the
+    # length from `size_hint`, which `Finish` forwards, so an ended body is announced as
+    # `Known(0)` instead of as no body, and both write `content-length: 0`
+    # (`proto/h1/role.rs`, `None | Some(BodyLength::Known(0))`). hyper then polls the body
+    # once, gets `None`, and `Finish` marks the connection as dropping it would.
+    'src/finish\.rs:79:9: replace <impl Body for Finish<B>>::is_end_stream -> bool with false$',
     # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
     # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
     # `HYPER_DEFAULT_BUFFER` copies). This stops holding if hyper changes that default.
