@@ -1183,3 +1183,65 @@ async fn redact_file_parts_off_sends_the_start_of_the_file_but_not_the_password(
     assert!(forwarded_body.contains("EXIFGPS"), "{forwarded_body}");
     proxy.stop().await
 }
+
+/// An upstream that answers every request with `response`, written as raw bytes so that
+/// it can carry what an HTTP library would drop, and then closes the connection.
+async fn start_raw_upstream(response: &'static str) -> Result<String, common::BoxError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _peer)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => head.extend_from_slice(buffer.get(..read).unwrap_or_default()),
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            });
+        }
+    });
+    Ok(url)
+}
+
+/// A 304 has no body, but its Content-Length may state the length of the full response.
+#[tokio::test]
+async fn a_304_with_a_content_length_is_forwarded() -> TestResult {
+    let upstream = start_raw_upstream(
+        "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 1234\r\n\r\n",
+    )
+    .await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config_text(
+        &stub.decide_url(),
+        &upstream,
+        GENEROUS_TIMEOUT_MS,
+    ))
+    .await?;
+
+    let reply = send(
+        &proxy.base(),
+        Method::GET,
+        "/page",
+        "example.com",
+        &[("if-none-match", "\"v1\"")],
+        Bytes::new(),
+    )
+    .await?;
+
+    assert_eq!(reply.status, StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        reply
+            .headers
+            .get("etag")
+            .and_then(|value| value.to_str().ok()),
+        Some("\"v1\"")
+    );
+    assert!(reply.body.is_empty());
+    proxy.stop().await
+}
