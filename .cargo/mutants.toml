@@ -3,8 +3,15 @@
 # src/test_support.rs builds test fixtures; mutating it only tests the test helper.
 exclude_globs = ["src/test_support.rs"]
 
-# The tests use real short timers, so a mutant that slows the code gets extra time before it counts as a timeout.
-timeout_multiplier = 3.0
+# Run the tests with cargo-nextest, in the "mutants" profile of .config/nextest.toml,
+# so a test that never returns is stopped and failed after 60 s. nextest does not run
+# doctests; the workspace has none.
+test_tool = "nextest"
+additional_cargo_test_args = ["--profile=mutants"]
+
+# Build in the "mutants" Cargo profile of Cargo.toml, which leaves out debug info.
+# It shares a name with the nextest profile above and is otherwise unrelated.
+profile = "mutants"
 
 # The workspace denies lints such as unused imports, so a mutant that leaves an
 # import or a parameter unused would fail to build and count as unviable instead
@@ -30,9 +37,9 @@ exclude_re = [
     'src/backend/sanitize/body/lexical\.rs:42:21: replace \+ with \* in redact_xml_elements$',
     # With `<=`, a retry at the end of the text moves `t` past the end and fails on the next
     # literal as before. A trailing `*`, the only way to match there, never retries.
-    'src/conf/mod\.rs:280:38: replace < with <= in wildcard_matches$',
+    'src/conf/mod\.rs:291:38: replace < with <= in wildcard_matches$',
     # `p = sp * 1` points at the `*` again, and its arm sets the same `star`, `p` and `t`.
-    'src/conf/mod\.rs:282:28: replace \+ with \* in wildcard_matches$',
+    'src/conf/mod\.rs:293:28: replace \+ with \* in wildcard_matches$',
     # At exactly hyper's default size, `max_buf_size(total)` sets the value hyper already uses
     # for both its read and write buffers (hyper 1.12.0, `DEFAULT_MAX_BUFFER_SIZE`, which
     # `HYPER_DEFAULT_BUFFER` copies). This stops holding if hyper changes that default.
