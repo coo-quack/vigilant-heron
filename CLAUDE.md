@@ -94,7 +94,7 @@ tests/
   common/        # Shared helpers: in-process upstream, stub and gated decision backends, client, fake System One endpoint
   cli.rs         # The binary: -h, -v, -t and -T, -s signals (reload, reopen, stop, quit), start, stop and restart, the startup log
   headers.rs     # proxy_set_header: variables, removal, inheritance, location replacement
-  websocket.rs   # proxy_websocket tunnels against an in-process echo upstream
+  websocket.rs   # proxy_websocket tunnels against an in-process echo upstream; no tunnel when a raw-socket upstream answers 101 to a request that may not upgrade
   reload.rs      # serve_reloadable: valid, broken, zone state kept or reset, in-flight requests finish
   request_check.rs # test-request agrees with the running router on outcome, reason and rule id
   skip_suggest.rs # suggest-skip-rules: learns skip-rule candidates from a json access log under fixed thresholds

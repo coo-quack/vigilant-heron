@@ -15,7 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use rstest::rstest;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Starts an upstream that answers Upgrade requests with 101 and echoes the bytes after it.
@@ -115,14 +115,7 @@ async fn handshake(
         "GET {path} HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await?;
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while !head.ends_with(b"\r\n\r\n") {
-        if stream.read(&mut byte).await? == 0 {
-            break;
-        }
-        head.push(byte[0]);
-    }
+    let head = read_head(&mut stream).await?;
     Ok((stream, String::from_utf8_lossy(&head).into_owned()))
 }
 
@@ -553,15 +546,15 @@ const CLIENT_MARKER: &[u8] = b"LEAKED-FROM-CLIENT";
 /// machine fails nothing; the tests do not wait that long when nothing is slow.
 const EVENT_BOUND: Duration = Duration::from_secs(5);
 
-/// The longest the tests watch for bytes that must not be relayed. A leak crosses the proxy
-/// within a few milliseconds; the window is far longer than that, so a leak that a slow run
-/// delays is still seen. The watch ends sooner when both ends of the connection have closed,
-/// because after that nothing can arrive.
+/// The longest the tests watch for relayed bytes after the client has written its marker. A
+/// relayed byte crosses the proxy within a few milliseconds, far less than this window; a leak
+/// delayed past the window would not be seen. The watch ends sooner when both ends of the
+/// connection have closed, because after that nothing can arrive.
 const ABSENCE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Reads byte by byte until the end of a head (`\r\n\r\n`) or end of stream, and returns what
 /// was read. It takes nothing after the head off the stream. A read error is returned.
-async fn read_head(stream: &mut (impl AsyncRead + Unpin)) -> Result<Vec<u8>, std::io::Error> {
+async fn read_head(stream: &mut TcpStream) -> Result<Vec<u8>, std::io::Error> {
     let mut head = Vec::new();
     let mut byte = [0u8; 1];
     while !head.ends_with(b"\r\n\r\n") {
@@ -727,21 +720,49 @@ fn assert_nothing_relayed(
     Ok(())
 }
 
+/// Sends `request` through the proxy at `proxy_addr` to `upstream`, then writes
+/// [`CLIENT_MARKER`] as a WebSocket client would after its handshake, and returns every byte the
+/// client received (the response head first).
+async fn exchange(
+    proxy_addr: std::net::SocketAddr,
+    upstream: &SwitchingUpstream,
+    request: &[u8],
+) -> Result<Vec<u8>, common::BoxError> {
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    client.write_all(request).await?;
+
+    // Step 1: the request is at the upstream, so the upstream's answer is on its way.
+    upstream.wait_for_head().await?;
+    // Step 2: the proxy has processed that answer, so the path a relayed byte would take is
+    // open by now.
+    let head = tokio::time::timeout(EVENT_BOUND, read_head(&mut client))
+        .await
+        .map_err(|_| format!("the proxy sent no complete head within {EVENT_BOUND:?}"))??;
+    // Step 3: the proxy may already have closed the connection, so a failed write is not an
+    // error here.
+    let _ = client.write_all(CLIENT_MARKER).await;
+    let mut received = head;
+    observe_relay(&mut client, &mut received, upstream).await;
+    Ok(received)
+}
+
+const UPGRADE_CHAT: &[u8] = b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n";
+
 // Only an Upgrade request on a site or location with `proxy_websocket on` is tunnelled
 // (docs/configuration.md). The upstream answers 101 to each request here, so a byte that
 // crosses in either direction means a tunnel was opened for a request that was not allowed one.
-// The first four cases send an `Upgrade` header that is not an allowed Upgrade request, so the
-// 101 check in `upstream_outcome` is what stops the tunnel. The last case sends no `Upgrade`
-// header at all: hyper never upgrades such a connection, so no byte can flow whatever
-// `upstream_outcome` decides. It states the documented behaviour and does not guard that check.
+// In the first two cases `proxy_websocket` is off, so the request is not treated as upgrading;
+// in the next two the request is not an Upgrade request. In all four, `upgrading` is false and
+// the `upgrading && status == 101` check in `upstream_outcome` is what stops the tunnel. The
+// last case sends no `Upgrade` header at all: hyper never upgrades such a connection, so no
+// byte can flow whatever `upstream_outcome` decides. It states the documented behaviour and does
+// not guard that check. The test after this one is the control: there the same upstream and
+// helpers see both markers cross.
 #[rstest]
-#[case::site_without_proxy_websocket(
-    "",
-    b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n"
-)]
+#[case::site_without_proxy_websocket("", UPGRADE_CHAT)]
 #[case::location_with_proxy_websocket_off_under_a_site_with_on(
     "proxy_websocket on;\n    location /chat {\n        proxy_websocket off;\n    }",
-    b"GET /chat HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    UPGRADE_CHAT
 )]
 #[case::upgrade_header_without_connection_upgrade(
     "proxy_websocket on;",
@@ -764,29 +785,52 @@ async fn an_upstream_101_relays_no_bytes_unless_an_allowed_upgrade_was_asked_for
     let stub = StubDecider::start().await?;
     let proxy = start_proxy(&config(&stub.decide_url(), upstream.addr, "", site)).await?;
 
-    let mut client = TcpStream::connect(proxy.addr).await?;
-    client.write_all(request).await?;
+    let received = exchange(proxy.addr, &upstream, request).await?;
 
-    // Step 1: the request is at the upstream, so the upstream's answer is on its way.
-    upstream.wait_for_head().await?;
-    // Step 2: the proxy has processed that answer. This is a positive control: the path a leak
-    // would take is open. What the client gets instead of a tunnel is not specified, so only
-    // the start of an HTTP response is checked.
-    let head = tokio::time::timeout(EVENT_BOUND, read_head(&mut client))
-        .await
-        .map_err(|_| format!("the proxy sent no complete head within {EVENT_BOUND:?}"))??;
+    // What the client gets instead of a tunnel is not specified, so only the start of an HTTP
+    // response is checked.
     assert!(
-        head.starts_with(b"HTTP/1.1 "),
+        received.starts_with(b"HTTP/1.1 "),
         "the proxy did not answer with an HTTP response: {:?}",
-        String::from_utf8_lossy(&head)
+        String::from_utf8_lossy(&received)
     );
-    // Step 3: the client writes what a WebSocket client would write after its handshake. The
-    // proxy may already have closed the connection, so a failed write is not an error here.
-    let _ = client.write_all(CLIENT_MARKER).await;
-    let mut received = head;
-    observe_relay(&mut client, &mut received, &upstream).await;
-
     assert_nothing_relayed(&upstream, &received)?;
-    drop(client);
+    proxy.stop().await
+}
+
+#[tokio::test]
+async fn an_upstream_101_to_an_allowed_upgrade_relays_bytes_both_ways() -> TestResult {
+    let upstream = start_switching_upstream().await?;
+    let stub = StubDecider::start().await?;
+    let proxy = start_proxy(&config(
+        &stub.decide_url(),
+        upstream.addr,
+        "",
+        "proxy_websocket on;",
+    ))
+    .await?;
+
+    let received = exchange(proxy.addr, &upstream, UPGRADE_CHAT).await?;
+
+    assert!(
+        received.starts_with(b"HTTP/1.1 101 "),
+        "the proxy did not pass on the 101: {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    assert!(
+        contains(&received, UPSTREAM_MARKER),
+        "the upstream's bytes did not reach the client: {:?}",
+        String::from_utf8_lossy(&received)
+    );
+    let after_head = upstream
+        .after_head
+        .lock()
+        .map_err(|_| "upstream lock poisoned")?
+        .clone();
+    assert!(
+        contains(&after_head, CLIENT_MARKER),
+        "the client's bytes did not reach the upstream: {:?}",
+        String::from_utf8_lossy(&after_head)
+    );
     proxy.stop().await
 }
