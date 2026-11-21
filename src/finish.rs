@@ -89,3 +89,25 @@ impl<B> Drop for Finish<B> {
         self.mark_idle();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use http_body_util::Full;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case::an_ended_body(Bytes::new(), true)]
+    #[case::a_body_with_data_left(Bytes::from_static(b"data"), false)]
+    fn a_finish_body_ends_its_stream_when_the_inner_body_does(
+        #[case] data: Bytes,
+        #[case] ended: bool,
+    ) {
+        let phase = Arc::new(crate::phase::PhaseCell::new());
+        let body_done = Arc::new(AtomicBool::new(true));
+        let body = Finish::new(Full::new(data), phase, body_done);
+        assert_eq!(body.is_end_stream(), ended);
+    }
+}
