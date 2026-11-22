@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.5.2 (2026-11-22)
+
+No change in this release is meant to change what the router does.
+
+- Changed: the release binaries and the image use form_urlencoded 1.2.3 (#182).
+- Tests: a `Finish` body ends its stream exactly when its inner body does (#181).
+- CI: actions/create-github-app-token (#177) and the e2e nginx image (#180) get
+  updates.
+
 ## v0.5.1 (2026-11-20)
 
 No change in this release is meant to change what the router does.
