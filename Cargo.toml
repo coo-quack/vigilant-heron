@@ -41,7 +41,7 @@ allow_attributes_without_reason = "deny"
 
 [package]
 name = "vigilant-heron"
-version = "0.5.1"
+version = "0.5.2"
 description = "Router that checks web requests with typed decision models and blocks, redirects or passes them"
 edition.workspace = true
 rust-version.workspace = true
@@ -55,7 +55,7 @@ workspace = true
 [dependencies]
 anyhow = "=1.0.104"
 bytes = "=1.12.2"
-form_urlencoded = "=1.2.2"
+form_urlencoded = "=1.2.3"
 http = "=1.5.0"
 http-body = "=1.1.0"
 http-body-util = "=0.1.5"
