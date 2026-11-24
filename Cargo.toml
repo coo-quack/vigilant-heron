@@ -59,7 +59,7 @@ form_urlencoded = "=1.2.3"
 http = "=1.5.0"
 http-body = "=1.1.0"
 http-body-util = "=0.1.5"
-hyper = { version = "=1.12.0", features = ["http1", "server", "client"] }
+hyper = { version = "=1.13.0", features = ["http1", "server", "client"] }
 hyper-rustls = { version = "=0.27.10", default-features = false, features = ["ring", "tls12", "http1", "logging", "native-tokio"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1"] }
 percent-encoding = "=2.3.2"
