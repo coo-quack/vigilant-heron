@@ -41,7 +41,7 @@ allow_attributes_without_reason = "deny"
 
 [package]
 name = "vigilant-heron"
-version = "0.5.2"
+version = "0.5.3"
 description = "Router that checks web requests with typed decision models and blocks, redirects or passes them"
 edition.workspace = true
 rust-version.workspace = true
@@ -53,13 +53,13 @@ publish = false
 workspace = true
 
 [dependencies]
-anyhow = "=1.0.104"
+anyhow = "=1.0.105"
 bytes = "=1.12.2"
 form_urlencoded = "=1.2.3"
 http = "=1.5.0"
 http-body = "=1.1.0"
 http-body-util = "=0.1.5"
-hyper = { version = "=1.12.0", features = ["http1", "server", "client"] }
+hyper = { version = "=1.13.0", features = ["http1", "server", "client"] }
 hyper-rustls = { version = "=0.27.10", default-features = false, features = ["ring", "tls12", "http1", "logging", "native-tokio"] }
 hyper-util = { version = "=0.1.21", features = ["tokio", "server-auto", "client-legacy", "http1"] }
 percent-encoding = "=2.3.2"
@@ -78,7 +78,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["json", "env-filter"] }
 
 [dev-dependencies]
 proptest = "=1.12.0"
-rstest = "=0.28.0"
+rstest = "=0.29.0"
 tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "test-util"] }
 criterion = { version = "=0.8.2", default-features = false, features = ["cargo_bench_support"] }
 
