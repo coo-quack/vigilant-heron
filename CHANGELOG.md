@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.5.3 (2026-11-26)
+
+No change in this release is meant to change what the router does.
+
+- Changed: the release binaries and the image use anyhow 1.0.105 (#189) and
+  hyper 1.13.0 (#190), and are built from an updated rust:1.100.0-slim-trixie
+  image digest (#192).
+- Tests: rstest 0.29.0 (#188).
+- CI: the e2e nginx image digest (#191), pnpm 12.23.0 (#187) and the lock file
+  maintenance (#186) get updates.
+
 ## v0.5.2 (2026-11-22)
 
 No change in this release is meant to change what the router does.
